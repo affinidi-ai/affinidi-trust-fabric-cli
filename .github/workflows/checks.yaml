@@ -1,0 +1,72 @@
+name: checks
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+  push:
+    branches:
+      - main
+  # Daily re-check of main, so an advisory published after the last merge
+  # still gets caught. Off the hour because GitHub delays busy cron slots.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+# Every job gets read-only access unless it asks for more below.
+permissions:
+  contents: read
+
+# Shared workflows are pinned to a commit so a change upstream can't run here
+# until someone bumps the pin. Only the security scan gets secrets, and only
+# the three it needs.
+jobs:
+  audit:
+    uses: affinidi/pipeline-rust/.github/workflows/audit.yaml@cc92894cfbd5ebe38eee9e7edb5e54addf369a02
+    permissions:
+      contents: read
+      issues: write
+
+  cargo-deny:
+    uses: affinidi/pipeline-rust/.github/workflows/cargo-deny.yaml@cc92894cfbd5ebe38eee9e7edb5e54addf369a02
+
+  check:
+    uses: affinidi/pipeline-rust/.github/workflows/cargo-check.yaml@cc92894cfbd5ebe38eee9e7edb5e54addf369a02
+    with:
+      toolchain: '1.96.0'
+      rustflags: '-D warnings'
+
+  test:
+    uses: affinidi/pipeline-rust/.github/workflows/test.yaml@cc92894cfbd5ebe38eee9e7edb5e54addf369a02
+    with:
+      toolchain: '1.96.0'
+      rustflags: '-D warnings'
+      useRedis: false
+
+  fmt:
+    uses: affinidi/pipeline-rust/.github/workflows/fmt.yaml@cc92894cfbd5ebe38eee9e7edb5e54addf369a02
+    with:
+      toolchain: '1.96.0'
+      rustflags: '-D warnings'
+
+  clippy:
+    uses: affinidi/pipeline-rust/.github/workflows/clippy.yaml@cc92894cfbd5ebe38eee9e7edb5e54addf369a02
+    with:
+      toolchain: '1.96.0'
+      rustflags: '-D warnings'
+
+  rust-scan:
+    uses: affinidi/pipeline-security/.github/workflows/rust-scanner.yml@0ca1f3d0e4da833304b3474dbb27942b64501932
+    secrets:
+      SNYK_SCANNER_TOKEN: ${{ secrets.SNYK_SCANNER_TOKEN }}
+      SNYK_SCANNER_REGION: ${{ secrets.SNYK_SCANNER_REGION }}
+      SNYK_GLOBAL_POLICY: ${{ secrets.SNYK_GLOBAL_POLICY }}
+
+  coverage:
+    uses: affinidi/pipeline-rust/.github/workflows/coverage.yaml@cc92894cfbd5ebe38eee9e7edb5e54addf369a02
+    with:
+      toolchain: '1.96.0'
+      rustflags: '-D warnings'
+      coverage: 80
+      useRedis: false

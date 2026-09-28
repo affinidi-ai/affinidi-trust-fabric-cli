@@ -1,0 +1,60 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+ignore = []
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "BSL-1.0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "CC0-1.0",
+    "ISC",
+    "MIT-0",
+    "MIT",
+    "Unlicense",
+    "Zlib",
+]
+
+exceptions = [
+    # MPL-2.0 (file-level copyleft), transitive via dirs -> dirs-sys. Same
+    # treatment as the other MPL-2.0 crates allowed in the gateway repo.
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    # CDLA-Permissive-2.0, Mozilla's root certificate list (via reqwest -> rustls-platform-verifier)
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
+    # Unicode-3.0, ICU / yoke / zerovec family (via url -> idna) and unicode-ident
+    { allow = ["Unicode-3.0"], crate = "icu_collections" },
+    { allow = ["Unicode-3.0"], crate = "icu_locale_core" },
+    { allow = ["Unicode-3.0"], crate = "icu_normalizer" },
+    { allow = ["Unicode-3.0"], crate = "icu_normalizer_data" },
+    { allow = ["Unicode-3.0"], crate = "icu_properties" },
+    { allow = ["Unicode-3.0"], crate = "icu_properties_data" },
+    { allow = ["Unicode-3.0"], crate = "icu_provider" },
+    { allow = ["Unicode-3.0"], crate = "litemap" },
+    { allow = ["Unicode-3.0"], crate = "potential_utf" },
+    { allow = ["Unicode-3.0"], crate = "tinystr" },
+    { allow = ["Unicode-3.0"], crate = "unicode-ident" },
+    { allow = ["Unicode-3.0"], crate = "writeable" },
+    { allow = ["Unicode-3.0"], crate = "yoke" },
+    { allow = ["Unicode-3.0"], crate = "yoke-derive" },
+    { allow = ["Unicode-3.0"], crate = "zerofrom" },
+    { allow = ["Unicode-3.0"], crate = "zerofrom-derive" },
+    { allow = ["Unicode-3.0"], crate = "zerotrie" },
+    { allow = ["Unicode-3.0"], crate = "zerovec" },
+    { allow = ["Unicode-3.0"], crate = "zerovec-derive" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
