@@ -689,8 +689,23 @@ enum SurfaceCommand {
     /// ways, and a tool whose result depends on it is shown once per
     /// combination. At most 3 can be left unpinned. A pattern matches anywhere
     /// in a tool name unless it starts with ^.
+    #[command(after_long_help = TOOL_GATE_PREVIEW_EXAMPLES)]
     ToolGatePreview(ToolGatePreviewArgs),
 }
+
+/// Examples shown at the bottom of `tool-gate-preview --help`.
+const TOOL_GATE_PREVIEW_EXAMPLES: &str = r#"Examples:
+  Check the gates a surface has saved:
+    fabric agent-gateway surfaces tool-gate-preview my-agent --tool delete_user,get_user
+
+  Check gates that are not saved yet, from a file:
+    fabric agent-gateway surfaces tool-gate-preview --gates-file gates.json --tool delete_user
+
+  Say what you know about the caller (an admin who is not a contractor):
+    fabric agent-gateway surfaces tool-gate-preview my-agent --tool delete_user --condition admins=met --condition contractors=unmet
+
+Reading the result:
+  RESULT is ALLOW or DENY. DECIDED BY is the gate that decided, or the default when no gate matched. A tool gets one row per combination of conditions only when its answer depends on them, otherwise one row marked "either way"."#;
 
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("gates_source").required(true).args(["surface_id", "gates_file"])))]
@@ -3166,6 +3181,27 @@ mod gateway_config_tests {
                 ],
                 "warnings": []
             })
+        );
+    }
+
+    #[test]
+    fn tool_gate_preview_help_ends_with_examples() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("agent-gateway")
+            .and_then(|command| command.find_subcommand_mut("surfaces"))
+            .and_then(|command| command.find_subcommand_mut("tool-gate-preview"))
+            .expect("tool-gate-preview exists")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("Examples:\n  Check the gates a surface has saved:"), "{help}");
+        assert!(help.contains("--condition admins=met --condition contractors=unmet"), "{help}");
+        assert!(
+            help.trim_end()
+                .ends_with("otherwise one row marked \"either way\"."),
+            "{help}"
         );
     }
 
