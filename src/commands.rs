@@ -13,6 +13,7 @@ use crate::{
     config::{Config, Connection, normalize_host, normalize_user_host},
     credentials::{CredentialStore, OsCredentialStore},
     features, surface_patch, surface_validate,
+    tool_gate_preview::{self, Conditions, Gating, Preview, ToolPreview, Verdict},
 };
 
 /// Prefix that identifies a gateway personal access token, matching
@@ -673,6 +674,43 @@ enum SurfaceCommand {
     AddFeature(AddFeatureArgs),
     /// Remove a feature from an Agent Surface.
     RemoveFeature(FeaturePlacementArgs),
+    /// Show which tools a set of MCP tool gates would allow or deny, and which
+    /// gate decided, before anything is saved.
+    ///
+    /// The gates come from a surface (the ones it has saved) or from a JSON
+    /// file, so gates that are not saved yet can be checked. Only the
+    /// surface's own gating (`target.mcp_tool_gating`) is previewed, not the
+    /// gating of its variants or transit points. Nothing is changed, and with
+    /// --gates-file nothing is read from the gateway either.
+    ///
+    /// A gate's condition is a policy only the gateway can evaluate for a
+    /// caller, so state what you know with --condition, such as
+    /// `--condition admins=met`. Every other condition policy is tried both
+    /// ways, and a tool whose result depends on it is shown once per
+    /// combination. At most 3 can be left unpinned. A pattern matches anywhere
+    /// in a tool name unless it starts with ^.
+    ToolGatePreview(ToolGatePreviewArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("gates_source").required(true).args(["surface_id", "gates_file"])))]
+struct ToolGatePreviewArgs {
+    /// Surface ID whose saved MCP tool gates to check (see `fabric
+    /// agent-gateway surfaces list`).
+    surface_id: Option<String>,
+    /// JSON file holding the MCP tool gating itself, as
+    /// `{"default_effect": "allow", "gates": [...]}` ('-' for standard
+    /// input).
+    #[arg(long, value_name = "PATH")]
+    gates_file: Option<PathBuf>,
+    /// Tool name to check. Repeatable, or comma separated.
+    #[arg(long = "tool", value_name = "NAME", value_delimiter = ',', required = true)]
+    tools: Vec<String>,
+    /// Whether the caller meets a gate's condition policy, as
+    /// POLICY_ID=met or POLICY_ID=unmet. A policy no gate uses is refused.
+    /// Repeatable.
+    #[arg(long = "condition", value_name = "POLICY_ID=met|unmet")]
+    conditions: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -977,6 +1015,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => {
             print_features(cli.output);
             Ok(())
+        }
+        Command::Surfaces {
+            command: SurfaceCommand::ToolGatePreview(args),
+        } if args.surface_id.is_none() => {
+            let file = args
+                .gates_file
+                .context("clap requires a surface or a gates file")?;
+            print_tool_gate_preview(&read_gates_file(&file)?, args.tools, &args.conditions, cli.output)
         }
         command => {
             let (connection_name, saved) = config.resolve(cli.connection.as_deref())?;
@@ -2936,6 +2982,317 @@ mod gateway_config_tests {
             request_lines(requests),
             ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1?dry_run=true HTTP/1.1"]
         );
+    }
+
+    const DELETE_GATE_FILE: &str = r#"{"default_effect":"allow","gates":[{"id":"g1","condition_policy_definition_id":"non-admins","action":{"effect":"deny","patterns":["^delete_"]}}]}"#;
+
+    const GATED_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","target":{"endpoint":"http://127.0.0.1:3000","mcp_tool_gating":{"default_effect":"deny","gates":[{"name":"Reads","action":{"effect":"allow","patterns":["^get_"]}}]}}}"#;
+
+    const ADMINS_AND_CONTRACTORS_FILE: &str = r#"{"default_effect":"deny","gates":[{"condition_policy_definition_id":"admins","action":{"effect":"allow","patterns":["^delete_"]}},{"condition_policy_definition_id":"contractors","action":{"effect":"deny","patterns":["^delete_"]}}]}"#;
+
+    fn preview_of(
+        gating_json: &str,
+        tools: &[&str],
+        conditions: &[&str],
+    ) -> (Gating, Preview, Vec<String>) {
+        let gating = tool_gate_preview::read_gating_config(
+            &serde_json::from_str(gating_json).expect("gating JSON"),
+            "mcp_tool_gating",
+        )
+        .expect("gating reads");
+        let names: Vec<String> = tools
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect();
+        let pinned = tool_gate_preview::parse_pins(
+            &conditions
+                .iter()
+                .map(|condition| (*condition).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .expect("conditions parse");
+        let previewed = tool_gate_preview::preview(&gating, &names, &pinned).expect("preview works");
+        let warnings = tool_gate_preview::warnings(&gating, &names);
+        (gating, previewed, warnings)
+    }
+
+    #[test]
+    fn tool_gate_preview_takes_a_surface_or_a_gates_file_and_at_least_one_tool() {
+        let Command::Surfaces {
+            command: SurfaceCommand::ToolGatePreview(args),
+        } = command_of(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "tool-gate-preview",
+            "s-1",
+            "--tool",
+            "a,b",
+            "--tool",
+            "c",
+        ])
+        else {
+            panic!("expected tool-gate-preview");
+        };
+        assert_eq!(args.surface_id.as_deref(), Some("s-1"));
+        assert_eq!(args.tools, ["a", "b", "c"]);
+        assert!(args.conditions.is_empty());
+
+        let Command::Surfaces {
+            command: SurfaceCommand::ToolGatePreview(args),
+        } = command_of(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "tool-gate-preview",
+            "--gates-file",
+            "-",
+            "--tool",
+            "a",
+        ])
+        else {
+            panic!("expected tool-gate-preview");
+        };
+        assert_eq!(args.gates_file, Some(PathBuf::from("-")));
+
+        for invalid in [
+            &["fabric", "agent-gateway", "surfaces", "tool-gate-preview", "--tool", "a"][..],
+            &["fabric", "agent-gateway", "surfaces", "tool-gate-preview", "s-1"][..],
+            &[
+                "fabric",
+                "agent-gateway",
+                "surfaces",
+                "tool-gate-preview",
+                "s-1",
+                "--gates-file",
+                "g.json",
+                "--tool",
+                "a",
+            ][..],
+        ] {
+            assert!(Cli::try_parse_from(invalid).is_err(), "{invalid:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn tool_gate_preview_table_shows_each_combination_of_conditions() {
+        let (gating, previewed, warnings) = preview_of(ADMINS_AND_CONTRACTORS_FILE, &["delete_user", "get_user"], &[]);
+
+        let table = tool_gate_preview_table(&gating, &previewed, &warnings);
+
+        assert_eq!(
+            table,
+            "TOOL         CONDITION                            RESULT  DECIDED BY\n\
+             delete_user  admins met, contractors met          DENY    Tool Gate 2\n\
+             delete_user  admins met, contractors not met      ALLOW   Tool Gate 1\n\
+             delete_user  admins not met, contractors met      DENY    Tool Gate 2\n\
+             delete_user  admins not met, contractors not met  DENY    default (deny)\n\
+             get_user     either way                           DENY    default (deny)\n"
+        );
+    }
+
+    #[test]
+    fn tool_gate_preview_table_lists_what_was_pinned_above_the_table() {
+        let (gating, previewed, warnings) = preview_of(ADMINS_AND_CONTRACTORS_FILE, &["delete_user"], &["admins=met"]);
+
+        let table = tool_gate_preview_table(&gating, &previewed, &warnings);
+
+        assert_eq!(
+            table,
+            "Assuming: admins met\n\
+             \n\
+             TOOL         CONDITION            RESULT  DECIDED BY\n\
+             delete_user  contractors met      DENY    Tool Gate 2\n\
+             delete_user  contractors not met  ALLOW   Tool Gate 1\n"
+        );
+    }
+
+    #[test]
+    fn tool_gate_preview_table_leaves_out_the_condition_column_when_it_makes_no_difference() {
+        let (gating, previewed, warnings) = preview_of(
+            r#"{"default_effect":"deny","gates":[{"name":"Reads","action":{"effect":"allow","patterns":["^get_"]}}]}"#,
+            &["get_user", "delete_user"],
+            &[],
+        );
+
+        let table = tool_gate_preview_table(&gating, &previewed, &warnings);
+
+        assert_eq!(
+            table,
+            "TOOL         RESULT  DECIDED BY\n\
+             get_user     ALLOW   Reads\n\
+             delete_user  DENY    default (deny)\n"
+        );
+    }
+
+    #[test]
+    fn tool_gate_preview_table_lists_warnings_under_a_heading() {
+        let (gating, previewed, warnings) = preview_of(
+            r#"{"gates":[{"name":"Blocker","action":{"effect":"deny","patterns":["delete_(", "delete_"]}}]}"#,
+            &["undelete_draft"],
+            &[],
+        );
+
+        let table = tool_gate_preview_table(&gating, &previewed, &warnings);
+
+        assert!(
+            table.contains("\nWarnings\n  - 'Blocker' has a pattern that is not valid regex (delete_()."),
+            "{table}"
+        );
+        assert!(table.contains("also matches 'undelete_draft' in the middle of the name"), "{table}");
+        assert!(table.contains("undelete_draft  DENY    Blocker"), "{table}");
+    }
+
+    #[test]
+    fn tool_gate_preview_json_carries_conditions_assumptions_and_warnings() {
+        let (gating, previewed, warnings) =
+            preview_of(ADMINS_AND_CONTRACTORS_FILE, &["delete_user", "get_user"], &["admins=met"]);
+
+        let value = tool_gate_preview_json(&gating, &previewed, &warnings);
+
+        assert_eq!(
+            value,
+            json!({
+                "default_effect": "deny",
+                "assumed": {"admins": "met"},
+                "tools": [
+                    {"tool": "delete_user", "results": [
+                        {"conditions": {"contractors": "met"}, "result": "deny", "decided_by": "Tool Gate 2"},
+                        {"conditions": {"contractors": "not_met"}, "result": "allow", "decided_by": "Tool Gate 1"}
+                    ]},
+                    {"tool": "get_user", "results": [
+                        {"conditions": {}, "result": "deny", "decided_by": null}
+                    ]}
+                ],
+                "warnings": []
+            })
+        );
+    }
+
+    #[test]
+    fn tool_gate_preview_takes_repeatable_conditions() {
+        let Command::Surfaces {
+            command: SurfaceCommand::ToolGatePreview(args),
+        } = command_of(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "tool-gate-preview",
+            "s-1",
+            "--tool",
+            "a",
+            "--condition",
+            "admins=met",
+            "--condition",
+            "contractors=unmet",
+        ])
+        else {
+            panic!("expected tool-gate-preview");
+        };
+
+        assert_eq!(args.conditions, ["admins=met", "contractors=unmet"]);
+    }
+
+    #[test]
+    fn tool_gate_preview_refuses_a_condition_no_gate_uses_and_more_than_three_unpinned() {
+        let gating = tool_gate_preview::read_gating_config(
+            &serde_json::from_str(ADMINS_AND_CONTRACTORS_FILE).expect("gating JSON"),
+            "mcp_tool_gating",
+        )
+        .expect("gating reads");
+
+        let error =
+            print_tool_gate_preview(&gating, vec!["delete_user".to_owned()], &["admin=met".to_owned()], Output::Table)
+                .expect_err("admin is a typo")
+                .to_string();
+        let malformed =
+            print_tool_gate_preview(&gating, vec!["delete_user".to_owned()], &["admins".to_owned()], Output::Table)
+                .expect_err("no state")
+                .to_string();
+
+        assert!(error.starts_with("--condition names 'admin'"), "{error}");
+        assert!(malformed.starts_with("--condition 'admins' should be"), "{malformed}");
+    }
+
+    #[test]
+    fn a_gates_file_that_is_not_valid_is_refused_with_the_field() {
+        let file = json_file(r#"{"gates":[{"action":{"effect":"block"}}]}"#);
+
+        let error = read_gates_file(file.path())
+            .expect_err("block is not an effect")
+            .to_string();
+
+        assert_eq!(error, "mcp_tool_gating.gates.0.action.effect should be 'allow' or 'deny', found 'block'");
+    }
+
+    #[test]
+    fn a_preview_with_only_blank_tool_names_is_refused() {
+        let error = print_tool_gate_preview(
+            &Gating {
+                denies_by_default: false,
+                gates: Vec::new(),
+            },
+            vec![" ".to_owned(), String::new()],
+            &[],
+            Output::Table,
+        )
+        .expect_err("a preview needs a tool")
+        .to_string();
+
+        assert_eq!(error, "--tool needs at least one tool name");
+    }
+
+    #[tokio::test]
+    async fn tool_gate_preview_with_a_gates_file_never_reaches_the_gateway() {
+        let (host, requests) = scripted_server(vec![]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let file = json_file(DELETE_GATE_FILE);
+        let command = surface_command(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "tool-gate-preview",
+            "--gates-file",
+            file.path()
+                .to_str()
+                .expect("path"),
+            "--tool",
+            "delete_user,get_user",
+        ]);
+
+        let value = run_surfaces(&client, command, Output::Json)
+            .await
+            .expect("the preview should succeed");
+
+        assert_eq!(value, None, "the preview is printed by the command itself");
+        assert!(request_lines(requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_gate_preview_with_a_surface_reads_it_and_changes_nothing() {
+        let (host, requests) = scripted_server(vec![("HTTP/1.1 200 OK", GATED_SURFACE)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command =
+            surface_command(&["fabric", "agent-gateway", "surfaces", "tool-gate-preview", "s-1", "--tool", "get_user"]);
+
+        let value = run_surfaces(&client, command, Output::Table)
+            .await
+            .expect("the preview should succeed");
+
+        assert_eq!(value, None);
+        assert_eq!(request_lines(requests), ["GET /api/v1/surfaces/s-1 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn tool_gate_preview_of_a_missing_surface_fails() {
+        let (host, _) = scripted_server(vec![("HTTP/1.1 404 Not Found", r#"{"error":"not found"}"#)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command =
+            surface_command(&["fabric", "agent-gateway", "surfaces", "tool-gate-preview", "s-9", "--tool", "a"]);
+
+        run_surfaces(&client, command, Output::Table)
+            .await
+            .expect_err("a surface that does not exist has no gates to preview");
     }
 
     #[tokio::test]
@@ -5211,7 +5568,215 @@ async fn run_surfaces(
         SurfaceCommand::AddFeature(args) => add_feature(client, args, output).await,
         SurfaceCommand::RemoveFeature(args) => remove_feature(client, args, output).await,
         SurfaceCommand::Features => unreachable!("features listing is handled before client setup"),
+        SurfaceCommand::ToolGatePreview(args) => {
+            let gating = match (&args.surface_id, &args.gates_file) {
+                (Some(surface_id), _) => {
+                    let surface = fetch_surface(client, &entity_path("/v1/surfaces", surface_id)).await?;
+                    tool_gate_preview::read_gating(&surface.value, MCP_TOOL_GATING_PATH)?
+                }
+                (None, Some(file)) => read_gates_file(file)?,
+                (None, None) => unreachable!("clap requires a surface or a gates file"),
+            };
+            print_tool_gate_preview(&gating, args.tools, &args.conditions, output)?;
+            Ok(None)
+        }
     }
+}
+
+/// Where a surface keeps its MCP tool gating.
+const MCP_TOOL_GATING_PATH: &str = "target.mcp_tool_gating";
+
+fn read_gates_file(file: &Path) -> Result<Gating> {
+    tool_gate_preview::read_gating_config(&read_json(file)?, "mcp_tool_gating")
+}
+
+/// Print the outcome of `tools` under `gating` for a caller who meets the
+/// `conditions` given as `POLICY_ID=met` or `POLICY_ID=unmet`, with the tool
+/// names trimmed and repeats dropped.
+fn print_tool_gate_preview(
+    gating: &Gating,
+    tools: Vec<String>,
+    conditions: &[String],
+    output: Output,
+) -> Result<()> {
+    let mut names: Vec<String> = Vec::new();
+    for tool in tools {
+        let tool = tool.trim();
+        if !tool.is_empty()
+            && !names
+                .iter()
+                .any(|name| name == tool)
+        {
+            names.push(tool.to_owned());
+        }
+    }
+    if names.is_empty() {
+        bail!("--tool needs at least one tool name");
+    }
+    let pinned = tool_gate_preview::parse_pins(conditions)?;
+    let previewed = tool_gate_preview::preview(gating, &names, &pinned)?;
+    let warnings = tool_gate_preview::warnings(gating, &names);
+    match output {
+        Output::Json => {
+            println!("{}", serde_json::to_string_pretty(&tool_gate_preview_json(gating, &previewed, &warnings))?)
+        }
+        Output::Table => print!("{}", tool_gate_preview_table(gating, &previewed, &warnings)),
+    }
+    Ok(())
+}
+
+fn effect_word(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Allowed => "allow",
+        Verdict::Blocked => "deny",
+    }
+}
+
+/// The conditions as `admins met, contractors not met`.
+fn conditions_text(conditions: &Conditions) -> String {
+    conditions
+        .iter()
+        .map(|(policy, met)| {
+            format!(
+                "{} {}",
+                table_cell(policy),
+                if *met {
+                    "met"
+                } else {
+                    "not met"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn conditions_json(conditions: &Conditions) -> Value {
+    Value::Object(
+        conditions
+            .iter()
+            .map(|(policy, met)| {
+                (
+                    policy.clone(),
+                    json!(if *met {
+                        "met"
+                    } else {
+                        "not_met"
+                    }),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn tool_gate_preview_json(
+    gating: &Gating,
+    previewed: &Preview,
+    warnings: &[String],
+) -> Value {
+    let tools: Vec<Value> = previewed
+        .tools
+        .iter()
+        .map(|preview| {
+            let results: Vec<Value> = preview
+                .outcomes
+                .iter()
+                .map(|outcome| {
+                    json!({
+                        "conditions": conditions_json(&outcome.conditions),
+                        "result": effect_word(outcome.decision.verdict),
+                        "decided_by": outcome.decision.decided_by,
+                    })
+                })
+                .collect();
+            json!({"tool": preview.tool, "results": results})
+        })
+        .collect();
+    json!({
+        "default_effect": if gating.denies_by_default { "deny" } else { "allow" },
+        "assumed": conditions_json(&previewed.assumed),
+        "tools": tools,
+        "warnings": warnings,
+    })
+}
+
+fn tool_gate_preview_table(
+    gating: &Gating,
+    previewed: &Preview,
+    warnings: &[String],
+) -> String {
+    let with_condition = previewed
+        .tools
+        .iter()
+        .any(ToolPreview::depends_on_conditions);
+    let default = format!(
+        "default ({})",
+        if gating.denies_by_default {
+            "deny"
+        } else {
+            "allow"
+        }
+    );
+    let mut header = vec!["TOOL", "RESULT", "DECIDED BY"];
+    if with_condition {
+        header.insert(1, "CONDITION");
+    }
+    let mut rows: Vec<Vec<String>> = vec![
+        header
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    ];
+    for preview in &previewed.tools {
+        for outcome in &preview.outcomes {
+            let mut cells = vec![table_cell(&preview.tool)];
+            if with_condition {
+                cells.push(if outcome.conditions.is_empty() {
+                    "either way".to_owned()
+                } else {
+                    conditions_text(&outcome.conditions)
+                });
+            }
+            cells.push(effect_word(outcome.decision.verdict).to_uppercase());
+            cells.push(
+                outcome
+                    .decision
+                    .decided_by
+                    .as_deref()
+                    .map_or_else(|| default.clone(), table_cell),
+            );
+            rows.push(cells);
+        }
+    }
+    let columns = rows[0].len();
+    let widths: Vec<usize> = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .map(|cells| cells[column].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut text = String::new();
+    if !previewed.assumed.is_empty() {
+        text.push_str(&format!("Assuming: {}\n\n", conditions_text(&previewed.assumed)));
+    }
+    for cells in &rows {
+        let line: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(cell, width)| format!("{cell:<width$}"))
+            .collect();
+        text.push_str(line.join("  ").trim_end());
+        text.push('\n');
+    }
+    if !warnings.is_empty() {
+        text.push_str("\nWarnings\n");
+        for warning in warnings {
+            text.push_str(&format!("  - {}\n", table_cell(warning)));
+        }
+    }
+    text
 }
 
 fn surface_body(args: SurfaceCreateArgs) -> Result<Value> {
