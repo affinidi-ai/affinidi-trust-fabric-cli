@@ -687,8 +687,10 @@ enum SurfaceCommand {
     /// caller, so state what you know with --condition, such as
     /// `--condition admins=met`. Every other condition policy is tried both
     /// ways, and a tool whose result depends on it is shown once per
-    /// combination. At most 3 can be left unpinned. A pattern matches anywhere
-    /// in a tool name unless it starts with ^.
+    /// combination. At most 3 can be left unpinned. A condition whose policy
+    /// does not exist or is disabled acts as a block gate on and an allow gate
+    /// off, and the preview cannot tell, so check the policy exists. A pattern
+    /// matches anywhere in a tool name unless it starts with ^.
     #[command(after_long_help = TOOL_GATE_PREVIEW_EXAMPLES)]
     ToolGatePreview(ToolGatePreviewArgs),
 }
@@ -984,6 +986,22 @@ impl ApiMethod {
     }
 }
 
+/// Runs a command that needs no saved connection, token or gateway, before
+/// any of those is looked up. Returns `None` for every other command.
+fn run_offline(cli: &AgentGatewayArgs) -> Option<Result<()>> {
+    let Command::Surfaces {
+        command: SurfaceCommand::ToolGatePreview(args),
+    } = &cli.command
+    else {
+        return None;
+    };
+    let file = args.gates_file.as_ref()?;
+    Some(
+        read_gates_file(file)
+            .and_then(|gating| print_tool_gate_preview(&gating, args.tools.clone(), &args.conditions, cli.output)),
+    )
+}
+
 /// Runs one command. Both the one-shot CLI and the interactive shell print
 /// what this returns, so every command's error passes through
 /// `add_terms_hint` here, and only here: the gateway's Terms gate can refuse
@@ -996,6 +1014,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     let cli = cli.into_agent_gateway();
+    if let Some(result) = run_offline(&cli) {
+        return result;
+    }
     let credentials = OsCredentialStore::new();
     let mut config = Config::load()?;
     config.migrate_legacy_tokens(&credentials)?;
@@ -1030,14 +1051,6 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => {
             print_features(cli.output);
             Ok(())
-        }
-        Command::Surfaces {
-            command: SurfaceCommand::ToolGatePreview(args),
-        } if args.surface_id.is_none() => {
-            let file = args
-                .gates_file
-                .context("clap requires a surface or a gates file")?;
-            print_tool_gate_preview(&read_gates_file(&file)?, args.tools, &args.conditions, cli.output)
         }
         command => {
             let (connection_name, saved) = config.resolve(cli.connection.as_deref())?;
@@ -3154,7 +3167,7 @@ mod gateway_config_tests {
             table.contains("\nWarnings\n  - 'Blocker' has a pattern that is not valid regex (delete_()."),
             "{table}"
         );
-        assert!(table.contains("also matches 'undelete_draft' in the middle of the name"), "{table}");
+        assert!(table.contains("so it also catches 'undelete_draft'"), "{table}");
         assert!(table.contains("undelete_draft  DENY    Blocker"), "{table}");
     }
 
@@ -3173,7 +3186,7 @@ mod gateway_config_tests {
                 "tools": [
                     {"tool": "delete_user", "results": [
                         {"conditions": {"contractors": "met"}, "result": "deny", "decided_by": "Tool Gate 2"},
-                        {"conditions": {"contractors": "not_met"}, "result": "allow", "decided_by": "Tool Gate 1"}
+                        {"conditions": {"contractors": "unmet"}, "result": "allow", "decided_by": "Tool Gate 1"}
                     ]},
                     {"tool": "get_user", "results": [
                         {"conditions": {}, "result": "deny", "decided_by": null}
@@ -3279,11 +3292,10 @@ mod gateway_config_tests {
     }
 
     #[tokio::test]
-    async fn tool_gate_preview_with_a_gates_file_never_reaches_the_gateway() {
+    async fn tool_gate_preview_with_a_gates_file_runs_offline_through_the_real_entry_point() {
         let (host, requests) = scripted_server(vec![]).await;
-        let client = GatewayClient::new(host, "agpat_valid").expect("client");
         let file = json_file(DELETE_GATE_FILE);
-        let command = surface_command(&[
+        let cli = Cli::try_parse_from([
             "fabric",
             "agent-gateway",
             "surfaces",
@@ -3294,13 +3306,65 @@ mod gateway_config_tests {
                 .expect("path"),
             "--tool",
             "delete_user,get_user",
+            "--condition",
+            "non-admins=met",
+            "--host",
+            host.as_str(),
+            "--token",
+            "agpat_valid",
+            "-o",
+            "json",
+        ])
+        .expect("arguments should parse");
+
+        run(cli)
+            .await
+            .expect("the preview should succeed with no saved connection");
+
+        assert!(request_lines(requests).is_empty(), "a gates file never contacts a gateway");
+    }
+
+    #[test]
+    fn only_a_gates_file_preview_is_run_offline() {
+        let file = json_file(DELETE_GATE_FILE);
+        let path = file
+            .path()
+            .to_str()
+            .expect("path");
+        let parse = |args: &[&str]| {
+            let mut all = vec!["fabric", "agent-gateway"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all)
+                .expect("arguments should parse")
+                .into_agent_gateway()
+        };
+
+        assert!(run_offline(&parse(&["surfaces", "tool-gate-preview", "--gates-file", path, "--tool", "a"])).is_some());
+        assert!(run_offline(&parse(&["surfaces", "tool-gate-preview", "s-1", "--tool", "a"])).is_none());
+        assert!(run_offline(&parse(&["surfaces", "list"])).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_surfaces_leaves_a_gates_file_to_the_offline_path() {
+        let (host, requests) = scripted_server(vec![]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command = surface_command(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "tool-gate-preview",
+            "--gates-file",
+            "gates.json",
+            "--tool",
+            "a",
         ]);
 
-        let value = run_surfaces(&client, command, Output::Json)
+        let error = run_surfaces(&client, command, Output::Json)
             .await
-            .expect("the preview should succeed");
+            .expect_err("run_surfaces reads a surface, not a file")
+            .to_string();
 
-        assert_eq!(value, None, "the preview is printed by the command itself");
+        assert!(error.starts_with("internal error: --gates-file"), "{error}");
         assert!(request_lines(requests).is_empty());
     }
 
@@ -5605,14 +5669,11 @@ async fn run_surfaces(
         SurfaceCommand::RemoveFeature(args) => remove_feature(client, args, output).await,
         SurfaceCommand::Features => unreachable!("features listing is handled before client setup"),
         SurfaceCommand::ToolGatePreview(args) => {
-            let gating = match (&args.surface_id, &args.gates_file) {
-                (Some(surface_id), _) => {
-                    let surface = fetch_surface(client, &entity_path("/v1/surfaces", surface_id)).await?;
-                    tool_gate_preview::read_gating(&surface.value, MCP_TOOL_GATING_PATH)?
-                }
-                (None, Some(file)) => read_gates_file(file)?,
-                (None, None) => unreachable!("clap requires a surface or a gates file"),
+            let Some(surface_id) = &args.surface_id else {
+                bail!("internal error: --gates-file is handled before a gateway connection is made");
             };
+            let surface = fetch_surface(client, &entity_path("/v1/surfaces", surface_id)).await?;
+            let gating = tool_gate_preview::read_gating(&surface.value, MCP_TOOL_GATING_PATH)?;
             print_tool_gate_preview(&gating, args.tools, &args.conditions, output)?;
             Ok(None)
         }
@@ -5697,7 +5758,7 @@ fn conditions_json(conditions: &Conditions) -> Value {
                     json!(if *met {
                         "met"
                     } else {
-                        "not_met"
+                        "unmet"
                     }),
                 )
             })
@@ -5753,57 +5814,47 @@ fn tool_gate_preview_table(
             "allow"
         }
     );
-    let mut header = vec!["TOOL", "RESULT", "DECIDED BY"];
-    if with_condition {
-        header.insert(1, "CONDITION");
-    }
-    let mut rows: Vec<Vec<String>> = vec![
-        header
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-    ];
+    // One entry per row: the condition cell, the result and who decided.
+    let mut entries: Vec<(String, String, String, String)> = Vec::new();
     for preview in &previewed.tools {
         for outcome in &preview.outcomes {
-            let mut cells = vec![table_cell(&preview.tool)];
-            if with_condition {
-                cells.push(if outcome.conditions.is_empty() {
-                    "either way".to_owned()
-                } else {
-                    conditions_text(&outcome.conditions)
-                });
-            }
-            cells.push(effect_word(outcome.decision.verdict).to_uppercase());
-            cells.push(
-                outcome
-                    .decision
-                    .decided_by
-                    .as_deref()
-                    .map_or_else(|| default.clone(), table_cell),
-            );
-            rows.push(cells);
+            let condition = if outcome.conditions.is_empty() {
+                "either way".to_owned()
+            } else {
+                conditions_text(&outcome.conditions)
+            };
+            let decided_by = outcome
+                .decision
+                .decided_by
+                .as_deref()
+                .map_or_else(|| default.clone(), table_cell);
+            entries.push((
+                table_cell(&preview.tool),
+                condition,
+                effect_word(outcome.decision.verdict).to_uppercase(),
+                decided_by,
+            ));
         }
     }
-    let columns = rows[0].len();
-    let widths: Vec<usize> = (0..columns)
-        .map(|column| {
-            rows.iter()
-                .map(|cells| cells[column].chars().count())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
+    let lines = if with_condition {
+        let rows: Vec<[String; 4]> = entries
+            .into_iter()
+            .map(|(tool, condition, result, decided_by)| [tool, condition, result, decided_by])
+            .collect();
+        format_table(&["TOOL", "CONDITION", "RESULT", "DECIDED BY"], &rows)
+    } else {
+        let rows: Vec<[String; 3]> = entries
+            .into_iter()
+            .map(|(tool, _, result, decided_by)| [tool, result, decided_by])
+            .collect();
+        format_table(&["TOOL", "RESULT", "DECIDED BY"], &rows)
+    };
     let mut text = String::new();
     if !previewed.assumed.is_empty() {
         text.push_str(&format!("Assuming: {}\n\n", conditions_text(&previewed.assumed)));
     }
-    for cells in &rows {
-        let line: Vec<String> = cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, width)| format!("{cell:<width$}"))
-            .collect();
-        text.push_str(line.join("  ").trim_end());
+    for line in lines {
+        text.push_str(&line);
         text.push('\n');
     }
     if !warnings.is_empty() {

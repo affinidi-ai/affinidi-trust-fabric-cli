@@ -43,42 +43,118 @@ pub enum Verdict {
 /// policy that is not listed counts as not met.
 pub type Conditions = BTreeMap<String, bool>;
 
-/// One gate read from a surface, in the order the surface lists it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Gate {
-    /// The name the surface builder shows for the gate: its own name where it
-    /// has one, otherwise `Tool Gate N` for its 1-based position in the list.
-    pub name: String,
-    /// `true` where the gate denies, `false` where it allows.
-    pub denies: bool,
-    /// The gate's regex patterns, matched against a tool name.
-    pub patterns: Vec<String>,
-    /// The id of the condition policy that decides whether the gate applies,
-    /// or `None` where the gate always applies.
-    pub condition: Option<String>,
+/// How a gate's condition is settled.
+enum Condition<'a> {
+    /// No condition, so the gate always applies.
+    Always,
+    /// A condition policy the caller either meets or does not, looked up by
+    /// its id exactly as written.
+    Policy(&'a str),
+    /// A blank policy id. The gateway finds no policy for it, so it fails
+    /// closed: a deny gate stays on and an allow gate is off.
+    Unresolved,
 }
 
-impl Gate {
-    /// The patterns that compile, each trimmed as the gateway trims it and
-    /// paired with its regex, and the trimmed ones that do not. A blank
-    /// pattern is ignored, as the gateway ignores it.
-    fn compile(&self) -> (Vec<(&str, Regex)>, Vec<&str>) {
-        let mut valid = Vec::new();
-        let mut invalid = Vec::new();
-        for pattern in self
-            .patterns
-            .iter()
-            .map(|pattern| pattern.trim())
-        {
-            if pattern.is_empty() {
+/// A gate's patterns, compiled once when the gate is read.
+#[derive(Debug, Clone)]
+struct Patterns {
+    /// Each pattern that compiled, trimmed as the gateway trims it, with its
+    /// regex.
+    matching: Vec<(String, Regex)>,
+    /// Trimmed patterns that are not valid regex.
+    not_valid: Vec<String>,
+    /// Trimmed patterns that are valid but too large to compile.
+    too_large: Vec<String>,
+}
+
+impl Patterns {
+    /// Compile `patterns`. A blank pattern is ignored, as the gateway ignores
+    /// it, and so is one over the length the gateway saves, which the gateway
+    /// does not compile either.
+    fn compile(patterns: &[String]) -> Self {
+        let mut compiled = Self {
+            matching: Vec::new(),
+            not_valid: Vec::new(),
+            too_large: Vec::new(),
+        };
+        for raw in patterns {
+            let pattern = raw.trim();
+            if pattern.is_empty() || raw.len() > PATTERN_BYTES_MAX {
                 continue;
             }
             match Regex::new(pattern) {
-                Ok(regex) => valid.push((pattern, regex)),
-                Err(_) => invalid.push(pattern),
+                Ok(regex) => compiled
+                    .matching
+                    .push((pattern.to_owned(), regex)),
+                Err(regex::Error::CompiledTooBig(_)) => compiled
+                    .too_large
+                    .push(pattern.to_owned()),
+                Err(_) => compiled
+                    .not_valid
+                    .push(pattern.to_owned()),
             }
         }
-        (valid, invalid)
+        compiled
+    }
+}
+
+/// One gate read from a surface, in the order the surface lists it.
+#[derive(Debug, Clone)]
+pub struct Gate {
+    /// The name the surface builder shows for the gate: its own name where it
+    /// has one, otherwise `Tool Gate N` for its 1-based position in the list.
+    name: String,
+    /// `true` where the gate denies, `false` where it allows.
+    denies: bool,
+    /// The gate's regex patterns as written, matched against a tool name.
+    patterns: Vec<String>,
+    /// The id of the condition policy that decides whether the gate applies,
+    /// or `None` where the gate always applies.
+    condition: Option<String>,
+    compiled: Patterns,
+}
+
+impl PartialEq for Gate {
+    fn eq(
+        &self,
+        other: &Self,
+    ) -> bool {
+        self.name == other.name
+            && self.denies == other.denies
+            && self.patterns == other.patterns
+            && self.condition == other.condition
+    }
+}
+
+impl Gate {
+    pub fn new(
+        name: String,
+        denies: bool,
+        patterns: Vec<String>,
+        condition: Option<String>,
+    ) -> Self {
+        let compiled = Patterns::compile(&patterns);
+        Self {
+            name,
+            denies,
+            patterns,
+            condition,
+            compiled,
+        }
+    }
+
+    fn condition(&self) -> Condition<'_> {
+        match self.condition.as_deref() {
+            None => Condition::Always,
+            Some(id) if id.trim().is_empty() => Condition::Unresolved,
+            Some(id) => Condition::Policy(id),
+        }
+    }
+
+    /// Whether the gate blocks whatever it matches for every caller, because
+    /// it is a deny gate with no condition or one that never resolves.
+    fn always_blocks(&self) -> bool {
+        self.denies && !matches!(self.condition(), Condition::Policy(_))
     }
 
     /// Whether any of the gate's patterns matches `tool`, the way the gateway
@@ -88,8 +164,8 @@ impl Gate {
         &self,
         tool: &str,
     ) -> bool {
-        self.compile()
-            .0
+        self.compiled
+            .matching
             .iter()
             .any(|(_, regex)| regex.is_match(tool))
     }
@@ -99,14 +175,14 @@ impl Gate {
         &self,
         conditions: &Conditions,
     ) -> bool {
-        self.condition
-            .as_ref()
-            .is_none_or(|policy| {
-                conditions
-                    .get(policy)
-                    .copied()
-                    .unwrap_or(false)
-            })
+        match self.condition() {
+            Condition::Always => true,
+            Condition::Policy(id) => conditions
+                .get(id)
+                .copied()
+                .unwrap_or(false),
+            Condition::Unresolved => self.denies,
+        }
     }
 }
 
@@ -124,7 +200,10 @@ impl Gating {
     pub fn policy_ids(&self) -> Vec<String> {
         self.gates
             .iter()
-            .filter_map(|gate| gate.condition.clone())
+            .filter_map(|gate| match gate.condition() {
+                Condition::Policy(id) => Some(id.to_owned()),
+                _ => None,
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -216,7 +295,7 @@ pub fn parse_pins(pins: &[String]) -> Result<Conditions> {
     let mut assumed = Conditions::new();
     for pin in pins {
         let (policy, state) = match pin.rsplit_once('=') {
-            Some((policy, state)) if !policy.trim().is_empty() => (policy.trim(), state.trim()),
+            Some((policy, state)) if !policy.is_empty() => (policy, state.trim()),
             _ => bail!("--condition '{pin}' should be POLICY_ID=met or POLICY_ID=unmet"),
         };
         let met = match state {
@@ -251,7 +330,7 @@ pub fn preview(
         if policies.is_empty() {
             bail!("--condition names '{unknown}', but none of the gates has a condition");
         }
-        bail!("--condition names '{unknown}', but no gate uses it; the gates use: {}", policies.join(", "));
+        bail!("--condition names '{unknown}', but no gate uses it; the gates use: {}", quoted(&policies));
     }
     let free: Vec<&String> = policies
         .iter()
@@ -328,6 +407,17 @@ pub fn warnings(
     }
     for gate in &gating.gates {
         let name = &gate.name;
+        match gate.condition() {
+            Condition::Unresolved => found.push(format!(
+                "'{name}' has an empty condition policy id, so the gateway can never meet it: a block gate stays on \
+                 and an allow gate is off."
+            )),
+            Condition::Policy(id) if id.trim() != id => found.push(format!(
+                "'{name}' has spaces at the start or end of its condition policy id; the gateway looks it up exactly \
+                 as written."
+            )),
+            _ => {}
+        }
         let effective = gate
             .patterns
             .iter()
@@ -338,26 +428,38 @@ pub fn warnings(
                 effective.clone().count()
             ));
         }
-        for pattern in effective.filter(|pattern| pattern.len() > PATTERN_BYTES_MAX) {
+        for pattern in effective
+            .clone()
+            .filter(|pattern| pattern.len() > PATTERN_BYTES_MAX)
+        {
             found.push(format!(
                 "'{name}' has a pattern of {} bytes, and the gateway will refuse to save one longer than \
-                 {PATTERN_BYTES_MAX} bytes.",
+                 {PATTERN_BYTES_MAX} bytes. It matches no tool here.",
                 pattern.len()
             ));
         }
-        let (valid, invalid) = gate.compile();
-        for pattern in &invalid {
+        for pattern in &gate.compiled.not_valid {
             found.push(format!(
                 "'{name}' has a pattern that is not valid regex ({pattern}). It matches no tool, and the gateway will \
                  refuse to save it."
             ));
         }
-        if valid.is_empty() {
-            if invalid.is_empty() {
-                found.push(format!(
-                    "'{name}' has no patterns, so it matches no tool, and the gateway will refuse to save it."
-                ));
-            }
+        for pattern in &gate.compiled.too_large {
+            found.push(format!(
+                "'{name}' has a pattern that is too large to compile ({pattern}), so the gateway will most likely \
+                 refuse to save it. It matches no tool here."
+            ));
+        }
+        if effective.count() == 0 {
+            found.push(format!(
+                "'{name}' has no patterns, so it matches no tool, and the gateway will refuse to save it."
+            ));
+        }
+        if gate
+            .compiled
+            .matching
+            .is_empty()
+        {
             continue;
         }
         let matched: Vec<&String> = tools
@@ -372,7 +474,7 @@ pub fn warnings(
             let blockers: Vec<&str> = gating
                 .gates
                 .iter()
-                .filter(|other| other.denies && other.condition.is_none())
+                .filter(|other| other.always_blocks())
                 .filter(|other| {
                     matched
                         .iter()
@@ -384,7 +486,7 @@ pub fn warnings(
                 gating
                     .gates
                     .iter()
-                    .any(|other| other.denies && other.condition.is_none() && other.matches(tool))
+                    .any(|other| other.always_blocks() && other.matches(tool))
             });
             if all_blocked {
                 found.push(format!(
@@ -403,8 +505,8 @@ pub fn warnings(
         if matched.is_empty() {
             found.push(format!("'{name}' matches none of the tools you gave."));
         }
-        for (pattern, regex) in &valid {
-            if pattern.starts_with('^') {
+        for (pattern, regex) in &gate.compiled.matching {
+            if ends_anchored(pattern) {
                 continue;
             }
             let inside: Vec<&String> = tools
@@ -416,15 +518,49 @@ pub fn warnings(
                 })
                 .collect();
             if !inside.is_empty() {
+                let anchor = if pattern.contains('|') {
+                    format!(
+                        "^(?:{})",
+                        pattern
+                            .strip_prefix('^')
+                            .unwrap_or(pattern)
+                    )
+                } else {
+                    "^".to_owned()
+                };
                 found.push(format!(
-                    "'{name}' pattern {pattern} also matches {} in the middle of the name, because a pattern matches \
-                     anywhere in a tool name. Start it with ^ to match from the beginning.",
+                    "'{name}' pattern {pattern} matches anywhere in the name, so it also catches {}. Add {anchor} if \
+                     you only want names that start with it.",
                     quoted(&inside)
                 ));
             }
         }
     }
     found
+}
+
+/// Whether `pattern` ends with `$` or `\z`, not escaped, optionally followed by
+/// closing groups, so a match that starts inside a tool name is what the
+/// pattern asks for.
+fn ends_anchored(pattern: &str) -> bool {
+    let backslashes = |text: &str| {
+        text.chars()
+            .rev()
+            .take_while(|character| *character == '\\')
+            .count()
+    };
+    let mut end = pattern;
+    while let Some(rest) = end.strip_suffix(')') {
+        if backslashes(rest) % 2 != 0 {
+            break;
+        }
+        end = rest;
+    }
+    if let Some(rest) = end.strip_suffix('$') {
+        return backslashes(rest) % 2 == 0;
+    }
+    end.strip_suffix('z')
+        .is_some_and(|rest| backslashes(rest) % 2 == 1)
 }
 
 /// The names as `'a', 'b'`, dropping repeats.
@@ -522,16 +658,12 @@ fn read_gate(
             .collect::<Result<Vec<_>>>()?,
         Some(other) => bail!("{at}.action.patterns should be a list, found {other}"),
     };
-    Ok(Gate {
-        name,
-        denies: effect_denies(effect, &format!("{at}.action.effect"))?,
-        patterns,
-        condition: match gate.get("condition_policy_definition_id") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(policy)) => Some(policy.clone()),
-            Some(other) => bail!("{at}.condition_policy_definition_id should be text, found {other}"),
-        },
-    })
+    let condition = match gate.get("condition_policy_definition_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(policy)) => Some(policy.clone()),
+        Some(other) => bail!("{at}.condition_policy_definition_id should be text, found {other}"),
+    };
+    Ok(Gate::new(name, effect_denies(effect, &format!("{at}.action.effect"))?, patterns, condition))
 }
 
 /// Read an `allow` or `deny` effect, refusing anything else with the field it
@@ -557,14 +689,27 @@ mod tests {
         denies: bool,
         patterns: &[&str],
     ) -> Gate {
-        Gate {
-            name: name.to_owned(),
+        Gate::new(
+            name.to_owned(),
             denies,
-            patterns: patterns
+            patterns
                 .iter()
                 .map(|p| (*p).to_owned())
                 .collect(),
-            condition: None,
+            None,
+        )
+    }
+
+    /// A gate whose condition policy id is `policy`, kept exactly as given.
+    fn with_policy(
+        name: &str,
+        denies: bool,
+        patterns: &[&str],
+        policy: &str,
+    ) -> Gate {
+        Gate {
+            condition: Some(policy.to_owned()),
+            ..gate(name, denies, patterns)
         }
     }
 
@@ -573,10 +718,7 @@ mod tests {
         denies: bool,
         patterns: &[&str],
     ) -> Gate {
-        Gate {
-            condition: Some(name.to_owned()),
-            ..gate(name, denies, patterns)
-        }
+        with_policy(name, denies, patterns, name)
     }
 
     fn verdict(
@@ -820,12 +962,12 @@ mod tests {
             read_gating(&surface, "target.mcp_tool_gating").expect("the surface is readable"),
             Gating {
                 denies_by_default: true,
-                gates: vec![Gate {
-                    name: "no-delete".to_owned(),
-                    denies: true,
-                    patterns: vec!["^delete_".to_owned()],
-                    condition: Some("non-admins".to_owned()),
-                }],
+                gates: vec![Gate::new(
+                    "no-delete".to_owned(),
+                    true,
+                    vec!["^delete_".to_owned()],
+                    Some("non-admins".to_owned())
+                )],
             }
         );
     }
@@ -1107,13 +1249,13 @@ mod tests {
         .expect_err("no gate has a condition")
         .to_string();
 
-        assert_eq!(error, "--condition names 'admin', but no gate uses it; the gates use: admins, contractors");
+        assert_eq!(error, "--condition names 'admin', but no gate uses it; the gates use: 'admins', 'contractors'");
         assert_eq!(none, "--condition names 'admin', but none of the gates has a condition");
     }
 
     #[test]
     fn parse_pins_reads_met_and_unmet() {
-        let parsed = parse_pins(&["admins=met".to_owned(), " contractors = unmet".to_owned(), "a=b=met".to_owned()])
+        let parsed = parse_pins(&["admins=met".to_owned(), "contractors=unmet ".to_owned(), "a=b=met".to_owned()])
             .expect("well formed");
 
         assert_eq!(parsed, pins(&[("admins", true), ("contractors", false), ("a=b", true)]));
@@ -1231,8 +1373,8 @@ mod tests {
         assert_eq!(
             warnings(&gating, &tools(&[&long, &exact, &wide])),
             [
-                "'Long' has a pattern of 513 bytes, and the gateway will refuse to save one longer than 512 bytes.",
-                "'Wide' has a pattern of 514 bytes, and the gateway will refuse to save one longer than 512 bytes."
+                "'Long' has a pattern of 513 bytes, and the gateway will refuse to save one longer than 512 bytes. It matches no tool here.",
+                "'Wide' has a pattern of 514 bytes, and the gateway will refuse to save one longer than 512 bytes. It matches no tool here."
             ]
         );
     }
@@ -1366,7 +1508,7 @@ mod tests {
         assert_eq!(
             warnings(&gating, &tools(&["delete_user", "undelete_draft", "redelete_x"])),
             [
-                "'Tool Gate 1' pattern delete_.* also matches 'undelete_draft', 'redelete_x' in the middle of the name, because a pattern matches anywhere in a tool name. Start it with ^ to match from the beginning."
+                "'Tool Gate 1' pattern delete_.* matches anywhere in the name, so it also catches 'undelete_draft', 'redelete_x'. Add ^ if you only want names that start with it."
             ]
         );
     }
@@ -1379,5 +1521,272 @@ mod tests {
         };
 
         assert!(warnings(&gating, &tools(&["delete_user"])).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_ending_in_an_end_anchor_gets_no_middle_of_the_name_warning() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Suffix", true, &["_user$"]), gate("Suffix z", true, &["_user\\z"])],
+        };
+
+        assert!(warnings(&gating, &tools(&["delete_user"])).is_empty());
+    }
+
+    #[test]
+    fn an_escaped_dollar_is_not_an_end_anchor() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Price", true, &["cost\\$"])],
+        };
+
+        assert_eq!(warnings(&gating, &tools(&["a_cost$"])).len(), 1);
+    }
+
+    #[test]
+    fn warns_when_only_one_alternative_is_anchored_and_suggests_wrapping_them() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Mixed", true, &["^get_|delete_"])],
+        };
+
+        assert_eq!(
+            warnings(&gating, &tools(&["get_user", "undelete_x"])),
+            [
+                "'Mixed' pattern ^get_|delete_ matches anywhere in the name, so it also catches 'undelete_x'. Add ^(?:get_|delete_) if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn warns_about_a_mid_name_match_of_a_pattern_without_a_leading_anchor() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Tool Gate 1", true, &["delete_.*"])],
+        };
+
+        assert_eq!(warnings(&gating, &tools(&["undelete_draft"])).len(), 1);
+    }
+
+    #[test]
+    fn an_anchored_pattern_gets_no_warning() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Tool Gate 1", true, &["^delete_"])],
+        };
+
+        assert!(warnings(&gating, &tools(&["delete_user", "undelete_draft"])).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_over_the_length_the_gateway_saves_matches_nothing() {
+        let long = format!("^a{}", "b".repeat(600));
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Long", true, &[&long])],
+        };
+
+        assert_eq!(verdict(&gating, &long[1..]), Verdict::Allowed);
+        assert!(
+            gating.gates[0]
+                .compiled
+                .matching
+                .is_empty()
+        );
+        assert!(
+            gating.gates[0]
+                .compiled
+                .not_valid
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_pattern_is_compiled_when_the_gate_is_read_not_per_tool() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Blocker", true, &["^delete_", "^drop_"])],
+        };
+        let many: Vec<String> = (0..2000)
+            .map(|index| format!("delete_{index}"))
+            .collect();
+
+        let previewed = preview(&gating, &many, &Conditions::new()).expect("no conditions");
+
+        assert_eq!(
+            gating.gates[0]
+                .compiled
+                .matching
+                .len(),
+            2
+        );
+        assert!(
+            previewed
+                .tools
+                .iter()
+                .all(|tool| tool.outcomes[0]
+                    .decision
+                    .verdict
+                    == Verdict::Blocked)
+        );
+    }
+
+    #[test]
+    fn a_valid_pattern_too_big_to_compile_is_told_apart_from_a_syntax_error() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Big", true, &["(?:\\w{100}){100}"]), gate("Broken", true, &["^a("])],
+        };
+
+        let found = warnings(&gating, &tools(&["a"]));
+
+        assert_eq!(
+            found[0],
+            "'Big' has a pattern that is too large to compile ((?:\\w{100}){100}), so the gateway will most likely refuse to save it. It matches no tool here."
+        );
+        assert!(found.contains(
+            &"'Broken' has a pattern that is not valid regex (^a(). It matches no tool, and the gateway will refuse to save it.".to_owned()
+        ));
+        assert_eq!(
+            found
+                .iter()
+                .filter(|note| note.contains("not valid regex"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_blank_condition_policy_id_is_unresolved_so_a_deny_gate_stays_on_and_an_allow_gate_is_off() {
+        let deny = Gating {
+            denies_by_default: false,
+            gates: vec![with_policy("Blocker", true, &["^delete_"], "  ")],
+        };
+        let allow = Gating {
+            denies_by_default: true,
+            gates: vec![with_policy("Opener", false, &["^delete_"], "")],
+        };
+
+        assert_eq!(verdict_with(&deny, "delete_user", true), Verdict::Blocked);
+        assert_eq!(verdict_with(&deny, "delete_user", false), Verdict::Blocked);
+        assert_eq!(verdict_with(&allow, "delete_user", true), Verdict::Blocked);
+        assert!(deny.policy_ids().is_empty());
+        assert!(
+            !preview(&deny, &tools(&["delete_user"]), &Conditions::new())
+                .expect("nothing to enumerate")
+                .tools[0]
+                .depends_on_conditions()
+        );
+        assert_eq!(
+            warnings(&deny, &tools(&["delete_user"])),
+            [
+                "'Blocker' has an empty condition policy id, so the gateway can never meet it: a block gate stays on and an allow gate is off."
+            ]
+        );
+        assert!(warnings(&allow, &tools(&["delete_user"]))[0].starts_with("'Opener' has an empty condition policy id"));
+        assert!(preview(&deny, &tools(&["x"]), &pins(&[("", true)])).is_err());
+    }
+
+    #[test]
+    fn a_condition_policy_id_with_spaces_is_kept_as_written_and_warned_about() {
+        let gating = Gating {
+            denies_by_default: true,
+            gates: vec![with_policy("Opener", false, &["^delete_"], "admins ")],
+        };
+
+        assert_eq!(gating.policy_ids(), ["admins "]);
+        assert_eq!(
+            warnings(&gating, &tools(&["delete_user"])),
+            [
+                "'Opener' has spaces at the start or end of its condition policy id; the gateway looks it up exactly as written."
+            ]
+        );
+        let error = preview(&gating, &tools(&["delete_user"]), &pins(&[("admins", true)]))
+            .expect_err("admins is not the id")
+            .to_string();
+        assert_eq!(error, "--condition names 'admins', but no gate uses it; the gates use: 'admins '");
+        let exact = preview(&gating, &tools(&["delete_user"]), &pins(&[("admins ", true)])).expect("exact id pins");
+        assert_eq!(
+            exact.tools[0].outcomes[0]
+                .decision
+                .verdict,
+            Verdict::Allowed
+        );
+        assert!(parse_pins(&["admins =met".to_owned()]).expect("kept")["admins "]);
+    }
+
+    #[test]
+    fn a_deny_gate_with_a_blank_condition_counts_as_always_blocking_in_warnings() {
+        let gating = Gating {
+            denies_by_default: true,
+            gates: vec![gate("Reads", false, &["^get_"]), with_policy("Blocker", true, &["^get_"], " ")],
+        };
+
+        assert!(
+            warnings(&gating, &tools(&["get_user"]))
+                .iter()
+                .any(|note| note.starts_with("'Reads' lets none of these tools through"))
+        );
+    }
+
+    #[test]
+    fn suggests_wrapping_alternatives_without_a_leading_anchor_of_their_own() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Plain", true, &["get_|delete_"])],
+        };
+
+        assert_eq!(
+            warnings(&gating, &tools(&["undelete_x"])),
+            [
+                "'Plain' pattern get_|delete_ matches anywhere in the name, so it also catches 'undelete_x'. Add ^(?:get_|delete_) if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn asks_about_intent_for_a_plain_pattern_meant_to_match_anywhere() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Bulk", true, &["delete"])],
+        };
+
+        assert_eq!(
+            warnings(&gating, &tools(&["bulk_delete_user", "delete_user"])),
+            [
+                "'Bulk' pattern delete matches anywhere in the name, so it also catches 'bulk_delete_user'. Add ^ if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn an_end_anchor_inside_closing_groups_still_counts_as_end_anchored() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![
+                gate("Group", true, &["(?:_user$)"]),
+                gate("Capture", true, &["(_user$)"]),
+                gate("Nested", true, &["((_user\\z))"]),
+            ],
+        };
+
+        assert!(warnings(&gating, &tools(&["delete_user"])).is_empty());
+    }
+
+    #[test]
+    fn an_end_anchor_in_the_middle_or_an_escaped_one_still_warns() {
+        let middle = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Middle", true, &["_user$|_admin"])],
+        };
+        let escaped_dollar = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Price", true, &["(cost\\$)"])],
+        };
+        assert_eq!(warnings(&middle, &tools(&["delete_admin"])).len(), 1);
+        assert_eq!(warnings(&escaped_dollar, &tools(&["a_cost$"])).len(), 1);
+        assert!(!ends_anchored(r"x$\)"));
+        assert!(!ends_anchored(r"x\$)"));
+        assert!(ends_anchored(r"(x$)"));
     }
 }
