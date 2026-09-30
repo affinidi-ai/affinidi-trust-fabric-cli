@@ -260,10 +260,11 @@ fabric agent-gateway surfaces create --name "Sales Agent" --description "Routes 
 fabric agent-gateway surfaces create --file surface.json
 fabric agent-gateway surfaces update <surface-id> --file surface.json
 fabric agent-gateway surfaces update <surface-id> --set access_point.rate_limit.requests=100 --set name="Sales Agent" --unset description
+fabric agent-gateway surfaces update "Sales Agent" --set access_point.rate_limit.requests=200
 fabric agent-gateway surfaces update <surface-id> --add tags=beta --remove transit.points=billing
 fabric agent-gateway surfaces update <surface-id> --set access_point.route=/billing --dry-run
 fabric agent-gateway policies create --id allow-sales --name "Allow sales" --policy-file allow-sales.rego
-fabric agent-gateway surfaces add-feature <surface-id> rate-limit --json '{"requests":100,"window_secs":60}'
+fabric agent-gateway surfaces add-feature <surface-id-or-name> rate-limit --json '{"requests":100,"window_secs":60}'
 fabric agent-gateway surfaces tool-gate-preview <surface-id> --tool delete_user,get_user
 fabric agent-gateway surfaces tool-gate-preview --gates-file gates.json --tool delete_user --condition admins=met
 fabric agent-gateway connection-points create --file connection-point.json
@@ -271,7 +272,7 @@ fabric agent-gateway connections list
 fabric agent-gateway tokens rotate <token-id> --yes
 ```
 
-The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID.
+The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID. Finding a surface by name needs the `surfaces.view` permission, so a token without it must pass the surface ID (a UUID), including for `update --set`, as with secrets.
 
 `tool-gate-preview` shows whether each tool would be allowed or denied (RESULT) and which gate, or the default, decided it (DECIDED BY).
 
