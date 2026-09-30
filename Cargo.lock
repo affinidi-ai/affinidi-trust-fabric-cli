@@ -416,6 +416,7 @@ dependencies = [
  "open",
  "rand 0.9.5",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rpassword",
  "rustyline",

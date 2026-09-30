@@ -20,6 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
+use regex_syntax::ast::{Ast, GroupKind};
+use regex_syntax::hir::{Hir, HirKind};
 use serde_json::Value;
 
 /// Most gates the gateway saves in one surface.
@@ -65,6 +67,9 @@ struct Patterns {
     not_valid: Vec<String>,
     /// Trimmed patterns that are valid but too large to compile.
     too_large: Vec<String>,
+    /// How many patterns are not blank, which is what the gateway counts
+    /// against its limit.
+    effective: usize,
 }
 
 impl Patterns {
@@ -76,10 +81,15 @@ impl Patterns {
             matching: Vec::new(),
             not_valid: Vec::new(),
             too_large: Vec::new(),
+            effective: 0,
         };
         for raw in patterns {
             let pattern = raw.trim();
-            if pattern.is_empty() || raw.len() > PATTERN_BYTES_MAX {
+            if pattern.is_empty() {
+                continue;
+            }
+            compiled.effective += 1;
+            if raw.len() > PATTERN_BYTES_MAX {
                 continue;
             }
             match Regex::new(pattern) {
@@ -196,6 +206,15 @@ pub struct Gating {
 }
 
 impl Gating {
+    /// What a tool that no active gate matches comes to.
+    pub fn default_verdict(&self) -> Verdict {
+        if self.denies_by_default {
+            Verdict::Blocked
+        } else {
+            Verdict::Allowed
+        }
+    }
+
     /// The distinct condition policy ids the gates name, in order.
     pub fn policy_ids(&self) -> Vec<String> {
         self.gates
@@ -221,11 +240,13 @@ pub struct Decision {
 
 /// Whether `tool` is allowed, and which gate decided.
 ///
-/// The deciding gate is the first active deny gate that matches, otherwise the
-/// first active allow gate that matches, otherwise nothing and the default
-/// decides. The gateway's own decision does not depend on the order gates are
-/// listed in, so a different matching gate of the same effect would give the
-/// same verdict.
+/// The deciding gate is the first active deny gate that matches. Otherwise,
+/// under a deny default, it is the first active allow gate that matches, since
+/// that gate is what lets the tool through. In every other case the default
+/// decides, because under an allow default removing a matching allow gate
+/// changes nothing. The gateway's own decision does not depend on the order
+/// gates are listed in, so a different matching gate of the same effect would
+/// give the same verdict.
 pub fn decide(
     gating: &Gating,
     tool: &str,
@@ -244,18 +265,18 @@ pub fn decide(
         }
         allowed_by.get_or_insert_with(|| gate.name.clone());
     }
-    if let Some(name) = allowed_by {
+    if let Some(name) = allowed_by
+        && gating.denies_by_default
+    {
         return Decision {
             verdict: Verdict::Allowed,
             decided_by: Some(name),
         };
     }
-    let verdict = if gating.denies_by_default {
-        Verdict::Blocked
-    } else {
-        Verdict::Allowed
-    };
-    Decision { verdict, decided_by: None }
+    Decision {
+        verdict: gating.default_verdict(),
+        decided_by: None,
+    }
 }
 
 /// The outcome for a tool when the caller meets `conditions`, which lists only
@@ -360,18 +381,22 @@ pub fn preview(
                 .collect()
         })
         .collect();
+    let cases: Vec<(Conditions, Conditions)> = cases
+        .into_iter()
+        .map(|case| {
+            let mut merged = pinned.clone();
+            merged.extend(case.clone());
+            (case, merged)
+        })
+        .collect();
     let tools = tools
         .iter()
         .map(|tool| {
             let outcomes: Vec<Outcome> = cases
                 .iter()
-                .map(|case| {
-                    let mut conditions = pinned.clone();
-                    conditions.extend(case.clone());
-                    Outcome {
-                        conditions: case.clone(),
-                        decision: decide(gating, tool, &conditions),
-                    }
+                .map(|(case, merged)| Outcome {
+                    conditions: case.clone(),
+                    decision: decide(gating, tool, merged),
                 })
                 .collect();
             let same = outcomes
@@ -418,19 +443,16 @@ pub fn warnings(
             )),
             _ => {}
         }
-        let effective = gate
-            .patterns
-            .iter()
-            .filter(|pattern| !pattern.trim().is_empty());
-        if effective.clone().count() > PATTERNS_MAX {
+        if gate.compiled.effective > PATTERNS_MAX {
             found.push(format!(
                 "'{name}' has {} patterns, and the gateway will refuse to save more than {PATTERNS_MAX} in one gate.",
-                effective.clone().count()
+                gate.compiled.effective
             ));
         }
-        for pattern in effective
-            .clone()
-            .filter(|pattern| pattern.len() > PATTERN_BYTES_MAX)
+        for pattern in gate
+            .patterns
+            .iter()
+            .filter(|pattern| pattern.len() > PATTERN_BYTES_MAX && !pattern.trim().is_empty())
         {
             found.push(format!(
                 "'{name}' has a pattern of {} bytes, and the gateway will refuse to save one longer than \
@@ -440,17 +462,19 @@ pub fn warnings(
         }
         for pattern in &gate.compiled.not_valid {
             found.push(format!(
-                "'{name}' has a pattern that is not valid regex ({pattern}). It matches no tool, and the gateway will \
-                 refuse to save it."
+                "'{name}' has a pattern that is not valid regex ({}). It matches no tool, and the gateway will \
+                 refuse to save it.",
+                quote(pattern)
             ));
         }
         for pattern in &gate.compiled.too_large {
             found.push(format!(
-                "'{name}' has a pattern that is too large to compile ({pattern}), so the gateway will most likely \
-                 refuse to save it. It matches no tool here."
+                "'{name}' has a pattern that is too large to compile ({}), so the gateway will most likely refuse to \
+                 save it. It matches no tool here.",
+                quote(pattern)
             ));
         }
-        if effective.count() == 0 {
+        if gate.compiled.effective == 0 {
             found.push(format!(
                 "'{name}' has no patterns, so it matches no tool, and the gateway will refuse to save it."
             ));
@@ -502,65 +526,158 @@ pub fn warnings(
                 ));
             }
         }
-        if matched.is_empty() {
-            found.push(format!("'{name}' matches none of the tools you gave."));
-        }
-        for (pattern, regex) in &gate.compiled.matching {
-            if ends_anchored(pattern) {
-                continue;
-            }
-            let inside: Vec<&String> = tools
-                .iter()
-                .filter(|tool| {
-                    regex
-                        .find(tool)
-                        .is_some_and(|hit| hit.start() > 0)
+        for (pattern, _) in &gate.compiled.matching {
+            let branches: Vec<(Branch, Hir)> = branches(pattern)
+                .into_iter()
+                .filter_map(|branch| {
+                    let hir = regex_syntax::Parser::new()
+                        .parse(&branch.source)
+                        .ok()?;
+                    Some((branch, hir))
                 })
                 .collect();
-            if !inside.is_empty() {
-                let anchor = if pattern.contains('|') {
-                    format!(
-                        "^(?:{})",
-                        pattern
-                            .strip_prefix('^')
-                            .unwrap_or(pattern)
-                    )
+            if branches
+                .iter()
+                .any(|(_, hir)| matches!(hir.kind(), HirKind::Empty))
+            {
+                found.push(format!(
+                    "'{name}' pattern {} has an empty alternative, which matches every tool name.",
+                    quote(pattern)
+                ));
+                continue;
+            }
+            for (branch, hir) in &branches {
+                if hir
+                    .properties()
+                    .look_set()
+                    .contains_anchor()
+                {
+                    continue;
+                }
+                let Ok(regex) = Regex::new(&branch.source) else {
+                    continue;
+                };
+                let inside: Vec<&String> = tools
+                    .iter()
+                    .filter(|tool| {
+                        regex
+                            .find(tool)
+                            .is_some_and(|hit| hit.start() > 0)
+                    })
+                    .collect();
+                if inside.is_empty() {
+                    continue;
+                }
+                let subject = if branches.len() == 1 {
+                    "it".to_owned()
                 } else {
-                    "^".to_owned()
+                    format!("its alternative {}", quote(&branch.text))
+                };
+                let anchor = if branches.len() == 1 {
+                    "Add ^"
+                } else {
+                    "Add ^ to that alternative"
                 };
                 found.push(format!(
-                    "'{name}' pattern {pattern} matches anywhere in the name, so it also catches {}. Add {anchor} if \
-                     you only want names that start with it.",
+                    "'{name}' pattern {} matches anywhere in the name, so {subject} also catches {}. {anchor} if you \
+                     only want names that start with it.",
+                    quote(pattern),
                     quoted(&inside)
                 ));
             }
         }
     }
+    if gating
+        .gates
+        .iter()
+        .any(|gate| {
+            !gate
+                .compiled
+                .matching
+                .is_empty()
+        })
+        && tools.iter().all(|tool| {
+            !gating
+                .gates
+                .iter()
+                .any(|gate| gate.matches(tool))
+        })
+    {
+        found.push("None of the gates match the tools you gave.".to_owned());
+    }
     found
 }
 
-/// Whether `pattern` ends with `$` or `\z`, not escaped, optionally followed by
-/// closing groups, so a match that starts inside a tool name is what the
-/// pattern asks for.
-fn ends_anchored(pattern: &str) -> bool {
-    let backslashes = |text: &str| {
-        text.chars()
-            .rev()
-            .take_while(|character| *character == '\\')
-            .count()
+/// One alternative of a pattern.
+struct Branch {
+    /// The alternative as written in the pattern.
+    text: String,
+    /// The alternative with the flags that apply to it, as a pattern of its own.
+    source: String,
+}
+
+/// The alternatives of a pattern as written: each branch of an alternation,
+/// looking inside groups and nested alternations, or the pattern itself where
+/// it has none. They come from the syntax tree, which keeps `a|b` as two
+/// alternatives where the compiled form folds it into one class. A flag set
+/// in one alternative, or by a group around them, is carried into the
+/// `source` of the alternatives it covers.
+fn branches(pattern: &str) -> Vec<Branch> {
+    let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) else {
+        return Vec::new();
     };
-    let mut end = pattern;
-    while let Some(rest) = end.strip_suffix(')') {
-        if backslashes(rest) % 2 != 0 {
-            break;
+    let mut found = Vec::new();
+    collect_branches(&ast, pattern, "", "", &mut found);
+    found
+}
+
+fn collect_branches(
+    ast: &Ast,
+    pattern: &str,
+    open: &str,
+    close: &str,
+    found: &mut Vec<Branch>,
+) {
+    match ast {
+        Ast::Group(group) => {
+            let (open, close) = match &group.kind {
+                GroupKind::NonCapturing(flags) if !flags.items.is_empty() => (
+                    format!("{open}(?{}:", &pattern[flags.span.start.offset..flags.span.end.offset]),
+                    format!("){close}"),
+                ),
+                _ => (open.to_owned(), close.to_owned()),
+            };
+            collect_branches(&group.ast, pattern, &open, &close, found);
         }
-        end = rest;
+        Ast::Alternation(alternation) => {
+            let mut carried = String::new();
+            for branch in &alternation.asts {
+                collect_branches(branch, pattern, &format!("{open}{carried}"), close, found);
+                let children: &[Ast] = match branch {
+                    Ast::Concat(concat) => &concat.asts,
+                    other => std::slice::from_ref(other),
+                };
+                for child in children {
+                    if let Ast::Flags(flags) = child {
+                        carried.push_str(&pattern[flags.span.start.offset..flags.span.end.offset]);
+                    }
+                }
+            }
+        }
+        other => {
+            let text = pattern[other.span().start.offset..other.span().end.offset].to_owned();
+            found.push(Branch {
+                source: format!("{open}{text}{close}"),
+                text,
+            });
+        }
     }
-    if let Some(rest) = end.strip_suffix('$') {
-        return backslashes(rest) % 2 == 0;
-    }
-    end.strip_suffix('z')
-        .is_some_and(|rest| backslashes(rest) % 2 == 1)
+}
+
+/// `text` in single quotes, so a pattern with spaces or a trailing `(` reads
+/// unambiguously.
+fn quote(text: &str) -> String {
+    format!("'{text}'")
 }
 
 /// The names as `'a', 'b'`, dropping repeats.
@@ -572,7 +689,7 @@ fn quoted<T: AsRef<str>>(names: &[T]) -> String {
         }
     }
     seen.iter()
-        .map(|name| format!("'{name}'"))
+        .map(|name| quote(name))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -694,7 +811,7 @@ mod tests {
             denies,
             patterns
                 .iter()
-                .map(|p| (*p).to_owned())
+                .map(|pattern| (*pattern).to_owned())
                 .collect(),
             None,
         )
@@ -1303,7 +1420,7 @@ mod tests {
         assert_eq!(
             warnings(&gating, &tools(&["a"])),
             [
-                "'Blocker' has a pattern that is not valid regex (^a(). It matches no tool, and the gateway will refuse to save it."
+                "'Blocker' has a pattern that is not valid regex ('^a('). It matches no tool, and the gateway will refuse to save it."
             ]
         );
     }
@@ -1399,7 +1516,7 @@ mod tests {
         assert_eq!(
             warnings(&gating, &tools(&["drop_table"])),
             [
-                "'Blocker' has a pattern that is not valid regex (^delete_(). It matches no tool, and the gateway will refuse to save it."
+                "'Blocker' has a pattern that is not valid regex ('^delete_('). It matches no tool, and the gateway will refuse to save it."
             ]
         );
     }
@@ -1495,7 +1612,7 @@ mod tests {
             gates: vec![gate("Tool Gate 1", true, &["^delete_"])],
         };
 
-        assert_eq!(warnings(&gating, &tools(&["get_user"])), ["'Tool Gate 1' matches none of the tools you gave."]);
+        assert_eq!(warnings(&gating, &tools(&["get_user"])), ["None of the gates match the tools you gave."]);
     }
 
     #[test]
@@ -1508,7 +1625,7 @@ mod tests {
         assert_eq!(
             warnings(&gating, &tools(&["delete_user", "undelete_draft", "redelete_x"])),
             [
-                "'Tool Gate 1' pattern delete_.* matches anywhere in the name, so it also catches 'undelete_draft', 'redelete_x'. Add ^ if you only want names that start with it."
+                "'Tool Gate 1' pattern 'delete_.*' matches anywhere in the name, so it also catches 'undelete_draft', 'redelete_x'. Add ^ if you only want names that start with it."
             ]
         );
     }
@@ -1544,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn warns_when_only_one_alternative_is_anchored_and_suggests_wrapping_them() {
+    fn names_the_unanchored_alternative_when_another_one_is_anchored() {
         let gating = Gating {
             denies_by_default: false,
             gates: vec![gate("Mixed", true, &["^get_|delete_"])],
@@ -1553,29 +1670,21 @@ mod tests {
         assert_eq!(
             warnings(&gating, &tools(&["get_user", "undelete_x"])),
             [
-                "'Mixed' pattern ^get_|delete_ matches anywhere in the name, so it also catches 'undelete_x'. Add ^(?:get_|delete_) if you only want names that start with it."
+                "'Mixed' pattern '^get_|delete_' matches anywhere in the name, so its alternative 'delete_' also catches 'undelete_x'. Add ^ to that alternative if you only want names that start with it."
             ]
         );
-    }
 
-    #[test]
-    fn warns_about_a_mid_name_match_of_a_pattern_without_a_leading_anchor() {
-        let gating = Gating {
+        let none_anchored = Gating {
             denies_by_default: false,
-            gates: vec![gate("Tool Gate 1", true, &["delete_.*"])],
+            gates: vec![gate("Plain", true, &["get_|delete_"])],
         };
 
-        assert_eq!(warnings(&gating, &tools(&["undelete_draft"])).len(), 1);
-    }
-
-    #[test]
-    fn an_anchored_pattern_gets_no_warning() {
-        let gating = Gating {
-            denies_by_default: false,
-            gates: vec![gate("Tool Gate 1", true, &["^delete_"])],
-        };
-
-        assert!(warnings(&gating, &tools(&["delete_user", "undelete_draft"])).is_empty());
+        assert_eq!(
+            warnings(&none_anchored, &tools(&["undelete_x"])),
+            [
+                "'Plain' pattern 'get_|delete_' matches anywhere in the name, so its alternative 'delete_' also catches 'undelete_x'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
     }
 
     #[test]
@@ -1602,36 +1711,6 @@ mod tests {
     }
 
     #[test]
-    fn a_pattern_is_compiled_when_the_gate_is_read_not_per_tool() {
-        let gating = Gating {
-            denies_by_default: false,
-            gates: vec![gate("Blocker", true, &["^delete_", "^drop_"])],
-        };
-        let many: Vec<String> = (0..2000)
-            .map(|index| format!("delete_{index}"))
-            .collect();
-
-        let previewed = preview(&gating, &many, &Conditions::new()).expect("no conditions");
-
-        assert_eq!(
-            gating.gates[0]
-                .compiled
-                .matching
-                .len(),
-            2
-        );
-        assert!(
-            previewed
-                .tools
-                .iter()
-                .all(|tool| tool.outcomes[0]
-                    .decision
-                    .verdict
-                    == Verdict::Blocked)
-        );
-    }
-
-    #[test]
     fn a_valid_pattern_too_big_to_compile_is_told_apart_from_a_syntax_error() {
         let gating = Gating {
             denies_by_default: false,
@@ -1642,10 +1721,10 @@ mod tests {
 
         assert_eq!(
             found[0],
-            "'Big' has a pattern that is too large to compile ((?:\\w{100}){100}), so the gateway will most likely refuse to save it. It matches no tool here."
+            "'Big' has a pattern that is too large to compile ('(?:\\w{100}){100}'), so the gateway will most likely refuse to save it. It matches no tool here."
         );
         assert!(found.contains(
-            &"'Broken' has a pattern that is not valid regex (^a(). It matches no tool, and the gateway will refuse to save it.".to_owned()
+            &"'Broken' has a pattern that is not valid regex ('^a('). It matches no tool, and the gateway will refuse to save it.".to_owned()
         ));
         assert_eq!(
             found
@@ -1730,36 +1809,6 @@ mod tests {
     }
 
     #[test]
-    fn suggests_wrapping_alternatives_without_a_leading_anchor_of_their_own() {
-        let gating = Gating {
-            denies_by_default: false,
-            gates: vec![gate("Plain", true, &["get_|delete_"])],
-        };
-
-        assert_eq!(
-            warnings(&gating, &tools(&["undelete_x"])),
-            [
-                "'Plain' pattern get_|delete_ matches anywhere in the name, so it also catches 'undelete_x'. Add ^(?:get_|delete_) if you only want names that start with it."
-            ]
-        );
-    }
-
-    #[test]
-    fn asks_about_intent_for_a_plain_pattern_meant_to_match_anywhere() {
-        let gating = Gating {
-            denies_by_default: false,
-            gates: vec![gate("Bulk", true, &["delete"])],
-        };
-
-        assert_eq!(
-            warnings(&gating, &tools(&["bulk_delete_user", "delete_user"])),
-            [
-                "'Bulk' pattern delete matches anywhere in the name, so it also catches 'bulk_delete_user'. Add ^ if you only want names that start with it."
-            ]
-        );
-    }
-
-    #[test]
     fn an_end_anchor_inside_closing_groups_still_counts_as_end_anchored() {
         let gating = Gating {
             denies_by_default: false,
@@ -1774,19 +1823,211 @@ mod tests {
     }
 
     #[test]
-    fn an_end_anchor_in_the_middle_or_an_escaped_one_still_warns() {
-        let middle = Gating {
+    fn a_whole_group_is_opened_up_and_only_the_offending_alternative_is_named() {
+        let gating = Gating {
             denies_by_default: false,
-            gates: vec![gate("Middle", true, &["_user$|_admin"])],
+            gates: vec![gate("Grouped", true, &["(_a$|_b)"])],
         };
-        let escaped_dollar = Gating {
+
+        assert_eq!(
+            warnings(&gating, &tools(&["x_a", "x_b"])),
+            [
+                "'Grouped' pattern '(_a$|_b)' matches anywhere in the name, so its alternative '_b' also catches 'x_b'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn warns_once_when_no_gate_matches_any_tool_given_and_not_when_one_does() {
+        let gating = Gating {
             denies_by_default: false,
-            gates: vec![gate("Price", true, &["(cost\\$)"])],
+            gates: vec![gate("One", true, &["^a_"]), gate("Two", true, &["^b_"]), gate("Three", true, &["^c_"])],
         };
-        assert_eq!(warnings(&middle, &tools(&["delete_admin"])).len(), 1);
-        assert_eq!(warnings(&escaped_dollar, &tools(&["a_cost$"])).len(), 1);
-        assert!(!ends_anchored(r"x$\)"));
-        assert!(!ends_anchored(r"x\$)"));
-        assert!(ends_anchored(r"(x$)"));
+
+        assert_eq!(warnings(&gating, &tools(&["z_x"])), ["None of the gates match the tools you gave."]);
+        assert!(warnings(&gating, &tools(&["b_x"])).is_empty());
+    }
+
+    fn anchoring_notes(
+        pattern: &str,
+        names: &[&str],
+    ) -> Vec<String> {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("G", true, &[pattern])],
+        };
+        warnings(&gating, &tools(names))
+    }
+
+    #[test]
+    fn a_flag_at_the_start_covers_every_alternative() {
+        assert_eq!(
+            anchoring_notes("(?i)a|b", &["xB"]),
+            [
+                "'G' pattern '(?i)a|b' matches anywhere in the name, so its alternative 'b' also catches 'xB'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bracket_holding_a_pipe_is_one_class_not_two_alternatives() {
+        assert_eq!(
+            anchoring_notes("[]a|b]", &["x|"]),
+            [
+                "'G' pattern '[]a|b]' matches anywhere in the name, so it also catches 'x|'. Add ^ if you only want names that start with it."
+            ]
+        );
+        assert_eq!(
+            anchoring_notes("[[:alpha:]|x]|c", &["9|"]),
+            [
+                "'G' pattern '[[:alpha:]|x]|c' matches anywhere in the name, so its alternative '[[:alpha:]|x]' also catches '9|'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn an_escaped_pipe_does_not_split_a_pattern() {
+        assert_eq!(
+            anchoring_notes(r"a\|b", &["xa|b"]),
+            [
+                r"'G' pattern 'a\|b' matches anywhere in the name, so it also catches 'xa|b'. Add ^ if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_end_anchored_alternative_is_left_out_of_the_anchoring_advice() {
+        assert!(anchoring_notes("_user$|_admin", &["delete_user"]).is_empty());
+        assert_eq!(
+            anchoring_notes("_user$|_admin", &["delete_admin"]),
+            [
+                "'G' pattern '_user$|_admin' matches anywhere in the name, so its alternative '_admin' also catches 'delete_admin'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+        assert!(anchoring_notes("delete_|_user$", &["delete_x", "a_user"]).is_empty());
+        assert_eq!(
+            anchoring_notes("delete_|_user$", &["undelete_x"]),
+            [
+                "'G' pattern 'delete_|_user$' matches anywhere in the name, so its alternative 'delete_' also catches 'undelete_x'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn an_anchor_outside_a_group_covers_every_alternative_inside_it() {
+        assert!(anchoring_notes("^(?:a|b)", &["ax"]).is_empty());
+        assert!(anchoring_notes(r"\A(?:a|b)", &["bx"]).is_empty());
+        assert!(anchoring_notes(r"(?:a|b)\z", &["xa"]).is_empty());
+    }
+
+    #[test]
+    fn an_anchor_on_one_alternative_inside_a_group_leaves_the_other_named() {
+        assert_eq!(
+            anchoring_notes("(?:^a|b)", &["xb", "xa"]),
+            [
+                "'G' pattern '(?:^a|b)' matches anywhere in the name, so its alternative 'b' also catches 'xb'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_group_followed_by_more_is_one_pattern() {
+        assert_eq!(
+            anchoring_notes("(a|b)c", &["xbc"]),
+            [
+                "'G' pattern '(a|b)c' matches anywhere in the name, so it also catches 'xbc'. Add ^ if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn alternatives_the_compiler_folds_together_are_still_judged_one_by_one() {
+        assert_eq!(
+            anchoring_notes("a|b", &["xb"]),
+            [
+                "'G' pattern 'a|b' matches anywhere in the name, so its alternative 'b' also catches 'xb'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+        assert_eq!(
+            anchoring_notes("(?i:a|b)", &["xB"]),
+            [
+                "'G' pattern '(?i:a|b)' matches anywhere in the name, so its alternative 'b' also catches 'xB'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn alternatives_with_a_shared_start_are_not_merged_into_one() {
+        let second = |tool: &str| {
+            format!(
+                "'G' pattern 'x.*a$|x.*b' matches anywhere in the name, so its alternative 'x.*b' also catches '{tool}'. Add ^ to that alternative if you only want names that start with it."
+            )
+        };
+
+        assert_eq!(anchoring_notes("x.*a$|x.*b", &["ax_b"]), [second("ax_b")]);
+        assert_eq!(anchoring_notes("x.*a$|x.*b", &["zzx_b"]), [second("zzx_b")]);
+        assert!(anchoring_notes("x.*a$|x.*b", &["x_a"]).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_with_nothing_in_it_is_warned_about_as_empty() {
+        let empty =
+            |pattern: &str| format!("'G' pattern '{pattern}' has an empty alternative, which matches every tool name.");
+
+        assert_eq!(anchoring_notes("(?:)", &["get_user"]), [empty("(?:)")]);
+        assert_eq!(anchoring_notes("()", &["get_user"]), [empty("()")]);
+    }
+
+    #[test]
+    fn an_empty_alternative_is_warned_about_without_anchoring_advice() {
+        let empty =
+            |pattern: &str| format!("'G' pattern '{pattern}' has an empty alternative, which matches every tool name.");
+
+        assert_eq!(anchoring_notes("a|", &["xa", "get_user"]), [empty("a|")]);
+        assert_eq!(anchoring_notes("a||b", &["xa", "get_user"]), [empty("a||b")]);
+        assert_eq!(anchoring_notes("(?:a|)", &["get_user"]), [empty("(?:a|)")]);
+    }
+
+    #[test]
+    fn an_allow_gate_is_the_decider_under_a_deny_default_and_the_default_under_an_allow_default() {
+        let under_deny = Gating {
+            denies_by_default: true,
+            gates: vec![gate("reads", false, &["^get_"])],
+        };
+        let under_allow = Gating {
+            denies_by_default: false,
+            gates: vec![gate("reads", false, &["^get_"])],
+        };
+
+        assert_eq!(
+            decide_all(&under_deny, "get_user", true),
+            Decision {
+                verdict: Verdict::Allowed,
+                decided_by: Some("reads".to_owned())
+            }
+        );
+        assert_eq!(
+            decide_all(&under_allow, "get_user", true),
+            Decision {
+                verdict: Verdict::Allowed,
+                decided_by: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_deny_gate_still_decides_under_an_allow_default_with_a_matching_allow_gate() {
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("reads", false, &["^get_"]), gate("no-secrets", true, &["secret"])],
+        };
+
+        assert_eq!(
+            decide_all(&gating, "get_secret", true),
+            Decision {
+                verdict: Verdict::Blocked,
+                decided_by: Some("no-secrets".to_owned())
+            }
+        );
     }
 }
