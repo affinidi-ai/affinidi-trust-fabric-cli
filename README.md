@@ -255,20 +255,24 @@ Dedicated commands cover common operations:
 ```sh
 fabric agent-gateway surfaces list
 fabric agent-gateway surfaces get <surface-id> --output json
+fabric agent-gateway surfaces get "Sales Agent"
 fabric agent-gateway surfaces create --name "Sales Agent" --description "Routes sales traffic"
 fabric agent-gateway surfaces create --file surface.json
 fabric agent-gateway surfaces update <surface-id> --file surface.json
 fabric agent-gateway surfaces update <surface-id> --set access_point.rate_limit.requests=100 --set name="Sales Agent" --unset description
+fabric agent-gateway surfaces update "Sales Agent" --set access_point.rate_limit.requests=200
 fabric agent-gateway surfaces update <surface-id> --add tags=beta --remove transit.points=billing
 fabric agent-gateway surfaces update <surface-id> --set access_point.route=/billing --dry-run
 fabric agent-gateway policies create --id allow-sales --name "Allow sales" --policy-file allow-sales.rego
-fabric agent-gateway surfaces add-feature <surface-id> rate-limit --json '{"requests":100,"window_secs":60}'
+fabric agent-gateway surfaces add-feature <surface-id-or-name> rate-limit --json '{"requests":100,"window_secs":60}'
 fabric agent-gateway surfaces tool-gate-preview <surface-id> --tool delete_user,get_user
 fabric agent-gateway surfaces tool-gate-preview --gates-file gates.json --tool delete_user --condition admins=met
 fabric agent-gateway connection-points create --file connection-point.json
 fabric agent-gateway connections list
 fabric agent-gateway tokens rotate <token-id> --yes
 ```
+
+The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID. Finding a surface by name needs the `surfaces.view` permission, so a token without it must pass the surface ID (a UUID), including for `update --set`, as with secrets.
 
 `tool-gate-preview` shows whether each tool would be allowed or denied (RESULT) and which gate, or the default, decided it (DECIDED BY).
 
@@ -401,7 +405,7 @@ fabric agent-gateway surfaces features
 fabric agent-gateway surfaces features --output json
 ```
 
-Add a feature to a surface. The surface ID and the feature are positional, in that order; the place is worked out from the feature name, so `--edge` (`ap-ma`, `ma-external` or `ma-tp`), `--response` and `--transit-point <alias>` are optional overrides, needed only when the command says the feature can go in more than one place.
+Add a feature to a surface. The surface ID or name and the feature are positional, in that order; the place is worked out from the feature name, so `--edge` (`ap-ma`, `ma-external` or `ma-tp`), `--response` and `--transit-point <alias>` are optional overrides, needed only when the command says the feature can go in more than one place.
 
 With no flags the CLI uses the surface place, and the request direction when a feature has both. `--response` picks the response place, and `--transit-point <alias>` picks the transit point place instead, as for tool gating, networking and policy. `--edge ma-tp` picks a transit point edge place that has no alias, which is the target leg of trust-check. Only `identity --response` has to be told the edge (`--edge ap-ma` or `--edge ma-external`), and the command lists both.
 
