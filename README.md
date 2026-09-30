@@ -263,10 +263,14 @@ fabric agent-gateway surfaces update <surface-id> --add tags=beta --remove trans
 fabric agent-gateway surfaces update <surface-id> --set access_point.route=/billing --dry-run
 fabric agent-gateway policies create --id allow-sales --name "Allow sales" --policy-file allow-sales.rego
 fabric agent-gateway surfaces add-feature <surface-id> rate-limit --json '{"requests":100,"window_secs":60}'
+fabric agent-gateway surfaces tool-gate-preview <surface-id> --tool delete_user,get_user
+fabric agent-gateway surfaces tool-gate-preview --gates-file gates.json --tool delete_user --condition admins=met
 fabric agent-gateway connection-points create --file connection-point.json
 fabric agent-gateway connections list
 fabric agent-gateway tokens rotate <token-id> --yes
 ```
+
+`tool-gate-preview` shows whether each tool would be allowed or denied (RESULT) and which gate, or the default, decided it (DECIDED BY).
 
 Create commands print the created entity ID in table mode. Use `--output json` to receive the complete response. Full JSON documents preserve access to the complete Gateway model without duplicating every nested setting as a CLI flag.
 
