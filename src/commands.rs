@@ -1022,6 +1022,17 @@ async fn dispatch(cli: Cli) -> Result<()> {
     let credentials = OsCredentialStore::new();
     let mut config = Config::load()?;
     config.migrate_legacy_tokens(&credentials)?;
+    dispatch_with(cli, config, &credentials).await
+}
+
+/// Runs a command that needs the gateway, with the saved `config` and the
+/// `credentials` store already in hand, so a test can supply both and never
+/// read or write the real ones.
+async fn dispatch_with(
+    cli: AgentGatewayArgs,
+    mut config: Config,
+    credentials: &impl CredentialStore,
+) -> Result<()> {
     match cli.command {
         Command::Shell => bail!("the interactive shell is already open"),
         Command::Login(mut args) => {
@@ -1032,14 +1043,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 .connection
                 .as_deref()
                 .unwrap_or(DEFAULT_CONNECTION);
-            login(&mut config, &credentials, connection, args, cli.allow_http).await
+            login(&mut config, credentials, connection, args, cli.allow_http).await
         }
-        Command::Logout => logout(&mut config, &credentials, cli.connection.as_deref()),
-        Command::Config { command } => run_config(&mut config, &credentials, command, cli.output),
+        Command::Logout => logout(&mut config, credentials, cli.connection.as_deref()),
+        Command::Config { command } => run_config(&mut config, credentials, command, cli.output),
         Command::Whoami => {
             whoami(
                 &config,
-                &credentials,
+                credentials,
                 cli.connection.as_deref(),
                 cli.host.as_deref(),
                 cli.allow_http,
@@ -3590,21 +3601,39 @@ mod gateway_config_tests {
         assert_eq!(value["warnings"], json!([]));
     }
 
-    #[tokio::test]
-    async fn tool_gate_preview_with_a_surface_reads_it_through_the_real_entry_point() {
-        let _guard = PROCESS_ENV_LOCK.lock().await;
-        let (host, requests) = scripted_server(vec![("HTTP/1.1 200 OK", GATED_SURFACE)]).await;
-        let home = tempfile::tempdir().expect("temp home");
-        let saved = ["HOME", "XDG_CONFIG_HOME"].map(|key| (key, std::env::var_os(key)));
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+    struct NoCredentials;
+
+    impl CredentialStore for NoCredentials {
+        fn get_token(
+            &self,
+            _connection: &str,
+        ) -> Result<Option<String>> {
+            Ok(None)
         }
+
+        fn set_token(
+            &self,
+            _connection: &str,
+            _token: &str,
+        ) -> Result<()> {
+            bail!("the test credential store is read only")
+        }
+
+        fn delete_token(
+            &self,
+            _connection: &str,
+        ) -> Result<()> {
+            bail!("the test credential store is read only")
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_gate_preview_with_a_surface_reads_it_through_the_command_dispatch() {
+        let (host, requests) = scripted_server(vec![("HTTP/1.1 200 OK", GATED_SURFACE)]).await;
         let config = crate::config::Config {
             current: Some("default".to_owned()),
             connections: [("default".to_owned(), crate::config::Connection::new(host))].into(),
         };
-        let saved_config = crate::config::config_path().and_then(|path| config.save_to(&path));
         let cli = Cli::try_parse_from([
             "fabric",
             "agent-gateway",
@@ -3615,25 +3644,13 @@ mod gateway_config_tests {
             "s-1",
             "--tool",
             "get_user, delete_user",
-        ]);
+        ])
+        .expect("arguments parse");
 
-        let result = match (&saved_config, cli) {
-            (Ok(()), Ok(cli)) => Some(run(cli).await),
-            _ => None,
-        };
-
-        unsafe {
-            for (key, value) in saved {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-        saved_config.expect("config saved");
-        result
-            .expect("arguments parse")
+        dispatch_with(cli.into_agent_gateway(), config, &NoCredentials)
+            .await
             .expect("the preview should succeed");
+
         assert_eq!(request_lines(requests), ["GET /api/v1/surfaces/s-1 HTTP/1.1"]);
     }
 

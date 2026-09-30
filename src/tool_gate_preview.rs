@@ -24,6 +24,8 @@ use regex_syntax::ast::{Ast, GroupKind};
 use regex_syntax::hir::{Hir, HirKind};
 use serde_json::Value;
 
+use crate::client::sanitize_for_terminal;
+
 /// Most gates the gateway saves in one surface.
 const GATES_MAX: usize = 64;
 /// Most patterns the gateway saves in one gate, blank ones not counted.
@@ -349,9 +351,9 @@ pub fn preview(
         .find(|policy| !policies.contains(policy))
     {
         if policies.is_empty() {
-            bail!("--condition names '{unknown}', but none of the gates has a condition");
+            bail!("--condition names {}, but none of the gates has a condition", quote(unknown));
         }
-        bail!("--condition names '{unknown}', but no gate uses it; the gates use: {}", quoted(&policies));
+        bail!("--condition names {}, but no gate uses it; the gates use: {}", quote(unknown), quoted(&policies));
     }
     let free: Vec<&String> = policies
         .iter()
@@ -363,7 +365,7 @@ pub fn preview(
              --condition POLICY_ID=met or POLICY_ID=unmet so that {} or fewer are left",
             free.len(),
             free.iter()
-                .map(|policy| policy.as_str())
+                .map(|policy| sanitize_for_terminal(policy))
                 .collect::<Vec<_>>()
                 .join(", "),
             1usize << free.len(),
@@ -431,7 +433,7 @@ pub fn warnings(
         ));
     }
     for gate in &gating.gates {
-        let name = &gate.name;
+        let name = sanitize_for_terminal(&gate.name);
         match gate.condition() {
             Condition::Unresolved => found.push(format!(
                 "'{name}' has an empty condition policy id, so the gateway can never meet it: a block gate stays on \
@@ -664,20 +666,92 @@ fn collect_branches(
                 }
             }
         }
-        other => {
-            let text = pattern[other.span().start.offset..other.span().end.offset].to_owned();
-            found.push(Branch {
-                source: format!("{open}{text}{close}"),
-                text,
-            });
+        Ast::Concat(concat)
+            if concat
+                .asts
+                .iter()
+                .any(has_alternation) =>
+        {
+            let mut parts: Vec<Branch> = vec![Branch {
+                text: String::new(),
+                source: String::new(),
+            }];
+            for child in &concat.asts {
+                let mut options = Vec::new();
+                if has_alternation(child) {
+                    collect_branches(child, pattern, "", "", &mut options);
+                } else {
+                    let text = pattern[child.span().start.offset..child.span().end.offset].to_owned();
+                    options.push(Branch { source: text.clone(), text });
+                }
+                if parts
+                    .len()
+                    .saturating_mul(options.len())
+                    > BRANCHES_MAX
+                {
+                    push_whole(ast, pattern, open, close, found);
+                    return;
+                }
+                parts = parts
+                    .iter()
+                    .flat_map(|part| {
+                        options
+                            .iter()
+                            .map(move |option| Branch {
+                                text: format!("{}{}", part.text, option.text),
+                                source: format!("{}{}", part.source, option.source),
+                            })
+                    })
+                    .collect();
+            }
+            found.extend(
+                parts
+                    .into_iter()
+                    .map(|part| Branch {
+                        source: format!("{open}{}{close}", part.source),
+                        text: part.text,
+                    }),
+            );
         }
+        other => push_whole(other, pattern, open, close, found),
     }
+}
+
+/// Most alternatives one pattern is opened up into; a pattern that would give
+/// more is judged as a whole.
+const BRANCHES_MAX: usize = 64;
+
+/// Whether `ast` holds an alternation anywhere outside a repetition.
+fn has_alternation(ast: &Ast) -> bool {
+    match ast {
+        Ast::Alternation(_) => true,
+        Ast::Group(group) => has_alternation(&group.ast),
+        Ast::Concat(concat) => concat
+            .asts
+            .iter()
+            .any(has_alternation),
+        _ => false,
+    }
+}
+
+fn push_whole(
+    ast: &Ast,
+    pattern: &str,
+    open: &str,
+    close: &str,
+    found: &mut Vec<Branch>,
+) {
+    let text = pattern[ast.span().start.offset..ast.span().end.offset].to_owned();
+    found.push(Branch {
+        source: format!("{open}{text}{close}"),
+        text,
+    });
 }
 
 /// `text` in single quotes, so a pattern with spaces or a trailing `(` reads
 /// unambiguously.
 fn quote(text: &str) -> String {
-    format!("'{text}'")
+    format!("'{}'", sanitize_for_terminal(text))
 }
 
 /// The names as `'a', 'b'`, dropping repeats.
@@ -712,10 +786,43 @@ pub fn read_gating(
     }
 }
 
+/// Keys a tool gating object has.
+const GATING_KEYS: &[&str] = &["default_effect", "gates"];
+/// Keys a gate has.
+const GATE_KEYS: &[&str] = &["id", "name", "description", "condition_policy_definition_id", "action"];
+/// Keys a gate's action has.
+const ACTION_KEYS: &[&str] = &["effect", "patterns"];
+
+/// Refuse any key of the object `value`, found at `at`, that is not in
+/// `expected`, naming it and listing the keys that are. The gateway refuses
+/// unknown keys too, and a misspelt one would otherwise be read as absent.
+fn refuse_unknown_keys(
+    value: &Value,
+    at: &str,
+    expected: &[&str],
+) -> Result<()> {
+    let Some(fields) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| !expected.contains(&key.as_str()))
+    {
+        bail!("{at} has an unknown key {}; the keys it can have are {}", quote(unknown), quoted(expected));
+    }
+    Ok(())
+}
+
+/// A JSON value as text that is safe to print.
+fn shown(value: &Value) -> String {
+    sanitize_for_terminal(&value.to_string())
+}
+
 /// Read a tool gating object, `{"default_effect": ..., "gates": [...]}`, that
 /// was found at `path`, which names it in errors. A gate is named the way the
 /// surface builder shows it: its own name where it has one, otherwise
-/// `Tool Gate N` for its 1-based position.
+/// `Tool Gate N` for its 1-based position. A key the gateway does not know, at
+/// any level, is refused.
 pub fn read_gating_config(
     config: &Value,
     path: &str,
@@ -727,12 +834,22 @@ pub fn read_gating_config(
         });
     }
     if !config.is_object() {
-        bail!("{path} should be an object, found {config}");
+        bail!("{path} should be an object, found {}", shown(config));
     }
+    if config
+        .pointer("/target/mcp_tool_gating")
+        .is_some()
+    {
+        bail!(
+            "{path} looks like a whole surface; the tool gating is in its target.mcp_tool_gating, so give a file with \
+             just that object, or preview the saved surface by its id"
+        );
+    }
+    refuse_unknown_keys(config, path, GATING_KEYS)?;
     let denies_by_default = match config.get("default_effect") {
         None | Some(Value::Null) => false,
         Some(Value::String(effect)) => effect_denies(effect, &format!("{path}.default_effect"))?,
-        Some(other) => bail!("{path}.default_effect should be 'allow' or 'deny', found {other}"),
+        Some(other) => bail!("{path}.default_effect should be 'allow' or 'deny', found {}", shown(other)),
     };
     let gates = match config.get("gates") {
         None | Some(Value::Null) => Vec::new(),
@@ -741,7 +858,7 @@ pub fn read_gating_config(
             .enumerate()
             .map(|(index, gate)| read_gate(gate, path, index))
             .collect::<Result<Vec<_>>>()?,
-        Some(other) => bail!("{path}.gates should be a list, found {other}"),
+        Some(other) => bail!("{path}.gates should be a list, found {}", shown(other)),
     };
     Ok(Gating { denies_by_default, gates })
 }
@@ -753,6 +870,7 @@ fn read_gate(
     index: usize,
 ) -> Result<Gate> {
     let at = format!("{path}.gates.{index}");
+    refuse_unknown_keys(gate, &at, GATE_KEYS)?;
     let name = match gate.get("name") {
         Some(Value::String(name)) if !name.trim().is_empty() => name.trim().to_owned(),
         _ => format!("Tool Gate {}", index + 1),
@@ -760,6 +878,7 @@ fn read_gate(
     let action = gate
         .get("action")
         .with_context(|| format!("{at} has no action"))?;
+    refuse_unknown_keys(action, &format!("{at}.action"), ACTION_KEYS)?;
     let effect = match action.get("effect") {
         Some(Value::String(effect)) => effect,
         _ => bail!("{at}.action.effect should be 'allow' or 'deny'"),
@@ -770,15 +889,15 @@ fn read_gate(
             .iter()
             .map(|pattern| match pattern {
                 Value::String(pattern) => Ok(pattern.clone()),
-                other => bail!("{at}.action.patterns should hold text, found {other}"),
+                other => bail!("{at}.action.patterns should hold text, found {}", shown(other)),
             })
             .collect::<Result<Vec<_>>>()?,
-        Some(other) => bail!("{at}.action.patterns should be a list, found {other}"),
+        Some(other) => bail!("{at}.action.patterns should be a list, found {}", shown(other)),
     };
     let condition = match gate.get("condition_policy_definition_id") {
         None | Some(Value::Null) => None,
         Some(Value::String(policy)) => Some(policy.clone()),
-        Some(other) => bail!("{at}.condition_policy_definition_id should be text, found {other}"),
+        Some(other) => bail!("{at}.condition_policy_definition_id should be text, found {}", shown(other)),
     };
     Ok(Gate::new(name, effect_denies(effect, &format!("{at}.action.effect"))?, patterns, condition))
 }
@@ -792,7 +911,7 @@ fn effect_denies(
     match effect {
         "allow" => Ok(false),
         "deny" => Ok(true),
-        other => bail!("{at} should be 'allow' or 'deny', found '{other}'"),
+        other => bail!("{at} should be 'allow' or 'deny', found {}", quote(other)),
     }
 }
 
@@ -1160,6 +1279,112 @@ mod tests {
             .to_string();
 
         assert_eq!(error, "mcp_tool_gating.gates should be a list, found {}");
+    }
+
+    #[test]
+    fn read_gating_config_refuses_a_misspelt_top_level_key_and_lists_the_real_ones() {
+        for config in [json!({"gate": []}), json!({"default_effects": "deny", "gates": []})] {
+            let error = read_gating_config(&config, "mcp_tool_gating")
+                .expect_err("an unknown key is refused")
+                .to_string();
+
+            assert!(error.starts_with("mcp_tool_gating has an unknown key '"), "{error}");
+            assert!(error.ends_with("the keys it can have are 'default_effect', 'gates'"), "{error}");
+        }
+    }
+
+    #[test]
+    fn read_gating_config_says_where_the_gating_is_when_given_a_whole_surface() {
+        let surface = json!({"name": "Sales", "target": {"mcp_tool_gating": {"gates": []}}});
+
+        let error = read_gating_config(&surface, "mcp_tool_gating")
+            .expect_err("a surface is not a gating object")
+            .to_string();
+
+        assert!(error.contains("looks like a whole surface"), "{error}");
+        assert!(error.contains("target.mcp_tool_gating"), "{error}");
+    }
+
+    #[test]
+    fn read_gating_config_refuses_a_wrong_wrapper_around_the_gating() {
+        let error = read_gating_config(&json!({"mcp_tool_gating": {"gates": []}}), "mcp_tool_gating")
+            .expect_err("the gating is not one level down")
+            .to_string();
+
+        assert_eq!(
+            error,
+            "mcp_tool_gating has an unknown key 'mcp_tool_gating'; the keys it can have are 'default_effect', 'gates'"
+        );
+    }
+
+    #[test]
+    fn read_gating_config_refuses_an_unknown_key_inside_a_gate_or_its_action() {
+        let gate = read_gating_config(
+            &json!({"gates": [{"action": {"effect": "deny", "patterns": ["^a"]}, "condition": "admins"}]}),
+            "mcp_tool_gating",
+        )
+        .expect_err("an unknown gate key is refused")
+        .to_string();
+        let action = read_gating_config(
+            &json!({"gates": [{"action": {"effect": "deny", "pattern": ["^a"]}}]}),
+            "mcp_tool_gating",
+        )
+        .expect_err("an unknown action key is refused")
+        .to_string();
+
+        assert_eq!(
+            gate,
+            "mcp_tool_gating.gates.0 has an unknown key 'condition'; the keys it can have are 'id', 'name', \
+             'description', 'condition_policy_definition_id', 'action'"
+        );
+        assert_eq!(
+            action,
+            "mcp_tool_gating.gates.0.action has an unknown key 'pattern'; the keys it can have are 'effect', \
+             'patterns'"
+        );
+    }
+
+    #[test]
+    fn read_gating_config_accepts_every_key_a_gate_can_have() {
+        let gating = read_gating_config(
+            &json!({"default_effect": "deny", "gates": [{
+                "id": "g-1",
+                "name": "Admins",
+                "description": "who may delete",
+                "condition_policy_definition_id": "admins",
+                "action": {"effect": "allow", "patterns": ["^delete_"]}
+            }]}),
+            "mcp_tool_gating",
+        )
+        .expect("every key is one the gateway has");
+
+        assert!(gating.denies_by_default);
+        assert_eq!(gating.gates.len(), 1);
+    }
+
+    #[test]
+    fn read_gating_config_reads_an_empty_object_as_no_gates_and_an_allow_default() {
+        let gating = read_gating_config(&json!({}), "mcp_tool_gating").expect("an empty object is no gating");
+
+        assert!(!gating.denies_by_default);
+        assert!(gating.gates.is_empty());
+    }
+
+    #[test]
+    fn an_effect_and_a_gate_name_with_control_characters_are_cleaned_before_they_are_printed() {
+        let error =
+            read_gating_config(&json!({"gates": [{"action": {"effect": "de\u{1b}[31mny"}}]}), "mcp_tool_gating")
+                .expect_err("the effect is not allow or deny")
+                .to_string();
+        let gating = Gating {
+            denies_by_default: false,
+            gates: vec![gate("Bl\u{1b}[31mocker", true, &["^delete_(", "^drop_"])],
+        };
+        let warning = warnings(&gating, &tools(&["drop_table"])).join("\n");
+
+        assert_eq!(error, "mcp_tool_gating.gates.0.action.effect should be 'allow' or 'deny', found 'de[31mny'");
+        assert!(warning.starts_with("'Bl[31mocker' has"), "{warning}");
+        assert!(!error.contains('\u{1b}') && !warning.contains('\u{1b}'));
     }
 
     #[test]
@@ -1931,13 +2156,45 @@ mod tests {
     }
 
     #[test]
-    fn a_group_followed_by_more_is_one_pattern() {
+    fn a_group_followed_by_more_is_judged_by_each_alternative_it_makes() {
         assert_eq!(
             anchoring_notes("(a|b)c", &["xbc"]),
             [
-                "'G' pattern '(a|b)c' matches anywhere in the name, so it also catches 'xbc'. Add ^ if you only want names that start with it."
+                "'G' pattern '(a|b)c' matches anywhere in the name, so its alternative 'bc' also catches 'xbc'. Add ^ to that alternative if you only want names that start with it."
             ]
         );
+    }
+
+    #[test]
+    fn an_alternation_inside_a_concatenation_is_judged_branch_by_branch() {
+        assert_eq!(
+            anchoring_notes("x(^a|b)", &["yxb"]),
+            [
+                "'G' pattern 'x(^a|b)' matches anywhere in the name, so its alternative 'xb' also catches 'yxb'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+        assert_eq!(
+            anchoring_notes("(a|^b)c", &["xac"]),
+            [
+                "'G' pattern '(a|^b)c' matches anywhere in the name, so its alternative 'ac' also catches 'xac'. Add ^ to that alternative if you only want names that start with it."
+            ]
+        );
+    }
+
+    #[test]
+    fn an_alternation_inside_a_concatenation_with_every_branch_anchored_gives_no_advice() {
+        assert!(anchoring_notes("(^a|^b)c", &["ac", "bc"]).is_empty());
+        assert!(anchoring_notes("^(a|b)c", &["ac"]).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_that_opens_into_too_many_alternatives_is_judged_whole() {
+        let pattern = format!("{}x", "(a|b)".repeat(7));
+
+        let notes = anchoring_notes(&pattern, &["yaaaaaaax"]);
+
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("so it also catches 'yaaaaaaax'"), "{notes:?}");
     }
 
     #[test]
