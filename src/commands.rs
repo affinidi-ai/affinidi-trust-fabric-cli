@@ -829,7 +829,7 @@ struct PlacementFlags {
 
 #[derive(Debug, Args)]
 struct AddFeatureArgs {
-    /// Surface ID (see `fabric agent-gateway surfaces list`).
+    /// Surface ID or name (see `fabric agent-gateway surfaces list`).
     surface_id: String,
     /// Feature key or alias (see `fabric agent-gateway surfaces features`).
     feature: String,
@@ -852,7 +852,7 @@ struct AddFeatureArgs {
 
 #[derive(Debug, Args)]
 struct FeaturePlacementArgs {
-    /// Surface ID (see `fabric agent-gateway surfaces list`).
+    /// Surface ID or name (see `fabric agent-gateway surfaces list`).
     surface_id: String,
     /// Feature key or alias (see `fabric agent-gateway surfaces features`).
     feature: String,
@@ -1665,13 +1665,15 @@ async fn run_runtime(
 }
 
 /// Names an unknown surface id. The gateway answers a reload of an id nothing
-/// is stored under with a 500, not a 404, so after a server error look the id
-/// up the way `surfaces get` does. A 404 there is reported above the gateway's
-/// error, which stays as the cause: with the DynamoDB configuration source the
-/// reload reads DynamoDB while the lookup reads the gateway's own surface
-/// store, so the two can disagree. Any other failure, or a lookup that does not
-/// answer 404, keeps the gateway's error alone: a 403 in particular can come
-/// from a resource-scoped token that the surfaces route also answers with 404.
+/// is stored under with a 500, not a 404, so after a server error the id is
+/// read straight from the surfaces API (`GET /v1/surfaces/<id>`), without the
+/// name lookup `surfaces get` does, since a reload takes only an id. A 404
+/// there is reported above the gateway's error, which stays as the cause: with
+/// the DynamoDB configuration source the reload reads DynamoDB while the read
+/// uses the gateway's own surface store, so the two can disagree. Any other
+/// failure, or a read that does not answer 404, keeps the gateway's error
+/// alone: a 403 in particular can come from a resource-scoped token that the
+/// surfaces route also answers with 404.
 async fn explain_failed_reload(
     client: &GatewayClient,
     surface: &str,
@@ -3448,7 +3450,7 @@ mod gateway_config_tests {
         let error = resolved.expect_err("an unknown reference should be refused");
         assert_eq!(
             error.to_string(),
-            "surface not found: no surface has the surface_id or name 'Support'; run `fabric agent-gateway surfaces list` to see them"
+            "surface not found: no surface has the ID or name 'Support'; run `fabric agent-gateway surfaces list` to see them"
         );
     }
 
@@ -5592,7 +5594,7 @@ async fn resolve_id(
     }
     match matches.as_slice() {
         [] => {
-            let fields = [&[*id_field][..], *names].concat();
+            let fields = [&["ID"][..], *names].concat();
             let described = match fields.split_last() {
                 Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
                 _ => fields.join(", "),
@@ -6024,7 +6026,7 @@ mod secrets_certs_tests {
 
         assert_eq!(
             error.to_string(),
-            "certificate not found: no certificate has the id or name 'serial-1'; run `fabric agent-gateway certificates list` to see them"
+            "certificate not found: no certificate has the ID or name 'serial-1'; run `fabric agent-gateway certificates list` to see them"
         );
         assert_eq!(request_lines(&requests), ["GET /api/v1/certificates HTTP/1.1"]);
     }
@@ -6159,7 +6161,7 @@ mod secrets_certs_tests {
 
         assert_eq!(
             error.to_string(),
-            "secret not found: no secret has the id, secret_id or name 'missing'; run `fabric agent-gateway secrets list` to see them"
+            "secret not found: no secret has the ID, secret_id or name 'missing'; run `fabric agent-gateway secrets list` to see them"
         );
         assert_eq!(request_lines(&requests), ["GET /api/v1/secrets HTTP/1.1"]);
     }
