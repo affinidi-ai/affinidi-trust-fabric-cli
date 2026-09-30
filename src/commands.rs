@@ -615,8 +615,11 @@ struct JsonFileArgs {
 enum SurfaceCommand {
     /// List Agent Surfaces.
     List,
-    /// Get an Agent Surface by ID.
-    Get { surface_id: String },
+    /// Get an Agent Surface by ID or name.
+    Get {
+        /// Surface ID or name (see `fabric agent-gateway surfaces list`).
+        surface_id: String,
+    },
     /// Create an Agent Surface using flags or a complete JSON document.
     Create(SurfaceCreateArgs),
     /// Update an Agent Surface, either replacing it whole from a JSON document
@@ -632,6 +635,7 @@ enum SurfaceCommand {
     /// edited surface is checked for its required fields before it is sent.
     #[command(group(ArgGroup::new("change").required(true).multiple(true).args(["file", "set", "unset", "add", "remove"])))]
     Update {
+        /// Surface ID or name (see `fabric agent-gateway surfaces list`).
         surface_id: String,
         /// Complete AgentSurface JSON that replaces the stored surface.
         #[arg(short, long, conflicts_with_all = ["set", "unset", "add", "remove"])]
@@ -666,8 +670,11 @@ enum SurfaceCommand {
         #[arg(long, conflicts_with = "file")]
         dry_run: bool,
     },
-    /// Delete an Agent Surface.
-    Delete { surface_id: String },
+    /// Delete an Agent Surface by ID or name.
+    Delete {
+        /// Surface ID or name (see `fabric agent-gateway surfaces list`).
+        surface_id: String,
+    },
     /// List the features that can be added to a surface.
     Features,
     /// Add a feature to an Agent Surface.
@@ -710,7 +717,7 @@ enum SurfaceCommand {
 
 /// Examples shown at the bottom of `tool-gate-preview --help`.
 const TOOL_GATE_PREVIEW_EXAMPLES: &str = r#"Examples:
-  Check the gates a surface has saved:
+  Check the gates a surface has saved, named by its name or ID:
     fabric agent-gateway surfaces tool-gate-preview my-agent --tool delete_user,get_user
 
   Check gates that are not saved yet, from a file:
@@ -725,7 +732,7 @@ Reading the result:
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("gates_source").required(true).args(["surface_id", "gates_file"])))]
 struct ToolGatePreviewArgs {
-    /// Surface ID whose saved MCP tool gates to check (see `fabric
+    /// Surface ID or name whose saved MCP tool gates to check (see `fabric
     /// agent-gateway surfaces list`).
     surface_id: Option<String>,
     /// JSON file holding the MCP tool gating itself, as
@@ -1104,6 +1111,12 @@ async fn dispatch_with(
             if let Command::AccessTokens { command } = command {
                 return run_access_tokens(&client, command, cli.output).await;
             }
+            let command = match command {
+                Command::Surfaces { command } => Command::Surfaces {
+                    command: resolve_surface_command(&client, command).await?,
+                },
+                command => command,
+            };
             if let Command::Surfaces {
                 command:
                     SurfaceCommand::ToolGatePreview(ToolGatePreviewArgs {
@@ -3371,6 +3384,574 @@ mod gateway_config_tests {
         }
     }
 
+    const SURFACE_LIST: &str = r#"[{"surface_id":"s-1","name":"Sales"},{"surface_id":"s-2","name":"Billing"},{"surface_id":"s-3","name":"Billing"}]"#;
+
+    /// The answer to asking for a reference as an ID when no surface has it.
+    const NOT_FOUND: (&str, &str) = ("HTTP/1.1 404 Not Found", "");
+
+    const LIST_REQUEST: &str = "GET /api/v1/surfaces HTTP/1.1";
+
+    /// The request that asks for the reference `Sales` as an ID.
+    const SALES_LOOKUP_REQUEST: &str = "GET /api/v1/surfaces/Sales HTTP/1.1";
+
+    async fn resolved_id(
+        reference: &str,
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (Result<String>, Vec<String>) {
+        let (host, requests) = scripted_server(responses).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let resolved = resolve_surface_id(&client, reference).await;
+        (resolved, request_lines(requests))
+    }
+
+    async fn resolved_name(reference: &str) -> (Result<String>, Vec<String>) {
+        resolved_id(reference, vec![NOT_FOUND, ("HTTP/1.1 200 OK", SURFACE_LIST)]).await
+    }
+
+    #[tokio::test]
+    async fn a_surface_id_the_gateway_accepts_resolves_to_itself_without_listing() {
+        let (resolved, requests) = resolved_id("s-2", vec![("HTTP/1.1 200 OK", STORED_SURFACE)]).await;
+
+        assert_eq!(resolved.expect("an ID should resolve"), "s-2");
+        assert_eq!(requests, ["GET /api/v1/surfaces/s-2 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn a_name_only_one_surface_has_resolves_to_its_id() {
+        let (resolved, requests) = resolved_name("Sales").await;
+
+        assert_eq!(resolved.expect("a unique name should resolve"), "s-1");
+        assert_eq!(requests, [SALES_LOOKUP_REQUEST, LIST_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn a_name_more_than_one_surface_has_lists_the_matches() {
+        let (resolved, _) = resolved_name("Billing").await;
+
+        let error = resolved.expect_err("a shared name should not be guessed");
+        assert_eq!(
+            error.to_string(),
+            "more than one surface is named 'Billing'; pass the ID of the one you mean:\n  s-2  Billing\n  s-3  Billing"
+        );
+        assert_eq!(exit_code(&error), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reference_no_surface_has_points_to_the_list() {
+        let (resolved, _) = resolved_name("Support").await;
+
+        let error = resolved.expect_err("an unknown reference should be refused");
+        assert_eq!(
+            error.to_string(),
+            "no surface has the ID or name 'Support'; run `fabric agent-gateway surfaces list` to see them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_with_two_dots_resolves_through_the_list_without_asking_for_it_as_an_id() {
+        let (resolved, requests) = resolved_id(
+            "Q1..Q2",
+            vec![("HTTP/1.1 200 OK", r#"[{"surface_id":"s-7","name":"Q1..Q2"},{"surface_id":"s-8","name":"Other"}]"#)],
+        )
+        .await;
+
+        assert_eq!(resolved.expect("the name should resolve"), "s-7");
+        assert_eq!(requests, [LIST_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn a_reference_with_two_dots_that_no_surface_has_is_not_found() {
+        let (resolved, requests) = resolved_id("a..b", vec![("HTTP/1.1 200 OK", SURFACE_LIST)]).await;
+
+        let error = resolved.expect_err("no surface has that name");
+        assert!(
+            error
+                .to_string()
+                .starts_with("no surface has the ID or name 'a..b'"),
+            "{error}"
+        );
+        assert_eq!(requests, [LIST_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_reference_is_refused_before_any_request() {
+        for reference in ["", "  \t"] {
+            let (resolved, requests) = resolved_id(reference, vec![]).await;
+
+            let error = resolved.expect_err("an empty reference names nothing");
+            assert_eq!(
+                error.to_string(),
+                "give a surface ID or name; run `fabric agent-gateway surfaces list` to see them"
+            );
+            assert!(requests.is_empty(), "nothing should reach the gateway");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_refused_when_asking_for_the_id_keeps_its_reference_as_an_id() {
+        for status in ["HTTP/1.1 401 Unauthorized", "HTTP/1.1 403 Forbidden"] {
+            let (resolved, requests) = resolved_id("s-9", vec![(status, "")]).await;
+
+            assert_eq!(resolved.expect("a refused lookup should not block a command by ID"), "s-9");
+            assert_eq!(requests, ["GET /api/v1/surfaces/s-9 HTTP/1.1"], "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reference_made_only_of_dots_is_looked_up_in_the_list_only() {
+        for reference in [".", "..", "..."] {
+            let (resolved, requests) = resolved_id(
+                reference,
+                vec![("HTTP/1.1 200 OK", r#"[{"surface_id":"s-4","name":"."},{"surface_id":"s-5","name":"..."}]"#)],
+            )
+            .await;
+
+            match reference {
+                "." => assert_eq!(resolved.expect("the name should resolve"), "s-4"),
+                "..." => assert_eq!(resolved.expect("the name should resolve"), "s-5"),
+                _ => assert!(resolved.is_err(), "no surface is named '..'"),
+            }
+            assert_eq!(requests, [LIST_REQUEST], "{reference}");
+        }
+    }
+
+    #[tokio::test]
+    async fn names_with_a_space_or_a_slash_are_asked_for_encoded_and_then_looked_up_in_the_list() {
+        let list = r#"[{"surface_id":"s-6","name":"Sales Agent"},{"surface_id":"s-7","name":"a/b"}]"#;
+        for (reference, probe, expected) in [
+            ("Sales Agent", "GET /api/v1/surfaces/Sales+Agent HTTP/1.1", "s-6"),
+            ("a/b", "GET /api/v1/surfaces/a%2Fb HTTP/1.1", "s-7"),
+        ] {
+            let (resolved, requests) = resolved_id(reference, vec![NOT_FOUND, ("HTTP/1.1 200 OK", list)]).await;
+
+            assert_eq!(resolved.expect("the name should resolve"), expected);
+            assert_eq!(requests, [probe, LIST_REQUEST]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bad_request_on_the_id_lookup_falls_through_to_the_list() {
+        let (resolved, requests) =
+            resolved_id("Sales", vec![("HTTP/1.1 400 Bad Request", ""), ("HTTP/1.1 200 OK", SURFACE_LIST)]).await;
+
+        assert_eq!(resolved.expect("the name should resolve"), "s-1");
+        assert_eq!(requests, [SALES_LOOKUP_REQUEST, LIST_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn a_token_refused_when_listing_keeps_its_reference_as_an_id() {
+        for status in ["HTTP/1.1 401 Unauthorized", "HTTP/1.1 403 Forbidden"] {
+            let (resolved, requests) = resolved_id("s-9", vec![NOT_FOUND, (status, "")]).await;
+
+            assert_eq!(resolved.expect("a refused list should not block a command by ID"), "s-9");
+            assert_eq!(requests, ["GET /api/v1/surfaces/s-9 HTTP/1.1", LIST_REQUEST], "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_by_id_names_the_lookup() {
+        let (resolved, requests) = resolved_id("Sales", vec![("HTTP/1.1 500 Internal Server Error", "")]).await;
+
+        let error = resolved.expect_err("a failed lookup should stop the command");
+        assert!(
+            error
+                .to_string()
+                .contains("look up the surface 'Sales'"),
+            "{error}"
+        );
+        assert_eq!(requests, [SALES_LOOKUP_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_surface_list_names_the_lookup() {
+        let (resolved, _) = resolved_id("Sales", vec![NOT_FOUND, ("HTTP/1.1 500 Internal Server Error", "")]).await;
+
+        let error = resolved.expect_err("a failed list should stop the command");
+        assert!(
+            error
+                .to_string()
+                .contains("look up the surface 'Sales'"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_list_that_is_not_a_list_is_refused() {
+        let (resolved, _) = resolved_id("Sales", vec![NOT_FOUND, ("HTTP/1.1 200 OK", r#"{"surfaces":[]}"#)]).await;
+
+        let error = resolved.expect_err("an odd answer should be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("something other than a list"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_note_for_a_token_that_cannot_list_says_what_happens_on_one_line() {
+        assert_eq!(
+            token_cannot_list_note("Sales"),
+            "note: could not list surfaces with this token, so 'Sales' is used as an ID; a name only works if the token can list surfaces"
+        );
+    }
+
+    #[test]
+    fn the_note_for_a_token_that_cannot_read_says_what_happens_on_one_line() {
+        assert_eq!(
+            token_cannot_read_note("Sales"),
+            "note: this token cannot read surfaces, so 'Sales' is used as an ID; a name only works if the token can list surfaces"
+        );
+        let note = token_cannot_read_note("a\nb\u{1b}[2J");
+        assert_eq!(note.lines().count(), 1, "{note:?}");
+        assert!(!note.contains('\u{1b}'), "{note:?}");
+    }
+
+    #[test]
+    fn the_note_cleans_a_reference_with_control_characters() {
+        let note = token_cannot_list_note("a\nb\tc\u{1b}[2Jd\re");
+
+        assert!(note.contains("'a b c[2Jde'"), "{note}");
+        assert!(!note.contains('\n') && !note.contains('\u{1b}') && !note.contains('\r'), "{note:?}");
+    }
+
+    #[test]
+    fn the_using_surface_note_names_the_id_and_the_name_on_one_line() {
+        assert_eq!(using_surface_note("s-1", "Sales"), "using surface s-1 (Sales)");
+        let note = using_surface_note("s-1", "Sa\nles\u{1b}[2J");
+        assert_eq!(note, "using surface s-1 (Sa les[2J)");
+    }
+
+    async fn resolved_command(args: &[&str]) -> SurfaceCommand {
+        let (host, _) = scripted_server(vec![NOT_FOUND, ("HTTP/1.1 200 OK", SURFACE_LIST)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        resolve_surface_command(&client, surface_command(args))
+            .await
+            .expect("the surface should resolve")
+    }
+
+    #[tokio::test]
+    async fn get_takes_a_surface_name() {
+        let command = resolved_command(&["fabric", "agent-gateway", "surfaces", "get", "Sales"]).await;
+
+        assert!(matches!(command, SurfaceCommand::Get { surface_id } if surface_id == "s-1"));
+    }
+
+    #[tokio::test]
+    async fn update_takes_a_surface_name_and_keeps_its_other_arguments() {
+        let command = resolved_command(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "update",
+            "Sales",
+            "--set",
+            "name=Retail",
+            "--dry-run",
+        ])
+        .await;
+
+        let SurfaceCommand::Update { surface_id, set, dry_run, .. } = command else {
+            panic!("expected `surfaces update`");
+        };
+        assert_eq!(surface_id, "s-1");
+        assert_eq!(set, ["name=Retail"]);
+        assert!(dry_run);
+    }
+
+    /// Runs `args` through the command dispatch against a gateway that answers
+    /// with `responses`, and returns the requests it received.
+    async fn dispatched_requests(
+        args: &[&str],
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> Vec<String> {
+        let (host, requests) = scripted_server(responses).await;
+        let config = crate::config::Config {
+            current: Some("default".to_owned()),
+            connections: [("default".to_owned(), crate::config::Connection::new(host))].into(),
+        };
+        let cli = Cli::try_parse_from(args).expect("arguments parse");
+        dispatch_with(cli.into_agent_gateway(), config, &NoCredentials)
+            .await
+            .expect("the command should succeed");
+        request_lines(requests)
+    }
+
+    #[tokio::test]
+    async fn delete_takes_a_surface_name() {
+        let requests = dispatched_requests(
+            &["fabric", "agent-gateway", "--token", "agpat_valid", "surfaces", "delete", "Sales"],
+            vec![NOT_FOUND, ("HTTP/1.1 200 OK", SURFACE_LIST), ("HTTP/1.1 204 No Content", "")],
+        )
+        .await;
+
+        assert_eq!(requests, [SALES_LOOKUP_REQUEST, LIST_REQUEST, "DELETE /api/v1/surfaces/s-1 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn add_feature_takes_a_surface_name() {
+        let requests = dispatched_requests(
+            &[
+                "fabric",
+                "agent-gateway",
+                "--token",
+                "agpat_valid",
+                "surfaces",
+                "add-feature",
+                "Sales",
+                "rate-limit",
+                "--json",
+                r#"{"requests":100}"#,
+            ],
+            vec![
+                NOT_FOUND,
+                ("HTTP/1.1 200 OK", SURFACE_LIST),
+                ("HTTP/1.1 200 OK", STORED_SURFACE),
+                ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1","name":"Sales"}"#),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            requests,
+            [
+                SALES_LOOKUP_REQUEST,
+                LIST_REQUEST,
+                "GET /api/v1/surfaces/s-1 HTTP/1.1",
+                "PATCH /api/v1/surfaces/s-1 HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_feature_takes_a_surface_name() {
+        let requests = dispatched_requests(
+            &["fabric", "agent-gateway", "--token", "agpat_valid", "surfaces", "remove-feature", "Sales", "rate-limit"],
+            vec![
+                NOT_FOUND, ("HTTP/1.1 200 OK", SURFACE_LIST),
+                (
+                    "HTTP/1.1 200 OK",
+                    r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales","rate_limit":{"requests":100}},"target":{"endpoint":"http://127.0.0.1:3000"}}"#,
+                ),
+                ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1","name":"Sales"}"#),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            requests,
+            [
+                SALES_LOOKUP_REQUEST,
+                LIST_REQUEST,
+                "GET /api/v1/surfaces/s-1 HTTP/1.1",
+                "PATCH /api/v1/surfaces/s-1 HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_gate_preview_takes_a_surface_name() {
+        let command = resolved_command(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "tool-gate-preview",
+            "Sales",
+            "--tool",
+            "get_user",
+        ])
+        .await;
+
+        let SurfaceCommand::ToolGatePreview(args) = command else {
+            panic!("expected `surfaces tool-gate-preview`");
+        };
+        assert_eq!(args.surface_id.as_deref(), Some("s-1"));
+    }
+
+    #[tokio::test]
+    async fn tool_gate_preview_from_a_file_looks_up_no_surface() {
+        let (host, requests) = scripted_server(vec![]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command = surface_command(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "tool-gate-preview",
+            "--gates-file",
+            "gates.json",
+            "--tool",
+            "get_user",
+        ]);
+
+        let command = resolve_surface_command(&client, command)
+            .await
+            .expect("no surface to look up");
+
+        let SurfaceCommand::ToolGatePreview(args) = command else {
+            panic!("expected `surfaces tool-gate-preview`");
+        };
+        assert_eq!(args.surface_id, None);
+        assert!(request_lines(requests).is_empty(), "nothing should reach the gateway");
+    }
+
+    #[tokio::test]
+    async fn commands_that_name_no_saved_surface_look_up_nothing() {
+        let (host, requests) = scripted_server(vec![]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+
+        for args in
+            [["fabric", "agent-gateway", "surfaces", "list"], ["fabric", "agent-gateway", "surfaces", "features"]]
+        {
+            resolve_surface_command(&client, surface_command(&args))
+                .await
+                .expect("nothing to look up");
+        }
+
+        assert!(request_lines(requests).is_empty(), "nothing should reach the gateway");
+    }
+
+    #[tokio::test]
+    async fn update_by_name_dry_run_sends_the_patch_to_the_resolved_surface() {
+        let (host, requests) = scripted_server(vec![
+            NOT_FOUND,
+            ("HTTP/1.1 200 OK", SURFACE_LIST),
+            (DRY_RUN_GATEWAY_OK, STORED_SURFACE),
+            ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1","name":"Retail"}"#),
+        ])
+        .await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command = resolve_surface_command(
+            &client,
+            surface_command(&[
+                "fabric",
+                "agent-gateway",
+                "surfaces",
+                "update",
+                "Sales",
+                "--set",
+                "name=Retail",
+                "--dry-run",
+            ]),
+        )
+        .await
+        .expect("the surface should resolve");
+
+        run_surfaces(&client, command, Output::Json)
+            .await
+            .expect("the dry run should succeed");
+
+        assert_eq!(
+            request_lines(requests),
+            [
+                SALES_LOOKUP_REQUEST,
+                LIST_REQUEST,
+                "GET /api/v1/surfaces/s-1 HTTP/1.1",
+                "PATCH /api/v1/surfaces/s-1?dry_run=true HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_by_name_reads_the_resolved_surface() {
+        let (host, requests) =
+            scripted_server(vec![NOT_FOUND, ("HTTP/1.1 200 OK", SURFACE_LIST), ("HTTP/1.1 200 OK", STORED_SURFACE)])
+                .await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command =
+            resolve_surface_command(&client, surface_command(&["fabric", "agent-gateway", "surfaces", "get", "Sales"]))
+                .await
+                .expect("the surface should resolve");
+
+        let value = run_surfaces(&client, command, Output::Json)
+            .await
+            .expect("the read should succeed");
+
+        assert!(value.is_some());
+        assert_eq!(request_lines(requests), [SALES_LOOKUP_REQUEST, LIST_REQUEST, "GET /api/v1/surfaces/s-1 HTTP/1.1"]);
+    }
+
+    const S1_REQUEST: &str = "GET /api/v1/surfaces/s-1 HTTP/1.1";
+
+    const OK: (&str, &str) = ("HTTP/1.1 200 OK", STORED_SURFACE);
+
+    fn agent_gateway_args<'a>(rest: &[&'a str]) -> Vec<&'a str> {
+        let mut args = vec!["fabric", "agent-gateway", "--token", "agpat_valid", "surfaces"];
+        args.extend_from_slice(rest);
+        args
+    }
+
+    #[tokio::test]
+    async fn delete_by_id_checks_the_id_and_deletes_it() {
+        let requests =
+            dispatched_requests(&agent_gateway_args(&["delete", "s-1"]), vec![OK, ("HTTP/1.1 204 No Content", "")])
+                .await;
+
+        assert_eq!(requests, [S1_REQUEST, "DELETE /api/v1/surfaces/s-1 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn get_by_id_checks_the_id_and_reads_it() {
+        let requests = dispatched_requests(&agent_gateway_args(&["get", "s-1"]), vec![OK, OK]).await;
+
+        assert_eq!(requests, [S1_REQUEST, S1_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn get_by_name_reads_the_resolved_surface_through_the_dispatch() {
+        let requests = dispatched_requests(
+            &agent_gateway_args(&["get", "Sales"]),
+            vec![NOT_FOUND, ("HTTP/1.1 200 OK", SURFACE_LIST), OK],
+        )
+        .await;
+
+        assert_eq!(requests, [SALES_LOOKUP_REQUEST, LIST_REQUEST, S1_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn update_by_id_and_by_name_patch_the_same_surface() {
+        let by_id =
+            dispatched_requests(&agent_gateway_args(&["update", "s-1", "--set", "name=Retail"]), vec![OK, OK, OK])
+                .await;
+        let by_name = dispatched_requests(
+            &agent_gateway_args(&["update", "Sales", "--set", "name=Retail"]),
+            vec![NOT_FOUND, ("HTTP/1.1 200 OK", SURFACE_LIST), OK, OK],
+        )
+        .await;
+
+        assert_eq!(by_id, [S1_REQUEST, S1_REQUEST, "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]);
+        assert_eq!(by_name[..2], [SALES_LOOKUP_REQUEST, LIST_REQUEST]);
+        assert_eq!(by_name[2..], by_id[1..]);
+    }
+
+    #[tokio::test]
+    async fn feature_edits_by_id_check_the_id_then_read_and_patch_it() {
+        let expected = [S1_REQUEST, S1_REQUEST, "PATCH /api/v1/surfaces/s-1 HTTP/1.1"];
+        let added = dispatched_requests(
+            &agent_gateway_args(&["add-feature", "s-1", "rate-limit", "--json", r#"{"requests":100}"#]),
+            vec![OK, OK, OK],
+        )
+        .await;
+        let removed = dispatched_requests(
+            &agent_gateway_args(&["remove-feature", "s-1", "rate-limit"]),
+            vec![OK, ("HTTP/1.1 200 OK", RATE_LIMITED_SURFACE), OK],
+        )
+        .await;
+
+        assert_eq!(added, expected);
+        assert_eq!(removed, expected);
+    }
+
+    #[tokio::test]
+    async fn tool_gate_preview_by_id_checks_the_id_and_reads_it() {
+        let requests = dispatched_requests(
+            &agent_gateway_args(&["tool-gate-preview", "s-1", "--tool", "get_user"]),
+            vec![OK, ("HTTP/1.1 200 OK", GATED_SURFACE)],
+        )
+        .await;
+
+        assert_eq!(requests, [S1_REQUEST, S1_REQUEST]);
+    }
+
     const DELETE_GATE_FILE: &str = r#"{"default_effect":"allow","gates":[{"id":"g1","condition_policy_definition_id":"non-admins","action":{"effect":"deny","patterns":["^delete_"]}}]}"#;
 
     const GATED_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","target":{"endpoint":"http://127.0.0.1:3000","mcp_tool_gating":{"default_effect":"deny","gates":[{"name":"Reads","action":{"effect":"allow","patterns":["^get_"]}}]}}}"#;
@@ -3568,7 +4149,7 @@ mod gateway_config_tests {
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("Examples:\n  Check the gates a surface has saved:"), "{help}");
+        assert!(help.contains("Examples:\n  Check the gates a surface has saved, named by its name or ID:"), "{help}");
         assert!(help.contains("--condition admins=met --condition contractors=unmet"), "{help}");
         assert!(
             help.trim_end()
@@ -3956,8 +4537,10 @@ mod gateway_config_tests {
     }
 
     #[tokio::test]
-    async fn tool_gate_preview_with_a_surface_reads_it_through_the_command_dispatch() {
-        let (host, requests) = scripted_server(vec![("HTTP/1.1 200 OK", GATED_SURFACE)]).await;
+    async fn tool_gate_preview_with_a_surface_name_reads_it_through_the_command_dispatch() {
+        let (host, requests) =
+            scripted_server(vec![NOT_FOUND, ("HTTP/1.1 200 OK", SURFACE_LIST), ("HTTP/1.1 200 OK", GATED_SURFACE)])
+                .await;
         let config = crate::config::Config {
             current: Some("default".to_owned()),
             connections: [("default".to_owned(), crate::config::Connection::new(host))].into(),
@@ -3969,7 +4552,7 @@ mod gateway_config_tests {
             "agpat_valid",
             "surfaces",
             "tool-gate-preview",
-            "s-1",
+            "Sales",
             "--tool",
             "get_user, delete_user",
         ])
@@ -3979,7 +4562,7 @@ mod gateway_config_tests {
             .await
             .expect("the preview should succeed");
 
-        assert_eq!(request_lines(requests), ["GET /api/v1/surfaces/s-1 HTTP/1.1"]);
+        assert_eq!(request_lines(requests), [SALES_LOOKUP_REQUEST, LIST_REQUEST, "GET /api/v1/surfaces/s-1 HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -8643,6 +9226,177 @@ struct FetchedSurface {
     value: Value,
     /// Whether the gateway that answered honours `?dry_run=true` on PATCH.
     dry_run_supported: bool,
+}
+
+/// Swaps the surface a command names, by ID or by name, for its ID, so the
+/// commands below it only ever see an ID. Commands that name no saved surface
+/// pass through untouched.
+async fn resolve_surface_command(
+    client: &GatewayClient,
+    command: SurfaceCommand,
+) -> Result<SurfaceCommand> {
+    Ok(match command {
+        SurfaceCommand::Get { surface_id } => SurfaceCommand::Get {
+            surface_id: resolve_surface_id(client, &surface_id).await?,
+        },
+        SurfaceCommand::Delete { surface_id } => SurfaceCommand::Delete {
+            surface_id: resolve_surface_id(client, &surface_id).await?,
+        },
+        SurfaceCommand::Update {
+            surface_id,
+            file,
+            set,
+            unset,
+            add,
+            remove,
+            dry_run,
+        } => SurfaceCommand::Update {
+            surface_id: resolve_surface_id(client, &surface_id).await?,
+            file,
+            set,
+            unset,
+            add,
+            remove,
+            dry_run,
+        },
+        SurfaceCommand::AddFeature(mut args) => {
+            args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
+            SurfaceCommand::AddFeature(args)
+        }
+        SurfaceCommand::RemoveFeature(mut args) => {
+            args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
+            SurfaceCommand::RemoveFeature(args)
+        }
+        SurfaceCommand::ToolGatePreview(mut args) => {
+            if let Some(reference) = args.surface_id.take() {
+                args.surface_id = Some(resolve_surface_id(client, &reference).await?);
+            }
+            SurfaceCommand::ToolGatePreview(args)
+        }
+        command @ (SurfaceCommand::List | SurfaceCommand::Create(_) | SurfaceCommand::Features) => command,
+    })
+}
+
+/// The one-line note printed when the surface list is refused and the
+/// reference is used as an ID without a lookup.
+fn token_cannot_list_note(reference: &str) -> String {
+    format!(
+        "note: could not list surfaces with this token, so '{}' is used as an ID; a name only works if the token \
+         can list surfaces",
+        sanitize_for_terminal(&reference.replace(['\n', '\t'], " "))
+    )
+}
+
+/// The one-line note printed when asking for the reference as an ID is refused
+/// and the reference is used as an ID without a lookup.
+fn token_cannot_read_note(reference: &str) -> String {
+    format!(
+        "note: this token cannot read surfaces, so '{}' is used as an ID; a name only works if the token can list \
+         surfaces",
+        sanitize_for_terminal(&reference.replace(['\n', '\t'], " "))
+    )
+}
+
+/// The ID of the surface `reference` names. The gateway is asked for it as an
+/// ID first, and only when it has no surface by that ID are the surfaces
+/// listed to find one named `reference`. A name only one surface has is
+/// enough, and a name more than one surface has is refused with the matches
+/// listed, since picking one would be a guess.
+///
+/// A token the gateway will not let read or list surfaces cannot be checked,
+/// so its reference is used as an ID, as it was before names were accepted.
+async fn resolve_surface_id(
+    client: &GatewayClient,
+    reference: &str,
+) -> Result<String> {
+    if reference.trim().is_empty() {
+        bail!("give a surface ID or name; run `fabric agent-gateway surfaces list` to see them");
+    }
+    // The client refuses a path with `..` in it, and `.` names the collection
+    // itself, so a reference made only of dots can only be a name.
+    if !reference.contains("..")
+        && !reference
+            .chars()
+            .all(|character| character == '.')
+    {
+        match client
+            .request(Method::GET, &entity_path("/v1/surfaces", reference), None)
+            .await
+        {
+            Ok(_) => return Ok(reference.to_owned()),
+            // A 400 means the gateway does not take the reference as an ID,
+            // which leaves it as a name to look for in the list.
+            Err(error) if matches!(response_status(&error), Some(StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST)) => {}
+            // The command sends its own credentials again and reports its own 401.
+            Err(error) if response_status(&error) == Some(StatusCode::UNAUTHORIZED) => {
+                return Ok(reference.to_owned());
+            }
+            Err(error) if response_status(&error) == Some(StatusCode::FORBIDDEN) => {
+                eprintln!("{}", token_cannot_read_note(reference));
+                return Ok(reference.to_owned());
+            }
+            Err(error) => return Err(error.context(format!("look up the surface '{reference}'"))),
+        }
+    }
+    let surfaces = match client
+        .request(Method::GET, "/v1/surfaces", None)
+        .await
+    {
+        Ok(surfaces) => surfaces,
+        Err(error) if is_unauthorized(&error) => {
+            eprintln!("{}", token_cannot_list_note(reference));
+            return Ok(reference.to_owned());
+        }
+        Err(error) => return Err(error.context(format!("look up the surface '{reference}'"))),
+    };
+    let rows = surfaces
+        .as_array()
+        .context("gateway answered the surface list with something other than a list")?;
+    let matches: Vec<String> = rows
+        .iter()
+        .filter(|row| {
+            row.get("name")
+                .and_then(Value::as_str)
+                == Some(reference)
+        })
+        .filter_map(|row| {
+            row.get("surface_id")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+        .collect();
+    let name = sanitize_for_terminal(reference);
+    match matches.as_slice() {
+        [surface_id] => {
+            eprintln!("{}", using_surface_note(surface_id, reference));
+            Ok(surface_id.clone())
+        }
+        [] => bail!("no surface has the ID or name '{name}'; run `fabric agent-gateway surfaces list` to see them"),
+        _ => {
+            let lines: Vec<String> = matches
+                .iter()
+                .map(|surface_id| format!("  {}  {name}", sanitize_for_terminal(surface_id)))
+                .collect();
+            bail!("more than one surface is named '{name}'; pass the ID of the one you mean:\n{}", lines.join("\n"))
+        }
+    }
+}
+
+fn is_unauthorized(error: &anyhow::Error) -> bool {
+    matches!(response_status(error), Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
+}
+
+/// The one-line note printed when a name was resolved to the surface it
+/// stands for, so the operator sees which surface a command acts on.
+fn using_surface_note(
+    surface_id: &str,
+    name: &str,
+) -> String {
+    format!(
+        "using surface {} ({})",
+        sanitize_for_terminal(&surface_id.replace(['\n', '\t'], " ")),
+        sanitize_for_terminal(&name.replace(['\n', '\t'], " "))
+    )
 }
 
 async fn fetch_surface(
