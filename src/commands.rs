@@ -671,8 +671,17 @@ enum SurfaceCommand {
     /// List the features that can be added to a surface.
     Features,
     /// Add a feature to an Agent Surface.
+    ///
+    /// Where the feature goes is worked out from its name, so no edge flags
+    /// are needed, for example:
+    /// `surfaces add-feature $ID tool-gating --json '{...}'`. Add --edge,
+    /// --transit-point or --response only when the feature can go in more than
+    /// one place and the command asks you to choose.
     AddFeature(AddFeatureArgs),
     /// Remove a feature from an Agent Surface.
+    ///
+    /// Where the feature is found is worked out from its name, the same as
+    /// for add-feature.
     RemoveFeature(FeaturePlacementArgs),
     /// Show which tools a set of MCP tool gates would allow or deny, and which
     /// gate decided, before anything is saved.
@@ -788,21 +797,34 @@ impl From<EdgeOpt> for features::Edge {
     }
 }
 
+/// Where on the surface a feature goes. All optional, since the place is
+/// worked out from the feature name.
+#[derive(Debug, Args)]
+struct PlacementFlags {
+    /// Pipeline edge. Only needed when the feature can go in more than one
+    /// place; it is worked out from the feature otherwise.
+    #[arg(long, value_enum, conflicts_with = "transit_point")]
+    edge: Option<EdgeOpt>,
+    /// Put the feature on the transit point place instead of the surface place
+    /// (implies the ma-tp edge). For most features this is the transit point
+    /// with this alias.
+    #[arg(long)]
+    transit_point: Option<String>,
+    /// Use the response place instead of the request place, when the feature
+    /// has both. Also picks a response-only place, such as identity on
+    /// ma-external.
+    #[arg(long)]
+    response: bool,
+}
+
 #[derive(Debug, Args)]
 struct AddFeatureArgs {
     /// Surface ID (see `fabric agent-gateway surfaces list`).
     surface_id: String,
     /// Feature key or alias (see `fabric agent-gateway surfaces features`).
     feature: String,
-    /// Pipeline edge. Use --transit-point for a per-transit-point placement.
-    #[arg(long, value_enum, default_value_t = EdgeOpt::ApMa)]
-    edge: EdgeOpt,
-    /// Target a per-transit-point placement by alias (implies the ma-tp edge).
-    #[arg(long)]
-    transit_point: Option<String>,
-    /// Apply to the response direction instead of the request direction.
-    #[arg(long)]
-    response: bool,
+    #[command(flatten)]
+    placement: PlacementFlags,
     /// Shortcut for policy features: the policy definition id.
     #[arg(long)]
     policy_id: Option<String>,
@@ -824,12 +846,8 @@ struct FeaturePlacementArgs {
     surface_id: String,
     /// Feature key or alias (see `fabric agent-gateway surfaces features`).
     feature: String,
-    #[arg(long, value_enum, default_value_t = EdgeOpt::ApMa)]
-    edge: EdgeOpt,
-    #[arg(long)]
-    transit_point: Option<String>,
-    #[arg(long)]
-    response: bool,
+    #[command(flatten)]
+    placement: PlacementFlags,
     /// Check the change with the gateway and show what it would change,
     /// without saving anything.
     #[arg(long)]
@@ -2075,7 +2093,7 @@ mod gateway_config_tests {
 
     /// Starts a server that answers successive requests with `responses`, one
     /// `(status line, body)` per connection. Returns its base URL and a
-    /// receiver carrying each request's start line. A request beyond the script
+    /// receiver carrying each whole request. A request beyond the script
     /// is recorded too, and answered with [`UNSCRIPTED`], so a test asserting
     /// the recorded sequence catches any request it did not expect.
     async fn scripted_server(
@@ -2094,13 +2112,7 @@ mod gateway_config_tests {
                 let (status_line, body) = script
                     .next()
                     .unwrap_or(UNSCRIPTED);
-                let request = read_request(&mut socket).await;
-                let request_line = request
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned();
-                let _ = sender.send(request_line);
+                let _ = sender.send(read_request(&mut socket).await);
                 let response =
                     format!("{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 let _ = socket
@@ -2149,15 +2161,28 @@ mod gateway_config_tests {
         String::from_utf8_lossy(&request).into_owned()
     }
 
-    /// Every request start line the scripted server has received. Complete
-    /// once the command has returned: the server records each line before it
+    /// Every whole request the scripted server has received. Complete once the
+    /// command has returned: the server records each request before it
     /// answers, and the client waits for each answer.
-    fn request_lines(mut receiver: tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
-        let mut lines = Vec::new();
-        while let Ok(line) = receiver.try_recv() {
-            lines.push(line);
+    fn full_requests(mut receiver: tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut requests = Vec::new();
+        while let Ok(request) = receiver.try_recv() {
+            requests.push(request);
         }
-        lines
+        requests
+    }
+
+    fn request_lines(receiver: tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        full_requests(receiver)
+            .iter()
+            .map(|request| {
+                request
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
     }
 
     /// Asserts the one-shot server never saw a request, which is what makes a
@@ -3041,6 +3066,208 @@ mod gateway_config_tests {
             request_lines(requests),
             ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1?dry_run=true HTTP/1.1"]
         );
+    }
+
+    const TRANSIT_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[{"alias":"gh"}]}}"#;
+
+    const GATED_TRANSIT_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000","mcp_tool_gating":{"default_effect":"deny","gates":[]}},"transit":{"points":[{"alias":"gh","mcp_tool_gating":{"default_effect":"deny","gates":[]}}]}}"#;
+
+    const RATE_LIMITED_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales","rate_limit":{"requests":100,"window_secs":60}},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
+
+    const NO_GATES: &str = r#"{"default_effect":"deny","gates":[]}"#;
+
+    /// Runs a feature command as a dry run against a server that records each
+    /// whole request, and returns the two requests it made: the read of the
+    /// surface, then the dry-run patch.
+    async fn feature_dry_run(
+        args: &[&str],
+        stored: &'static str,
+    ) -> Result<Vec<String>> {
+        let (host, requests) =
+            scripted_server(vec![(DRY_RUN_GATEWAY_OK, stored), ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1"}"#)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let mut argv = vec!["fabric", "agent-gateway", "surfaces"];
+        argv.extend_from_slice(args);
+        argv.push("--dry-run");
+        run_surfaces(&client, surface_command(&argv), Output::Json).await?;
+        Ok(full_requests(requests))
+    }
+
+    fn start_lines(requests: &[String]) -> Vec<&str> {
+        requests
+            .iter()
+            .map(|request| {
+                request
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn patch_body(requests: &[String]) -> Value {
+        let body = requests[1]
+            .split_once("\r\n\r\n")
+            .expect("request body")
+            .1;
+        serde_json::from_str(body).expect("patch body is JSON")
+    }
+
+    const READ_AND_DRY_RUN: [&str; 2] =
+        ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1?dry_run=true HTTP/1.1"];
+
+    #[tokio::test]
+    async fn add_feature_finds_the_surface_wide_place_for_tool_gating_with_no_flags() {
+        let requests = feature_dry_run(&["add-feature", "s-1", "tool-gating", "--json", NO_GATES], TRANSIT_SURFACE)
+            .await
+            .expect("tool gating needs no edge flags");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(
+            patch_body(&requests),
+            json!({"target": {"mcp_tool_gating": {"default_effect": "deny", "gates": []}}})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_feature_finds_the_transit_point_place_when_a_transit_point_is_given() {
+        let requests = feature_dry_run(
+            &["add-feature", "s-1", "tool-gating", "--transit-point", "gh", "--json", NO_GATES],
+            TRANSIT_SURFACE,
+        )
+        .await
+        .expect("a transit point picks the per-transit-point place");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"alias": "gh", "mcp_tool_gating": {"default_effect": "deny", "gates": []}}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_feature_uses_the_one_networking_place_with_no_flags() {
+        let requests =
+            feature_dry_run(&["add-feature", "s-1", "timeout", "--json", r#"{"timeout_secs":5}"#], TRANSIT_SURFACE)
+                .await
+                .expect("both edges write the same networking spot");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(patch_body(&requests).pointer("/target/networking/timeout_secs"), Some(&json!(5)));
+    }
+
+    #[tokio::test]
+    async fn remove_feature_finds_the_place_with_no_flags() {
+        let requests = feature_dry_run(&["remove-feature", "s-1", "rate-limit"], RATE_LIMITED_SURFACE)
+            .await
+            .expect("rate limit needs no edge flags");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(patch_body(&requests), json!({"access_point": {"rate_limit": null}}));
+    }
+
+    #[tokio::test]
+    async fn remove_feature_takes_tool_gating_off_the_surface_with_no_flags() {
+        let requests = feature_dry_run(&["remove-feature", "s-1", "tool-gating"], GATED_TRANSIT_SURFACE)
+            .await
+            .expect("tool gating needs no edge flags");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(patch_body(&requests), json!({"target": {"mcp_tool_gating": null}}));
+    }
+
+    #[tokio::test]
+    async fn remove_feature_takes_tool_gating_off_one_transit_point() {
+        let requests =
+            feature_dry_run(&["remove-feature", "s-1", "tool-gating", "--transit-point", "gh"], GATED_TRANSIT_SURFACE)
+                .await
+                .expect("a transit point picks the per-transit-point place");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(patch_body(&requests), json!({"transit": {"points": [{"alias": "gh"}]}}));
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_feature_ask_for_a_flag_when_the_feature_has_several_places() {
+        for args in
+            [&["add-feature", "s-1", "policy", "--policy-id", "p1"][..], &["remove-feature", "s-1", "policy"][..]]
+        {
+            let error = feature_dry_run(args, STORED_SURFACE)
+                .await
+                .expect_err("policy has several places")
+                .to_string();
+            assert!(error.contains("can go in more than one place"), "{error}");
+            assert!(error.contains("--edge ap-ma --response"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn add_feature_still_accepts_an_explicit_edge_and_response() {
+        let requests = feature_dry_run(
+            &["add-feature", "s-1", "policy", "--edge", "ap-ma", "--response", "--policy-id", "p1"],
+            STORED_SURFACE,
+        )
+        .await
+        .expect("explicit flags pick the place");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(
+            patch_body(&requests),
+            json!({"target": {"response_policy": {"policy_definition_id": "p1", "require_agent_context": false}}})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_feature_takes_a_response_only_edge_without_response() {
+        let requests = feature_dry_run(
+            &["add-feature", "s-1", "identity", "--edge", "ma-external", "--json", r#"{"strategy":"from_mtls"}"#],
+            STORED_SURFACE,
+        )
+        .await
+        .expect("ma-external only has a response place for identity");
+        assert_eq!(patch_body(&requests), json!({"identity_slots": {"external": {"strategy": "from_mtls"}}}));
+    }
+
+    #[tokio::test]
+    async fn add_feature_refuses_response_on_a_transit_point_for_a_request_only_feature() {
+        let error = feature_dry_run(
+            &["add-feature", "s-1", "networking", "--transit-point", "gh", "--response", "--json", "{}"],
+            TRANSIT_SURFACE,
+        )
+        .await
+        .expect_err("networking has no response place on a transit point")
+        .to_string();
+        assert_eq!(
+            error,
+            "feature 'networking' has no ma-tp/response placement; valid placements: ap-ma/request, ma-external/request, ma-tp/request"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_feature_reject_a_transit_point_for_a_feature_without_one() {
+        for args in [
+            &["add-feature", "s-1", "rate-limit", "--transit-point", "gh", "--json", "{}"][..],
+            &["remove-feature", "s-1", "rate-limit", "--transit-point", "gh"][..],
+        ] {
+            let error = feature_dry_run(args, RATE_LIMITED_SURFACE)
+                .await
+                .expect_err("rate limit cannot go on one transit point")
+                .to_string();
+            assert!(error.contains("cannot go on a single transit point"), "{error}");
+        }
+    }
+
+    #[test]
+    fn edge_and_transit_point_cannot_be_given_together() {
+        for command in ["add-feature", "remove-feature"] {
+            let error = Cli::try_parse_from([
+                "fabric",
+                "agent-gateway",
+                "surfaces",
+                command,
+                "s-1",
+                "tool-gating",
+                "--edge",
+                "ma-external",
+                "--transit-point",
+                "gh",
+            ])
+            .expect_err("--edge and --transit-point pick different places");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     const DELETE_GATE_FILE: &str = r#"{"default_effect":"allow","gates":[{"id":"g1","condition_policy_definition_id":"non-admins","action":{"effect":"deny","patterns":["^delete_"]}}]}"#;
@@ -8214,18 +8441,15 @@ async fn add_feature(
 ) -> Result<Option<Value>> {
     let feature = features::find(&args.feature)
         .with_context(|| format!("unknown feature '{}'; run `fabric agent-gateway surfaces features`", args.feature))?;
-    let (edge, direction) = placement_selector(&args.edge, args.transit_point.as_deref(), args.response);
-    let placement = feature
-        .placement(edge, direction)
-        .with_context(|| {
-            format!(
-                "feature '{}' has no {}/{} placement; valid placements: {}",
-                feature.key,
-                edge.label(),
-                direction.label(),
-                feature.placement_summary()
-            )
-        })?;
+    let placement = feature.select_placement(
+        args.placement
+            .edge
+            .map(Into::into),
+        args.placement
+            .transit_point
+            .is_some(),
+        args.placement.response,
+    )?;
     let value = build_feature_value(placement.kind, &args)?;
 
     let path = entity_path("/v1/surfaces", &args.surface_id);
@@ -8234,7 +8458,9 @@ async fn add_feature(
         feature,
         placement,
         &surface.value,
-        args.transit_point.as_deref(),
+        args.placement
+            .transit_point
+            .as_deref(),
         features::FeatureEdit::Add(value),
     )?;
     send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
@@ -8247,18 +8473,15 @@ async fn remove_feature(
 ) -> Result<Option<Value>> {
     let feature = features::find(&args.feature)
         .with_context(|| format!("unknown feature '{}'; run `fabric agent-gateway surfaces features`", args.feature))?;
-    let (edge, direction) = placement_selector(&args.edge, args.transit_point.as_deref(), args.response);
-    let placement = feature
-        .placement(edge, direction)
-        .with_context(|| {
-            format!(
-                "feature '{}' has no {}/{} placement; valid placements: {}",
-                feature.key,
-                edge.label(),
-                direction.label(),
-                feature.placement_summary()
-            )
-        })?;
+    let placement = feature.select_placement(
+        args.placement
+            .edge
+            .map(Into::into),
+        args.placement
+            .transit_point
+            .is_some(),
+        args.placement.response,
+    )?;
 
     let path = entity_path("/v1/surfaces", &args.surface_id);
     let surface = fetch_surface(client, &path).await?;
@@ -8266,7 +8489,9 @@ async fn remove_feature(
         feature,
         placement,
         &surface.value,
-        args.transit_point.as_deref(),
+        args.placement
+            .transit_point
+            .as_deref(),
         features::FeatureEdit::Remove,
     )?;
     send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
@@ -8497,26 +8722,6 @@ fn dry_run_table(
     }
     text.push_str("\nDry run: nothing was saved.\n");
     Ok(text)
-}
-
-/// Resolve the (edge, direction) a feature is being placed on. A transit
-/// point alias implies the ma-tp edge.
-fn placement_selector(
-    edge: &EdgeOpt,
-    transit_point: Option<&str>,
-    response: bool,
-) -> (features::Edge, features::Direction) {
-    let edge = if transit_point.is_some() {
-        features::Edge::MaTp
-    } else {
-        (*edge).into()
-    };
-    let direction = if response {
-        features::Direction::Response
-    } else {
-        features::Direction::Request
-    };
-    (edge, direction)
 }
 
 fn build_feature_value(
@@ -12471,7 +12676,7 @@ mod tests {
         };
         assert_eq!(args.surface_id, "my-agent");
         assert_eq!(args.feature, "policy");
-        assert!(args.response);
+        assert!(args.placement.response);
     }
 
     #[test]

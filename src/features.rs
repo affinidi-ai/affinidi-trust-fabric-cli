@@ -74,6 +74,28 @@ pub struct Placement {
     pub kind: ValueKind,
 }
 
+impl Placement {
+    /// Whether both write the same value at the same spot on the surface.
+    fn same_place(
+        &self,
+        other: &Placement,
+    ) -> bool {
+        self.pointer == other.pointer && self.kind == other.kind
+    }
+
+    /// The flags that select this placement.
+    fn flags(&self) -> String {
+        let edge = match self.edge {
+            Edge::MaTp => "--transit-point <alias>".to_owned(),
+            edge => format!("--edge {}", edge.label()),
+        };
+        match self.direction {
+            Direction::Request => edge,
+            Direction::Response => format!("{edge} --response"),
+        }
+    }
+}
+
 pub struct Feature {
     pub key: &'static str,
     pub aliases: &'static [&'static str],
@@ -104,6 +126,103 @@ impl Feature {
             .find(|placement| placement.edge == edge && placement.direction == direction)
     }
 
+    /// Pick the placement the flags mean. With no `edge` and no
+    /// `transit_point_given`, that is the feature's only distinct place, or an
+    /// error listing the choices. Two places that write the same pointer count
+    /// as one.
+    pub fn select_placement(
+        &self,
+        edge: Option<Edge>,
+        transit_point_given: bool,
+        response: bool,
+    ) -> Result<&Placement> {
+        let edge = if transit_point_given {
+            Some(Edge::MaTp)
+        } else {
+            edge
+        };
+        let direction = if response {
+            Direction::Response
+        } else {
+            Direction::Request
+        };
+        let Some(edge) = edge else {
+            let candidates = distinct_places(
+                self.placements
+                    .iter()
+                    .filter(|placement| {
+                        placement.edge != Edge::MaTp && (!response || placement.direction == direction)
+                    }),
+            );
+            return match candidates.as_slice() {
+                [only] => Ok(only),
+                [] => bail!(
+                    "feature '{}' has no response place; valid placements: {}",
+                    self.key,
+                    self.placement_summary()
+                ),
+                _ => bail!(
+                    "feature '{}' can go in more than one place; add one of these flags:\n{}",
+                    self.key,
+                    self.placement_choices(response)
+                ),
+            };
+        };
+        if let Some(chosen) = self.placement(edge, direction) {
+            return Ok(chosen);
+        }
+        let mut on_edge = self
+            .placements
+            .iter()
+            .filter(|placement| placement.edge == edge);
+        if !response && let (Some(only), None) = (on_edge.next(), on_edge.next()) {
+            return Ok(only);
+        }
+        if transit_point_given
+            && !self
+                .placements
+                .iter()
+                .any(|placement| placement.edge == Edge::MaTp)
+        {
+            bail!(
+                "feature '{}' cannot go on a single transit point, so leave out --transit-point; valid placements: {}",
+                self.key,
+                self.placement_summary()
+            );
+        }
+        bail!(
+            "feature '{}' has no {}/{} placement; valid placements: {}",
+            self.key,
+            edge.label(),
+            direction.label(),
+            self.placement_summary()
+        )
+    }
+
+    /// One line per distinct place the feature can go, with the flags that pick it.
+    fn placement_choices(
+        &self,
+        response_only: bool,
+    ) -> String {
+        let shown = distinct_places(
+            self.placements
+                .iter()
+                .filter(|placement| !response_only || placement.direction == Direction::Response),
+        );
+        shown
+            .iter()
+            .map(|placement| {
+                let scope = if placement.edge == Edge::MaTp {
+                    "on one transit point"
+                } else {
+                    "on the whole surface"
+                };
+                format!("  {}  ({}, {}: {})", placement.flags(), placement.direction.label(), scope, placement.pointer)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Human-readable list of valid placements, for error messages.
     pub fn placement_summary(&self) -> String {
         self.placements
@@ -112,6 +231,20 @@ impl Feature {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+/// Keep the first of any places that write the same value at the same spot.
+fn distinct_places<'a>(placements: impl Iterator<Item = &'a Placement>) -> Vec<&'a Placement> {
+    let mut distinct: Vec<&Placement> = Vec::new();
+    for placement in placements {
+        if !distinct
+            .iter()
+            .any(|seen| seen.same_place(placement))
+        {
+            distinct.push(placement);
+        }
+    }
+    distinct
 }
 
 macro_rules! place {
@@ -606,6 +739,148 @@ mod tests {
                 .placement(Edge::MaExternal, Direction::Request)
                 .is_none()
         );
+    }
+
+    fn pointer_for(
+        key: &str,
+        edge: Option<Edge>,
+        per_transit_point: bool,
+        response: bool,
+    ) -> Result<&'static str> {
+        find(key)
+            .expect("feature")
+            .select_placement(edge, per_transit_point, response)
+            .map(|placement| placement.pointer)
+    }
+
+    #[test]
+    fn places_every_feature_with_no_flags_or_asks() {
+        let ambiguous = ["policy", "custom-metadata", "identity"];
+        let expected = [
+            ("inbound-policy", "/access_point/inbound_policy"),
+            ("caller-auth", "/access_point/caller_authentication"),
+            ("rate-limit", "/access_point/rate_limit"),
+            ("networking", "/target/networking"),
+            ("payment", "/target/payment_policy"),
+            ("extension-validation", "/access_point/extension_validation"),
+            ("extension-rules", "/target/extension_rules"),
+            ("header-metadata", "/access_point/header_metadata_mapping"),
+            ("trust-check", "/access_point/trust_check_list"),
+            ("trust-recorder", "/access_point/trust_recorder"),
+            ("mcp-tool-gating", "/target/mcp_tool_gating"),
+            ("credential-delegation", "/outbound_credentials"),
+            ("workload-binding", "/target/workload_binding"),
+        ];
+        for feature in FEATURES {
+            let result = pointer_for(feature.key, None, false, false);
+            if ambiguous.contains(&feature.key) {
+                let error = result
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("more than one place"), "{}: {error}", feature.key);
+            } else {
+                let (_, pointer) = expected
+                    .iter()
+                    .find(|(key, _)| *key == feature.key)
+                    .unwrap_or_else(|| panic!("no expectation for {}", feature.key));
+                assert_eq!(result.unwrap(), *pointer, "{}", feature.key);
+            }
+        }
+        assert_eq!(expected.len() + ambiguous.len(), FEATURES.len());
+    }
+
+    #[test]
+    fn places_tool_gating_on_the_surface_or_one_transit_point() {
+        assert_eq!(pointer_for("tool-gating", None, false, false).unwrap(), "/target/mcp_tool_gating");
+        assert_eq!(pointer_for("tool-gating", None, true, false).unwrap(), "/transit/points/{tp}/mcp_tool_gating");
+        assert_eq!(pointer_for("tool-gating", None, false, true).unwrap(), "/target/mcp_tool_gating");
+        assert_eq!(
+            pointer_for("tool-gating", Some(Edge::MaExternal), false, false).unwrap(),
+            "/target/mcp_tool_gating"
+        );
+    }
+
+    #[test]
+    fn lists_the_choices_with_their_flags_when_a_feature_has_several() {
+        let error = pointer_for("policy", None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("feature 'policy' can go in more than one place"), "{error}");
+        assert!(error.contains("--edge ap-ma  (request, on the whole surface: /target/policy)"), "{error}");
+        assert!(
+            error.contains("--edge ap-ma --response  (response, on the whole surface: /target/response_policy)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("--transit-point <alias>  (request, on one transit point: /transit/points/{tp}/policy)"),
+            "{error}"
+        );
+        assert!(error.contains("--transit-point <alias> --response  (response, on one transit point"), "{error}");
+    }
+
+    #[test]
+    fn lists_only_response_choices_when_response_is_asked_for() {
+        let error = pointer_for("identity", None, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--edge ap-ma --response"), "{error}");
+        assert!(error.contains("--edge ma-external --response"), "{error}");
+        assert!(!error.contains("/identity_slots/inbound"), "{error}");
+    }
+
+    #[test]
+    fn explicit_flags_still_pick_the_place() {
+        assert_eq!(pointer_for("policy", Some(Edge::ApMa), false, false).unwrap(), "/target/policy");
+        assert_eq!(pointer_for("policy", Some(Edge::ApMa), false, true).unwrap(), "/target/response_policy");
+        assert_eq!(pointer_for("policy", None, true, false).unwrap(), "/transit/points/{tp}/policy");
+        assert_eq!(pointer_for("policy", None, true, true).unwrap(), "/transit/points/{tp}/response_policy");
+        assert_eq!(pointer_for("networking", Some(Edge::MaExternal), false, false).unwrap(), "/target/networking");
+        assert!(pointer_for("identity", None, false, true).is_err());
+        assert_eq!(pointer_for("identity", Some(Edge::MaExternal), false, true).unwrap(), "/identity_slots/external");
+        assert_eq!(pointer_for("trust-recorder", None, false, true).unwrap(), "/access_point/trust_recorder");
+    }
+
+    #[test]
+    fn names_a_place_the_feature_does_not_have() {
+        let error = pointer_for("payment", Some(Edge::MaExternal), false, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "feature 'payment' has no ma-external/request placement; valid placements: ap-ma/request");
+        let error = pointer_for("payment", Some(Edge::ApMa), false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no ap-ma/response placement"), "{error}");
+        let error = pointer_for("rate-limit", None, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no response place; valid placements: ap-ma/request"), "{error}");
+    }
+
+    #[test]
+    fn counts_places_that_write_the_same_spot_once() {
+        for name in ["networking", "timeout", "retry", "circuit-breaker"] {
+            assert_eq!(pointer_for(name, None, false, false).unwrap(), "/target/networking");
+        }
+        let error = pointer_for("custom-metadata", None, false, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error
+                .matches("\n  --")
+                .count(),
+            2,
+            "{error}"
+        );
+        assert_eq!(pointer_for("networking", Some(Edge::MaExternal), false, false).unwrap(), "/target/networking");
+        assert_eq!(pointer_for("networking", None, true, false).unwrap(), "/transit/points/{tp}/networking");
+    }
+
+    #[test]
+    fn rejects_transit_point_on_a_feature_without_one() {
+        let error = pointer_for("rate-limit", None, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot go on a single transit point, so leave out --transit-point"), "{error}");
     }
 
     #[test]
