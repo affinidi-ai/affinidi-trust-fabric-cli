@@ -401,9 +401,9 @@ fabric agent-gateway surfaces features
 fabric agent-gateway surfaces features --output json
 ```
 
-Add a feature to a surface. The surface ID and the feature are positional, in that order; the place is worked out from the feature name, so `--edge` (`ap-ma` or `ma-external`), `--response` and `--transit-point <alias>` are optional overrides, needed only when the command says the feature can go in more than one place.
+Add a feature to a surface. The surface ID and the feature are positional, in that order; the place is worked out from the feature name, so `--edge` (`ap-ma`, `ma-external` or `ma-tp`), `--response` and `--transit-point <alias>` are optional overrides, needed only when the command says the feature can go in more than one place.
 
-With no flags the CLI uses the surface place whenever the feature has no other choice to make. `--transit-point <alias>` picks the transit point place instead, as for tool gating and networking. `policy`, `custom-metadata` and `identity` have more than one choice, so they list the flags to add.
+With no flags the CLI uses the surface place, and the request direction when a feature has both. `--response` picks the response place, and `--transit-point <alias>` picks the transit point place instead, as for tool gating, networking and policy. `--edge ma-tp` picks a transit point edge place that has no alias, which is the target leg of trust-check. Only `identity --response` has to be told the edge (`--edge ap-ma` or `--edge ma-external`), and the command lists both.
 
 Configuration comes from `--policy-id` (policy shortcut), `--json`, or `--file`:
 
@@ -419,6 +419,9 @@ fabric agent-gateway surfaces add-feature <id> networking --file networking.json
 
 # Append a Trust Check element (list feature)
 fabric agent-gateway surfaces add-feature <id> trust-check --file trust-check.json
+
+# Trust Check element on the target leg
+fabric agent-gateway surfaces add-feature <id> trust-check --edge ma-tp --file trust-check.json
 
 # Per-transit-point response policy
 fabric agent-gateway surfaces add-feature <id> policy --transit-point github --response --policy-id allow-gh

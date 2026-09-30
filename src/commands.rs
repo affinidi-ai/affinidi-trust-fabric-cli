@@ -674,9 +674,11 @@ enum SurfaceCommand {
     ///
     /// Where the feature goes is worked out from its name, so no edge flags
     /// are needed, for example:
-    /// `surfaces add-feature $ID tool-gating --json '{...}'`. Add --edge,
-    /// --transit-point or --response only when the feature can go in more than
-    /// one place and the command asks you to choose.
+    /// `surfaces add-feature $ID tool-gating --json '{...}'`. A feature with one
+    /// place uses it, and otherwise the request place is used unless you add
+    /// --response. --transit-point picks one transit point, and --edge ma-tp
+    /// picks the target leg of trust-check. --edge is otherwise only needed
+    /// when the command asks you to choose.
     AddFeature(AddFeatureArgs),
     /// Remove a feature from an Agent Surface.
     ///
@@ -786,6 +788,7 @@ impl Protocol {
 enum EdgeOpt {
     ApMa,
     MaExternal,
+    MaTp,
 }
 
 impl From<EdgeOpt> for features::Edge {
@@ -793,6 +796,7 @@ impl From<EdgeOpt> for features::Edge {
         match edge {
             EdgeOpt::ApMa => features::Edge::ApMa,
             EdgeOpt::MaExternal => features::Edge::MaExternal,
+            EdgeOpt::MaTp => features::Edge::MaTp,
         }
     }
 }
@@ -801,18 +805,17 @@ impl From<EdgeOpt> for features::Edge {
 /// worked out from the feature name.
 #[derive(Debug, Args)]
 struct PlacementFlags {
-    /// Pipeline edge. Only needed when the feature can go in more than one
-    /// place; it is worked out from the feature otherwise.
+    /// Pipeline edge. Only needed when the command asks for it; it is worked
+    /// out from the feature otherwise. Use ma-tp for a place with no transit
+    /// point alias, such as the target leg of trust-check.
     #[arg(long, value_enum, conflicts_with = "transit_point")]
     edge: Option<EdgeOpt>,
-    /// Put the feature on the transit point place instead of the surface place
-    /// (implies the ma-tp edge). For most features this is the transit point
-    /// with this alias.
+    /// Put the feature on the transit point with this alias instead of on the
+    /// whole surface (implies the ma-tp edge).
     #[arg(long)]
     transit_point: Option<String>,
     /// Use the response place instead of the request place, when the feature
-    /// has both. Also picks a response-only place, such as identity on
-    /// ma-external.
+    /// has both.
     #[arg(long)]
     response: bool,
 }
@@ -3174,16 +3177,53 @@ mod gateway_config_tests {
     }
 
     #[tokio::test]
-    async fn add_and_remove_feature_ask_for_a_flag_when_the_feature_has_several_places() {
-        for args in
-            [&["add-feature", "s-1", "policy", "--policy-id", "p1"][..], &["remove-feature", "s-1", "policy"][..]]
-        {
+    async fn add_feature_treats_policy_with_no_flags_as_the_request_policy() {
+        let requests = feature_dry_run(&["add-feature", "s-1", "policy", "--policy-id", "p1"], STORED_SURFACE)
+            .await
+            .expect("policy needs no edge flags");
+        assert_eq!(
+            patch_body(&requests),
+            json!({"target": {"policy": {"policy_definition_id": "p1", "require_agent_context": false}}})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_feature_takes_response_and_transit_point_without_an_edge() {
+        let requests =
+            feature_dry_run(&["add-feature", "s-1", "policy", "--response", "--policy-id", "p1"], STORED_SURFACE)
+                .await
+                .expect("--response alone picks the response policy");
+        assert!(
+            patch_body(&requests)
+                .pointer("/target/response_policy")
+                .is_some()
+        );
+        let requests = feature_dry_run(
+            &["add-feature", "s-1", "policy", "--transit-point", "gh", "--policy-id", "p1"],
+            TRANSIT_SURFACE,
+        )
+        .await
+        .expect("a transit point alone picks its request policy");
+        assert!(
+            patch_body(&requests)
+                .pointer("/transit/points/0/policy")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_feature_ask_for_the_edge_when_identity_response_has_two_places() {
+        for args in [
+            &["add-feature", "s-1", "identity", "--response", "--json", "{}"][..],
+            &["remove-feature", "s-1", "identity", "--response"][..],
+        ] {
             let error = feature_dry_run(args, STORED_SURFACE)
                 .await
-                .expect_err("policy has several places")
+                .expect_err("identity has two response places")
                 .to_string();
             assert!(error.contains("can go in more than one place"), "{error}");
-            assert!(error.contains("--edge ap-ma --response"), "{error}");
+            assert!(error.contains("--edge ap-ma  (response"), "{error}");
+            assert!(error.contains("--edge ma-external  (response"), "{error}");
         }
     }
 
@@ -3228,17 +3268,86 @@ mod gateway_config_tests {
         );
     }
 
+    const TRUST_CHECKED_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales","trust_check_list":[{"id":"a","trust_registry_id":"tr-1","query_type":"recognition","query":{}}]},"target":{"endpoint":"http://127.0.0.1:3000","trust_check_list":[{"id":"b","trust_registry_id":"tr-1","query_type":"recognition","query":{}}]}}"#;
+
+    #[tokio::test]
+    async fn add_feature_puts_trust_check_on_the_caller_or_target_leg() {
+        let element = r#"{"id":"c","trust_registry_id":"tr-1","query_type":"recognition","query":{}}"#;
+        let requests = feature_dry_run(&["add-feature", "s-1", "trust-check", "--json", element], STORED_SURFACE)
+            .await
+            .expect("no flags means the caller leg");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(
+            patch_body(&requests),
+            json!({"access_point": {"trust_check_list": [serde_json::from_str::<Value>(element).unwrap()]}})
+        );
+        let requests = feature_dry_run(
+            &["add-feature", "s-1", "trust-check", "--edge", "ma-tp", "--json", element],
+            STORED_SURFACE,
+        )
+        .await
+        .expect("--edge ma-tp means the target leg");
+        assert_eq!(
+            patch_body(&requests),
+            json!({"target": {"trust_check_list": [serde_json::from_str::<Value>(element).unwrap()]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_feature_takes_trust_check_off_the_caller_or_target_leg() {
+        let requests = feature_dry_run(&["remove-feature", "s-1", "trust-check"], TRUST_CHECKED_SURFACE)
+            .await
+            .expect("no flags means the caller leg");
+        assert_eq!(patch_body(&requests), json!({"access_point": {"trust_check_list": null}}));
+        let requests =
+            feature_dry_run(&["remove-feature", "s-1", "trust-check", "--edge", "ma-tp"], TRUST_CHECKED_SURFACE)
+                .await
+                .expect("--edge ma-tp means the target leg");
+        assert_eq!(patch_body(&requests), json!({"target": {"trust_check_list": null}}));
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_feature_refuse_edge_ma_tp_where_an_alias_is_needed() {
+        for (args, feature) in [
+            (&["add-feature", "s-1", "policy", "--edge", "ma-tp", "--policy-id", "p1"][..], "policy"),
+            (&["remove-feature", "s-1", "policy", "--edge", "ma-tp"][..], "policy"),
+            (&["add-feature", "s-1", "tool-gating", "--edge", "ma-tp", "--json", "{}"][..], "mcp-tool-gating"),
+            (&["remove-feature", "s-1", "tool-gating", "--edge", "ma-tp"][..], "mcp-tool-gating"),
+        ] {
+            let error = feature_dry_run(args, TRANSIT_SURFACE)
+                .await
+                .expect_err("these features need an alias for ma-tp")
+                .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "feature '{feature}' goes on one transit point, so use --transit-point <alias> instead of --edge ma-tp"
+                )
+            );
+        }
+    }
+
     #[tokio::test]
     async fn add_and_remove_feature_reject_a_transit_point_for_a_feature_without_one() {
         for args in [
             &["add-feature", "s-1", "rate-limit", "--transit-point", "gh", "--json", "{}"][..],
             &["remove-feature", "s-1", "rate-limit", "--transit-point", "gh"][..],
+            &["add-feature", "s-1", "trust-check", "--transit-point", "gh", "--json", "{}"][..],
+            &["remove-feature", "s-1", "trust-check", "--transit-point", "gh"][..],
         ] {
             let error = feature_dry_run(args, RATE_LIMITED_SURFACE)
                 .await
-                .expect_err("rate limit cannot go on one transit point")
+                .expect_err("these features have no transit point place")
                 .to_string();
-            assert!(error.contains("cannot go on a transit point"), "{error}");
+            let expected = match args[2] {
+                "trust-check" => {
+                    "feature 'trust-check' has no place per transit point alias, so leave out --transit-point (--edge ma-tp is the target leg); use one of: --edge ap-ma, --edge ma-tp"
+                }
+                _ => {
+                    "feature 'rate-limit' cannot go on a transit point, so leave out --transit-point; use one of: --edge ap-ma"
+                }
+            };
+            assert_eq!(error, expected);
         }
     }
 
