@@ -2172,8 +2172,8 @@ mod gateway_config_tests {
         requests
     }
 
-    fn request_lines(receiver: tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
-        full_requests(receiver)
+    fn start_lines(requests: &[String]) -> Vec<String> {
+        requests
             .iter()
             .map(|request| {
                 request
@@ -2183,6 +2183,10 @@ mod gateway_config_tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    fn request_lines(receiver: tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        start_lines(&full_requests(receiver))
     }
 
     /// Asserts the one-shot server never saw a request, which is what makes a
@@ -3093,18 +3097,6 @@ mod gateway_config_tests {
         Ok(full_requests(requests))
     }
 
-    fn start_lines(requests: &[String]) -> Vec<&str> {
-        requests
-            .iter()
-            .map(|request| {
-                request
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-            })
-            .collect()
-    }
-
     fn patch_body(requests: &[String]) -> Value {
         let body = requests[1]
             .split_once("\r\n\r\n")
@@ -3232,7 +3224,7 @@ mod gateway_config_tests {
         .to_string();
         assert_eq!(
             error,
-            "feature 'networking' has no ma-tp/response placement; valid placements: ap-ma/request, ma-external/request, ma-tp/request"
+            "feature 'networking' cannot use --transit-point <alias> --response; use one of: --edge ap-ma, --edge ma-external, --transit-point <alias>"
         );
     }
 
@@ -3246,7 +3238,7 @@ mod gateway_config_tests {
                 .await
                 .expect_err("rate limit cannot go on one transit point")
                 .to_string();
-            assert!(error.contains("cannot go on a single transit point"), "{error}");
+            assert!(error.contains("cannot go on a transit point"), "{error}");
         }
     }
 

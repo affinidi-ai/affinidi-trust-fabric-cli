@@ -403,7 +403,7 @@ fabric agent-gateway surfaces features --output json
 
 Add a feature to a surface. The surface ID and the feature are positional, in that order; the place is worked out from the feature name, so `--edge` (`ap-ma` or `ma-external`), `--response` and `--transit-point <alias>` are optional overrides, needed only when the command says the feature can go in more than one place.
 
-With no flags the CLI uses the surface place whenever the feature has no other choice to make. `--transit-point <alias>` picks the transit point place instead, as for tool gating, trust-check and networking. `policy`, `custom-metadata` and `identity` have more than one choice, so they list the flags to add.
+With no flags the CLI uses the surface place whenever the feature has no other choice to make. `--transit-point <alias>` picks the transit point place instead, as for tool gating and networking. `policy`, `custom-metadata` and `identity` have more than one choice, so they list the flags to add.
 
 Configuration comes from `--policy-id` (policy shortcut), `--json`, or `--file`:
 

@@ -85,14 +85,7 @@ impl Placement {
 
     /// The flags that select this placement.
     fn flags(&self) -> String {
-        let edge = match self.edge {
-            Edge::MaTp => "--transit-point <alias>".to_owned(),
-            edge => format!("--edge {}", edge.label()),
-        };
-        match self.direction {
-            Direction::Request => edge,
-            Direction::Response => format!("{edge} --response"),
-        }
+        flags_for(self.edge, self.direction)
     }
 }
 
@@ -157,9 +150,14 @@ impl Feature {
             return match candidates.as_slice() {
                 [only] => Ok(only),
                 [] => bail!(
-                    "feature '{}' has no response place; valid placements: {}",
+                    "feature '{}' has no {}; use one of: {}",
                     self.key,
-                    self.placement_summary()
+                    if response {
+                        "response place"
+                    } else {
+                        "place on the whole surface"
+                    },
+                    self.allowed_flags()
                 ),
                 _ => bail!(
                     "feature '{}' can go in more than one place; add one of these flags:\n{}",
@@ -185,18 +183,12 @@ impl Feature {
                 .any(|placement| placement.edge == Edge::MaTp)
         {
             bail!(
-                "feature '{}' cannot go on a single transit point, so leave out --transit-point; valid placements: {}",
+                "feature '{}' cannot go on a transit point, so leave out --transit-point; use one of: {}",
                 self.key,
-                self.placement_summary()
+                self.allowed_flags()
             );
         }
-        bail!(
-            "feature '{}' has no {}/{} placement; valid placements: {}",
-            self.key,
-            edge.label(),
-            direction.label(),
-            self.placement_summary()
-        )
+        bail!("feature '{}' cannot use {}; use one of: {}", self.key, flags_for(edge, direction), self.allowed_flags())
     }
 
     /// One line per distinct place the feature can go, with the flags that pick it.
@@ -223,13 +215,28 @@ impl Feature {
             .join("\n")
     }
 
-    /// Human-readable list of valid placements, for error messages.
-    pub fn placement_summary(&self) -> String {
+    /// The flags that pick each place the feature has, for error messages.
+    fn allowed_flags(&self) -> String {
         self.placements
             .iter()
-            .map(|placement| format!("{}/{}", placement.edge.label(), placement.direction.label()))
+            .map(Placement::flags)
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+/// The flags that select a place on `edge` in `direction`.
+fn flags_for(
+    edge: Edge,
+    direction: Direction,
+) -> String {
+    let edge = match edge {
+        Edge::MaTp => "--transit-point <alias>".to_owned(),
+        edge => format!("--edge {}", edge.label()),
+    };
+    match direction {
+        Direction::Request => edge,
+        Direction::Response => format!("{edge} --response"),
     }
 }
 
@@ -845,15 +852,34 @@ mod tests {
         let error = pointer_for("payment", Some(Edge::MaExternal), false, false)
             .unwrap_err()
             .to_string();
-        assert_eq!(error, "feature 'payment' has no ma-external/request placement; valid placements: ap-ma/request");
+        assert_eq!(error, "feature 'payment' cannot use --edge ma-external; use one of: --edge ap-ma");
         let error = pointer_for("payment", Some(Edge::ApMa), false, true)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("has no ap-ma/response placement"), "{error}");
+        assert_eq!(error, "feature 'payment' cannot use --edge ap-ma --response; use one of: --edge ap-ma");
         let error = pointer_for("rate-limit", None, false, true)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("has no response place; valid placements: ap-ma/request"), "{error}");
+        assert_eq!(error, "feature 'rate-limit' has no response place; use one of: --edge ap-ma");
+    }
+
+    #[test]
+    fn names_a_missing_surface_place_when_response_was_not_asked_for() {
+        let transit_only = Feature {
+            key: "transit-only",
+            aliases: &[],
+            description: "",
+            placements: &[place!(MaTp, Request, "/transit/points/{tp}/x", Object)],
+        };
+        let error = transit_only
+            .select_placement(None, false, false)
+            .map(|placement| placement.pointer)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "feature 'transit-only' has no place on the whole surface; use one of: --transit-point <alias>"
+        );
     }
 
     #[test]
@@ -880,7 +906,7 @@ mod tests {
         let error = pointer_for("rate-limit", None, true, false)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("cannot go on a single transit point, so leave out --transit-point"), "{error}");
+        assert!(error.contains("cannot go on a transit point, so leave out --transit-point"), "{error}");
     }
 
     #[test]
