@@ -7,6 +7,7 @@ mod features;
 mod interactive;
 mod surface_patch;
 mod surface_validate;
+mod tables;
 mod tool_gate_preview;
 
 use anyhow::Result;

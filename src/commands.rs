@@ -13,6 +13,7 @@ use crate::{
     config::{Config, Connection, normalize_host, normalize_user_host},
     credentials::{CredentialStore, OsCredentialStore},
     features, surface_patch, surface_validate,
+    tables::{self, Layout, table_cell},
     tool_gate_preview::{self, Conditions, Gating, Preview, ToolPreview, Verdict},
 };
 
@@ -1131,6 +1132,7 @@ async fn dispatch_with(
             }
             let created = is_create_command(&command);
             let deleted = delete_confirmation(&command);
+            let layout = list_layout(&command);
             let value = match command {
                 Command::Runtime { command } => run_runtime(&client, command).await?,
                 Command::Settings { command } => run_settings(&client, command).await?,
@@ -1202,7 +1204,10 @@ async fn dispatch_with(
             };
             match deleted {
                 Some(confirmation) => print_outcome(&value, cli.output, &confirmation),
-                None => print_value(&value, cli.output, created),
+                None => match layout {
+                    Some(layout) => print_list(&value, cli.output, layout),
+                    None => print_value(&value, cli.output, created),
+                },
             }
         }
     }
@@ -1602,7 +1607,7 @@ fn run_config(
     match command {
         ConfigCommand::List => {
             let rows: Vec<Value> = config.connections.iter().map(|(name, connection)| json!({"name": name, "host": connection.host, "current": config.current.as_deref() == Some(name)})).collect();
-            print_value(&Value::Array(rows), output, false)
+            print_list(&Value::Array(rows), output, &tables::CONNECTION_SETTINGS)
         }
         ConfigCommand::Use { name } => {
             if !config
@@ -5302,7 +5307,7 @@ async fn run_certificates(
         command => run_crud(client, CERTIFICATES_PATH, command).await?,
     };
     if let Some(id) = deleted {
-        return Ok(report_removal(value, "Deleted certificate", &id, output));
+        return Ok(report_removal(value, removal_line("Deleted", "certificate", &id), output));
     }
     if !reveal {
         mask_keys(&mut value, &["private_key_pem"]);
@@ -5361,7 +5366,7 @@ async fn run_secrets(
             let value = client
                 .request(Method::DELETE, &encoded_path(SECRETS_PATH, &id), None)
                 .await?;
-            return Ok(report_removal(value, "Deleted secret", &id, output));
+            return Ok(report_removal(value, removal_line("Deleted", "secret", &id), output));
         }
     };
     if !reveal {
@@ -5392,17 +5397,38 @@ async fn run_delegation_vault(
             let value = client
                 .request(Method::DELETE, &encoded_path(DELEGATION_VAULT_PATH, &id), None)
                 .await?;
-            Ok(report_removal(value, "Revoked grant", &id, output))
+            Ok(report_removal(value, removal_line("Revoked", "grant", &id), output))
         }
-        // A mass revoke answers with a real 200 body reporting how many
-        // grants went, so it never takes the empty-body path.
+        // A mass revoke answers with `{"revoked": N}`. Table output says how
+        // many went in one line and `--output json` keeps the answer.
         DelegationVaultCommand::RevokeUser { user_hash } => {
             let path = encoded_path(&format!("{DELEGATION_VAULT_PATH}/by-user"), &user_hash);
-            client
+            let value = client
                 .request(Method::DELETE, &path, None)
-                .await
-                .map(Some)
+                .await?;
+            if matches!(output, Output::Table) {
+                println!("{}", revoked_grants_line(&value, &user_hash));
+                return Ok(None);
+            }
+            Ok(Some(value))
         }
+    }
+}
+
+/// `Revoked 2 grants for user '<hash>'`, with the count from the gateway's
+/// answer, or `Revoked grants for user '<hash>'` when the answer carries none.
+fn revoked_grants_line(
+    answer: &Value,
+    user_hash: &str,
+) -> String {
+    let hash = tables::flatten(user_hash);
+    match answer
+        .get("revoked")
+        .and_then(Value::as_u64)
+    {
+        Some(1) => format!("Revoked 1 grant for user '{hash}'"),
+        Some(count) => format!("Revoked {count} grants for user '{hash}'"),
+        None => format!("Revoked grants for user '{hash}'"),
     }
 }
 
@@ -5534,7 +5560,7 @@ async fn resolve_id(
         names,
         view,
     } = lookup;
-    let shown = one_line(reference);
+    let shown = tables::flatten_capped(reference);
     let response = client
         .request(Method::GET, base, None)
         .await;
@@ -5613,23 +5639,18 @@ async fn resolve_id(
                 .map(|(id, entity)| {
                     let details = names
                         .iter()
-                        .map(|name| format!("{name}: {}", one_line(string_field(entity, name).unwrap_or("-"))))
+                        .map(|name| {
+                            format!("{name}: {}", tables::flatten_capped(string_field(entity, name).unwrap_or("-")))
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("  {}  ({details})", one_line(id))
+                    format!("  {}  ({details})", tables::flatten_capped(id))
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
             bail!("'{shown}' matches more than one {noun}; pass one of these ids instead:\n{candidates}")
         }
     }
-}
-
-/// `value` on one line with control characters removed, for text that goes to
-/// the terminal inside a message. A newline or tab becomes a space, where
-/// `sanitize_for_terminal` would keep it.
-fn one_line(value: &str) -> String {
-    sanitize_for_terminal(&value.replace(['\n', '\t', '\r'], " "))
 }
 
 fn string_field<'a>(
@@ -5653,18 +5674,17 @@ fn is_uuid(value: &str) -> bool {
             })
 }
 
-/// Reports the empty body a 204 carries. Table output gets a human line and
-/// nothing to print afterwards; JSON output keeps the `null` that body parses
-/// to, so it matches every other delete command. A response that does carry a
-/// document is passed through untouched.
+/// Reports a removal the gateway answered with an empty body. Table output
+/// prints the confirmation line and has nothing to print afterwards. JSON
+/// output keeps the `null` that body parses to, and an answer with content is
+/// passed on untouched in both modes.
 fn report_removal(
     value: Value,
-    action: &str,
-    id: &str,
+    line: String,
     output: Output,
 ) -> Option<Value> {
     if value.is_null() && matches!(output, Output::Table) {
-        println!("{action} {id}");
+        println!("{line}");
         return None;
     }
     Some(value)
@@ -6604,7 +6624,7 @@ mod secrets_certs_tests {
             DelegationVaultCommand::RevokeUser {
                 user_hash: "sha256:abc".to_owned(),
             },
-            Output::Table,
+            Output::Json,
         )
         .await
         .expect("revoke user");
@@ -7803,7 +7823,7 @@ async fn run_api_keys(
             let value = client
                 .request(Method::POST, &path, Some(json!({"actor": actor})))
                 .await?;
-            print_outcome(&value, output, &format!("Revoked API key '{key_id}'"))
+            print_outcome(&value, output, &removal_line("Revoked", "API key", &key_id))
         }
         ApiKeyCommand::Rotate { key_id, surface, actor } => {
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
@@ -7818,7 +7838,7 @@ async fn run_api_keys(
             let value = client
                 .request(Method::DELETE, &api_key_path(&agent_id, &key_id), None)
                 .await?;
-            print_outcome(&value, output, &format!("Deleted API key '{key_id}'"))
+            print_outcome(&value, output, &removal_line("Deleted", "API key", &key_id))
         }
     }
 }
@@ -7881,7 +7901,9 @@ fn surfaces_carrying_key<'a>(
         .collect())
 }
 
-/// Prints the outcome of a call the gateway answers with 204 and no body.
+/// Prints the outcome of a delete: the confirmation line in table mode, even
+/// when the gateway sent a document back, and the gateway's own answer with
+/// `--output json`.
 fn print_outcome(
     value: &Value,
     output: Output,
@@ -7896,10 +7918,10 @@ fn print_outcome(
     }
 }
 
-/// Chooses what an empty 204 answer puts on standard output: a confirmation
-/// for a person reading a table, and the gateway's own document (`null` for
-/// an empty body) in JSON mode, where prose would make the output
-/// unparseable for whatever consumes it.
+/// Chooses what a delete or revoke puts on standard output, whether the
+/// gateway answered with nothing or with a document: a confirmation for a
+/// person reading a table, and the gateway's own document (`null` for an
+/// empty body) in JSON mode, where prose would break whatever parses it.
 fn outcome_line(
     output: Output,
     confirmation: &str,
@@ -7970,29 +7992,7 @@ fn print_api_keys(
     value: &Value,
     output: Output,
 ) -> Result<()> {
-    match (output, value.as_array()) {
-        (Output::Table, Some(rows)) if rows.is_empty() => println!("No results."),
-        (Output::Table, Some(rows)) => {
-            for row in rows {
-                print_api_key_row(row);
-            }
-        }
-        _ => return print_value(value, output, false),
-    }
-    Ok(())
-}
-
-fn print_api_key_row(value: &Value) {
-    let Some(key) = value.as_object() else {
-        println!("{value}");
-        return;
-    };
-    let field = |name: &str| {
-        key.get(name)
-            .and_then(Value::as_str)
-            .unwrap_or("-")
-    };
-    println!("{}\t{}\t{}\t{}", field("key_id"), field("agent_id"), field("client_id"), field("status"));
+    print_list(value, output, &tables::API_KEYS)
 }
 
 async fn run_tenant_ownership(
@@ -8857,19 +8857,156 @@ mod identity_access_tests {
     }
 
     #[test]
-    fn deletes_with_an_answer_of_their_own_keep_the_shared_printer() {
-        for arguments in [
-            // `run_api_keys` prints this one itself.
-            vec!["fabric", "agent-gateway", "api-keys", "delete", "atgk_1"],
-            // Deactivation answers 200 with the identity it changed.
-            vec!["fabric", "agent-gateway", "identities", "deactivate", "i-1"],
+    fn every_delete_on_the_shared_commands_confirms_with_its_kind_and_id() {
+        for (arguments, line) in [
+            (["surfaces", "delete", "x-1"], "Deleted surface 'x-1'"),
+            (["policies", "delete", "x-1"], "Deleted policy 'x-1'"),
+            (["connections", "delete", "x-1"], "Deleted connection 'x-1'"),
+            (["connection-points", "delete", "x-1"], "Deleted connection point 'x-1'"),
+            (["issuers", "delete", "x-1"], "Deleted issuer 'x-1'"),
+            (["authorities", "delete", "x-1"], "Deleted authority 'x-1'"),
+            (["trust-registries", "delete", "x-1"], "Deleted trust registry 'x-1'"),
+            (["mediators", "delete", "x-1"], "Deleted mediator 'x-1'"),
+            (["mcp-proxies", "delete", "x-1"], "Deleted MCP proxy 'x-1'"),
+            (["a2a-proxies", "delete", "x-1"], "Deleted A2A proxy 'x-1'"),
+            (["sts-clients", "delete", "x-1"], "Deleted STS client 'x-1'"),
+            (["credential-providers", "delete", "x-1"], "Deleted credential provider 'x-1'"),
+            (["integrations", "delete", "x-1"], "Deleted integration 'x-1'"),
         ] {
-            let cli = Cli::try_parse_from(&arguments).expect("the command should parse");
-            assert!(
-                delete_confirmation(&cli.agent_gateway().command).is_none(),
-                "{arguments:?} does not answer with an empty 204",
-            );
+            let mut full = vec!["fabric", "agent-gateway"];
+            full.extend(arguments);
+            let cli = Cli::try_parse_from(&full).expect("delete should parse");
+
+            assert_eq!(delete_confirmation(&cli.agent_gateway().command).as_deref(), Some(line), "{full:?}");
         }
+    }
+
+    #[test]
+    fn a_delete_confirmation_never_carries_control_characters() {
+        let cli = Cli::try_parse_from(["fabric", "agent-gateway", "issuers", "delete", "i\u{1b}[31m-1"])
+            .expect("delete should parse");
+
+        let line = delete_confirmation(&cli.agent_gateway().command).expect("a confirmation");
+
+        assert_eq!(line, "Deleted issuer 'i[31m-1'");
+    }
+
+    #[test]
+    fn a_removal_line_keeps_a_typed_id_on_one_line_and_whole() {
+        assert_eq!(removal_line("Deleted", "issuer", "a\nb\tc\rd"), "Deleted issuer 'a b c d'");
+
+        let long = "i".repeat(800);
+        assert_eq!(removal_line("Revoked", "grant", &long), format!("Revoked grant '{long}'"));
+    }
+
+    #[test]
+    fn each_list_command_prints_the_header_of_its_own_resource() {
+        for (arguments, header) in [
+            (vec!["surfaces", "list"], "NAME  ID  PROTOCOL  ROUTE  TARGET  TRANSIT POINTS"),
+            (vec!["policies", "list"], "NAME  ID  DESCRIPTION  ENABLED  VERSION  UPDATED"),
+            (vec!["policies", "versions", "p-1"], "VERSION  HASH  CREATED  BY  NOTE"),
+            (vec!["connections", "list"], "NAME  ID  TYPE  STATUS  UPDATED"),
+            (vec!["connection-points", "list"], "NAME  ID  CONNECTION  ENABLED  USES  EXPIRES"),
+            (vec!["issuers", "list"], "NAME  ID  DID  DESCRIPTION"),
+            (vec!["authorities", "list"], "NAME  ID  DID  DESCRIPTION"),
+            (vec!["trust-registries", "list"], "NAME  ID  DID  DESCRIPTION"),
+            (vec!["mediators", "list"], "NAME  ID  STATUS  DID  DESCRIPTION"),
+            (vec!["mcp-proxies", "list"], "NAME  ID  STATUS  BASE URL  DESCRIPTION"),
+            (vec!["a2a-proxies", "list"], "NAME  ID  STATUS  DESCRIPTION  UPDATED"),
+            (vec!["sts-clients", "list"], "NAME  ID  CLIENT ID  SCOPES"),
+            (vec!["credential-providers", "list"], "NAME  ID  PROVIDER ID  TYPE"),
+            (vec!["certificates", "list"], "NAME  ID  KIND  ACTIVE  UPDATED"),
+            (vec!["secrets", "list"], "NAME  ID  SECRET ID  TYPE  DESCRIPTION"),
+            (vec!["integrations", "list"], "NAME  ID  TYPE  STATUS  DESCRIPTION"),
+            (vec!["users", "list"], "USERNAME  ID  ROLE  STATUS  EMAIL"),
+            (vec!["identities", "list"], "DID  ID  VERSION  ACTIVE  UPDATED"),
+            (vec!["delegation-vault", "list"], "ID  AGENT DID  PROVIDER  EXPIRES  EXPIRED"),
+            (vec!["jwt-verification-strategies", "list"], "NAME  ID  ISSUER  UPDATED"),
+        ] {
+            let mut full = vec!["fabric", "agent-gateway"];
+            full.extend(&arguments);
+            let cli = Cli::try_parse_from(&full).expect("command should parse");
+            let layout = list_layout(&cli.agent_gateway().command).expect("a list has a layout");
+
+            assert_eq!(tables::render_list(layout, &[json!({})])[0], header, "{full:?}");
+        }
+    }
+
+    #[test]
+    fn lists_that_print_themselves_use_their_own_headers() {
+        for (layout, header) in [
+            (&tables::API_KEYS, "KEY ID  SURFACE  CLIENT ID  STATUS"),
+            (&tables::CONNECTION_SETTINGS, "NAME  HOST  CURRENT"),
+            (&tables::PAYMENTS, "ID  STORE  SURFACE  STATUS  AMOUNT  CURRENCY  CREATED"),
+            (&tables::AUDIT, "TIMESTAMP  EVENT  SURFACE  DECISION  DETAIL"),
+            (&tables::GENERIC, "NAME  ID  DESCRIPTION"),
+            (&tables::TOKENS, "NAME  ID  STATUS  SCOPES  CREATED  EXPIRES"),
+        ] {
+            assert_eq!(tables::render_list(layout, &[json!({})])[0], header);
+        }
+    }
+
+    #[test]
+    fn a_token_name_and_id_are_never_cut_but_the_other_cells_are_cleaned() {
+        let long = "n".repeat(700);
+        let row = access_token_row(&json!({"id": long, "name": long, "created_at": "2026-09-01\r"}));
+
+        assert_eq!(row[0].len(), 700);
+        assert_eq!(row[1].len(), 700);
+        assert_eq!(row[4], "2026-09-01 ");
+    }
+
+    #[test]
+    fn a_token_name_with_a_line_break_or_escape_code_stays_in_its_cell() {
+        let row = access_token_row(&json!({"id": "t-1", "name": "ci\nbot\u{1b}[31m", "scopes": ["a\tb"]}));
+
+        assert_eq!(row[0], "ci bot[31m");
+        assert_eq!(row[3], "a b");
+    }
+
+    #[test]
+    fn only_list_commands_have_a_table_layout() {
+        for (arguments, listed) in [
+            (vec!["surfaces", "list"], true),
+            (vec!["policies", "list"], true),
+            (vec!["secrets", "list", "--tag", "x"], true),
+            (vec!["certificates", "list"], true),
+            (vec!["jwt-verification-strategies", "list"], true),
+            (vec!["surfaces", "get", "s-1"], false),
+            (vec!["issuers", "get", "i-1"], false),
+        ] {
+            let mut full = vec!["fabric", "agent-gateway"];
+            full.extend(&arguments);
+            let cli = Cli::try_parse_from(&full).expect("command should parse");
+
+            assert_eq!(list_layout(&cli.agent_gateway().command).is_some(), listed, "{full:?}");
+        }
+    }
+
+    #[test]
+    fn deletes_with_an_answer_of_their_own_keep_the_shared_printer() {
+        // `run_api_keys` prints this one itself.
+        let arguments = ["fabric", "agent-gateway", "api-keys", "delete", "atgk_1"];
+        let cli = Cli::try_parse_from(arguments).expect("the command should parse");
+
+        assert!(delete_confirmation(&cli.agent_gateway().command).is_none(), "{arguments:?} prints its own line");
+    }
+
+    #[test]
+    fn deactivating_an_identity_confirms_even_when_the_gateway_sends_the_identity_back() {
+        let cli = Cli::try_parse_from(["fabric", "agent-gateway", "identities", "deactivate", "i-1"])
+            .expect("deactivate should parse");
+
+        assert_eq!(delete_confirmation(&cli.agent_gateway().command).as_deref(), Some("Deactivated identity 'i-1'"));
+    }
+
+    #[test]
+    fn the_revoke_user_line_uses_the_count_from_the_answer() {
+        assert_eq!(revoked_grants_line(&json!({"revoked": 2}), "sha256:a"), "Revoked 2 grants for user 'sha256:a'");
+        assert_eq!(revoked_grants_line(&json!({"revoked": 1}), "sha256:a"), "Revoked 1 grant for user 'sha256:a'");
+        assert_eq!(revoked_grants_line(&json!({"revoked": 0}), "sha256:a"), "Revoked 0 grants for user 'sha256:a'");
+        assert_eq!(revoked_grants_line(&Value::Null, "sha256:a\nb"), "Revoked grants for user 'sha256:a b'");
+        assert_eq!(revoked_grants_line(&json!({"revoked": "x"}), "h"), "Revoked grants for user 'h'");
     }
 }
 
@@ -8898,7 +9035,7 @@ async fn run_access_tokens(
             let value = client
                 .request(Method::DELETE, &entity_path("/v1/access-tokens", &args.id), None)
                 .await?;
-            print_json_or_else(&value, output, || println!("Revoked access token {}", args.id))?;
+            print_json_or_else(&value, output, || println!("{}", removal_line("Revoked", "access token", &args.id)))?;
         }
         AccessTokenCommand::Rotate(args) => {
             if !args.yes
@@ -9056,18 +9193,25 @@ fn print_access_token_table(value: &Value) {
         print_table(value);
         return;
     };
-    if tokens.is_empty() {
-        println!("No results.");
-        return;
-    }
-    let header = ["NAME", "ID", "STATUS", "SCOPES", "CREATED", "EXPIRES"];
-    let rows: Vec<[String; 6]> = tokens
+    let entries: Vec<Value> = tokens
         .iter()
-        .map(access_token_row)
+        .map(access_token_entry)
         .collect();
-    for line in format_table(&header, &rows) {
-        println!("{line}");
-    }
+    print_rows(&tables::TOKENS, &entries);
+}
+
+/// A token as the cells of [`tables::TOKENS`]: the status and the scope
+/// summary are worked out here, since the gateway sends neither as one value.
+fn access_token_entry(token: &Value) -> Value {
+    let [name, id, status, scopes, created_at, expires_at] = access_token_row(token);
+    json!({
+        "name": name,
+        "id": id,
+        "status": status,
+        "scopes": scopes,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    })
 }
 
 /// Formats a single token object as one table row of cell values.
@@ -9080,8 +9224,8 @@ fn access_token_row(token: &Value) -> [String; 6] {
             .unwrap_or("-")
             .to_owned()
     };
-    let name = field("name");
-    let id = field("id");
+    let name = tables::whole_cell(&field("name"));
+    let id = tables::whole_cell(&field("id"));
     let status = access_token_status(token).to_owned();
     let scopes = token
         .get("scopes")
@@ -9093,10 +9237,13 @@ fn access_token_row(token: &Value) -> [String; 6] {
                 .collect::<Vec<_>>()
         })
         .filter(|scopes| !scopes.is_empty())
-        .map(|scopes| summarize_scopes(&scopes))
+        .map(|scopes| table_cell(&summarize_scopes(&scopes)))
         .unwrap_or_else(|| "-".to_owned());
-    let created = field("created_at");
-    let expires = field("expires_at");
+    let created = table_cell(&field("created_at"));
+    let expires = match field("expires_at").as_str() {
+        "-" => "never".to_owned(),
+        expires => table_cell(expires),
+    };
     [name, id, status, scopes, created, expires]
 }
 
@@ -9141,45 +9288,16 @@ fn summarize_scopes(scopes: &[&str]) -> String {
     summary
 }
 
-/// Lays out a header and rows as fixed-width, space-padded columns, matching
-/// the plain style used by tools like `kubectl`/`docker`/`gh`: each column is
-/// padded (left-aligned) to the widest cell in that column (including the
-/// header), with a 2-space gap between columns. The last column is left
-/// unpadded so lines don't carry trailing whitespace.
+/// Lays out a header and rows with the same padding every list uses.
 fn format_table<const N: usize>(
     header: &[&str; N],
     rows: &[[String; N]],
 ) -> Vec<String> {
-    let mut widths = header.map(str::len);
-    for row in rows {
-        for (width, cell) in widths
-            .iter_mut()
-            .zip(row.iter())
-        {
-            *width = (*width).max(cell.len());
-        }
-    }
-    let format_row = |cells: &[&str; N]| -> String {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(index, cell)| {
-                if index == N - 1 {
-                    (*cell).to_owned()
-                } else {
-                    format!("{cell:<width$}", width = widths[index])
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("  ")
-    };
-    let mut lines = Vec::with_capacity(rows.len() + 1);
-    lines.push(format_row(header));
-    for row in rows {
-        let cells: [&str; N] = std::array::from_fn(|index| row[index].as_str());
-        lines.push(format_row(&cells));
-    }
-    lines
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.to_vec())
+        .collect();
+    tables::format_rows(header, &rows)
 }
 
 /// A token is REVOKED when `revoked_at` is set or `active` is explicitly false,
@@ -9391,7 +9509,7 @@ fn using_surface_note(
     surface_id: &str,
     name: &str,
 ) -> String {
-    format!("using surface {} ({})", one_line(surface_id), one_line(name))
+    format!("using surface {} ({})", tables::flatten_capped(surface_id), tables::flatten_capped(name))
 }
 
 async fn fetch_surface(
@@ -9682,7 +9800,7 @@ async fn run_policies(
     }
 }
 
-use crate::client::{REDACTED, RawAuth, clean_for_terminal, gateway_error, sanitize_for_terminal};
+use crate::client::{REDACTED, RawAuth, clean_for_terminal, gateway_error};
 
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
@@ -10094,7 +10212,7 @@ async fn fetch_audit_page(
         .await
 }
 
-/// Printed to standard error beneath "No audit events.", for the operator who
+/// Printed to standard error beneath "No audit events yet.", for the operator who
 /// expected events: why the log can be empty, and what it never records.
 const EMPTY_AUDIT_NOTES: [&str; 2] = [
     "An empty result is ambiguous: the gateway answers 200 with no events when the audit log is empty, when its \
@@ -10109,86 +10227,65 @@ fn print_audit_table(response: &Value) -> Result<()> {
     write_audit_table(response, &mut io::stdout().lock(), &mut io::stderr().lock()).context("print the audit table")
 }
 
-/// Write one row per event to `rows`, or, for an empty result, "No audit
-/// events." to `rows` and [`EMPTY_AUDIT_NOTES`] to `notes`, so piped rows stay
-/// clean. `rows` is standard output and `notes` standard error.
+/// Writes the events to `rows` as the shared audit table, or, for an empty
+/// result, "No audit events yet." to `rows` and [`EMPTY_AUDIT_NOTES`] to `notes`,
+/// so piped output stays clean. `rows` is standard output and `notes` standard
+/// error.
 fn write_audit_table(
     response: &Value,
     rows: &mut impl io::Write,
     notes: &mut impl io::Write,
 ) -> io::Result<()> {
-    let events = response
+    let events: Vec<Value> = response
         .get("events")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .iter()
+        .map(audit_row)
+        .collect();
+    for line in tables::render_list(&tables::AUDIT, &events) {
+        writeln!(rows, "{line}")?;
+    }
     if events.is_empty() {
-        writeln!(rows, "No audit events.")?;
         for note in EMPTY_AUDIT_NOTES {
             writeln!(notes, "{note}")?;
         }
-        return Ok(());
-    }
-    for event in events {
-        writeln!(rows, "{}", audit_row(event))?;
     }
     Ok(())
 }
 
-/// Format one audit event as `timestamp  event  surface_id  decision  detail`.
-/// Audit events carry none of the `id`, `name`, or `description` keys the
-/// shared list formatter looks for, so every row would otherwise render as
-/// dashes. `detail` is the gateway's own note on the event, such as how many
-/// tokens a revocation removed. Every cell goes through [`table_cell`].
-fn audit_row(event: &Value) -> String {
-    let timestamp = event
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let action = event.get("event");
-    // Actions without fields serialise as a bare string; the rest are
-    // externally tagged, as `{"policy_decision": {…}}`.
-    let (name, details) = match action {
-        Some(Value::String(name)) => (name.as_str(), None),
+/// Flattens one audit event into the `timestamp`, `event`, `surface_id`,
+/// `decision` and `detail` fields of [`tables::AUDIT`]. Events carry none of
+/// the `id`, `name` or `description` keys the generic list looks for, and the
+/// event itself is either a bare string or a tagged object such as
+/// `{"policy_decision": {...}}`, so the table cannot read them in place. A
+/// missing field is left out and prints as `-`; `detail` is the gateway's own
+/// note on the event, such as how many tokens a revocation removed.
+fn audit_row(event: &Value) -> Value {
+    let (name, details) = match event.get("event") {
+        Some(Value::String(name)) => (Some(name.as_str()), None),
         Some(Value::Object(tagged)) => match tagged.iter().next() {
-            Some((name, value)) => (name.as_str(), value.as_object()),
-            None => ("-", None),
+            Some((name, value)) => (Some(name.as_str()), value.as_object()),
+            None => (None, None),
         },
-        _ => ("-", None),
+        _ => (None, None),
     };
-    let surface_id = event
-        .get("surface_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            details
-                .and_then(|fields| fields.get("surface_id"))
-                .and_then(Value::as_str)
-        })
-        .unwrap_or("-");
-    let decision = details
-        .and_then(|fields| fields.get("decision"))
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let detail = event
-        .get("detail")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    [timestamp, name, surface_id, decision, detail]
-        .map(table_cell)
-        .join("\t")
-}
-
-/// One cell of a tab-separated row built from gateway-supplied text: sanitised
-/// like an error message, with line breaks and tabs turned into spaces so a
-/// stored value can neither drive the terminal nor split or shift the row, and
-/// `-` when nothing printable is left.
-fn table_cell(text: &str) -> String {
-    let cell = sanitize_for_terminal(text).replace(['\n', '\t'], " ");
-    if cell.trim().is_empty() {
-        "-".to_owned()
-    } else {
-        cell
-    }
+    let field = |key: &str| {
+        details
+            .and_then(|fields| fields.get(key))
+            .and_then(Value::as_str)
+    };
+    json!({
+        "timestamp": event.get("timestamp"),
+        "event": name,
+        "surface_id": event
+            .get("surface_id")
+            .and_then(Value::as_str)
+            .or_else(|| field("surface_id")),
+        "decision": field("decision"),
+        "detail": event.get("detail"),
+    })
 }
 
 /// Replace the credential-bearing fields of every event: `vp_jwt` carries a
@@ -10339,12 +10436,7 @@ async fn list_payments(
     match output {
         Output::Json => println!("{}", serde_json::to_string_pretty(&Value::Array(rows))?),
         Output::Table => {
-            if rows.is_empty() {
-                println!("No payment records.");
-            }
-            for row in &rows {
-                println!("{}", payment_table_row(row));
-            }
+            print_rows(&tables::PAYMENTS, &rows);
             for footer in &footers {
                 eprintln!("{footer}");
             }
@@ -10418,7 +10510,7 @@ async fn delete_payment(
         // The gateway answers 204 with no body, which would otherwise print
         // `null` where a reader expects a result.
         Output::Table => {
-            println!("Deleted x402 payment {id}");
+            println!("{}", removal_line("Deleted", "x402 payment", id));
             Ok(())
         }
         // Mirror `GatewayClient::request`, which reports an empty body as a
@@ -10591,24 +10683,6 @@ fn sort_payments_newest_first(rows: &mut [Value]) {
                 .unwrap_or(i64::MIN),
         )
     });
-}
-
-fn payment_table_row(row: &Value) -> String {
-    let cell = |key: &str| match row.get(key) {
-        Some(Value::String(value)) => table_cell(value),
-        Some(Value::Null) | None => "-".to_owned(),
-        Some(other) => table_cell(&other.to_string()),
-    };
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        cell("id"),
-        cell("store"),
-        cell("surface_id"),
-        cell("status"),
-        cell("amount"),
-        cell("currency"),
-        cell("created_at")
-    )
 }
 
 async fn run_metrics(
@@ -11017,7 +11091,7 @@ mod observability_tests {
             "timestamp": "2026-09-21T10:00:00Z",
             "event": {"policy_decision": {"scope": "surface", "decision": "deny", "surface_id": "sales"}},
         });
-        assert_eq!(audit_row(&event), "2026-09-21T10:00:00Z\tpolicy_decision\tsales\tdeny\t-");
+        assert_eq!(audit_line(&event), "2026-09-21T10:00:00Z  policy_decision  sales    deny      -");
     }
 
     #[test]
@@ -11027,7 +11101,7 @@ mod observability_tests {
             "event": "consent_granted",
             "surface_id": "sales",
         });
-        assert_eq!(audit_row(&event), "2026-09-21T10:00:00Z\tconsent_granted\tsales\t-\t-");
+        assert_eq!(audit_line(&event), "2026-09-21T10:00:00Z  consent_granted  sales    -         -");
     }
 
     /// A reviewer saw nothing after creating an identity with every audit
@@ -11037,7 +11111,7 @@ mod observability_tests {
     fn an_empty_audit_result_says_admin_calls_are_not_audited() {
         let (rows, notes) = audit_table(&json!({"events": [], "total": 0}));
 
-        assert_eq!(rows, "No audit events.\n");
+        assert_eq!(rows, "No audit events yet.\n");
         assert!(notes.contains("audit subsystem failed to start"), "got: {notes}");
         assert!(notes.contains("cannot read the audit file or the file is not valid UTF-8"), "got: {notes}");
         assert!(notes.contains("drops any line of the file it cannot parse"), "got: {notes}");
@@ -11053,7 +11127,10 @@ mod observability_tests {
     fn an_audit_result_with_events_prints_rows_and_no_notes() {
         let (rows, notes) = audit_table(&json!({"events": [{"timestamp": "t1", "event": "user_tokens_revoked"}]}));
 
-        assert_eq!(rows, "t1\tuser_tokens_revoked\t-\t-\t-\n");
+        assert_eq!(
+            rows,
+            "TIMESTAMP  EVENT                SURFACE  DECISION  DETAIL\nt1         user_tokens_revoked  -        -         -\n"
+        );
         assert_eq!(notes, "");
     }
 
@@ -11065,9 +11142,14 @@ mod observability_tests {
         (String::from_utf8(rows).expect("UTF-8 rows"), String::from_utf8(notes).expect("UTF-8 notes"))
     }
 
+    /// The data line `audit list` prints for one event, without the header.
+    fn audit_line(event: &Value) -> String {
+        tables::render_list(&tables::AUDIT, &[audit_row(event)]).remove(1)
+    }
+
     #[test]
     fn audit_row_falls_back_to_dashes() {
-        assert_eq!(audit_row(&json!({})), "-\t-\t-\t-\t-");
+        assert_eq!(audit_line(&json!({})), "-          -      -        -         -");
     }
 
     /// The event's own `detail` is the only place some events say what they
@@ -11081,7 +11163,10 @@ mod observability_tests {
             "user_identity_hash": "sha256:abc",
             "via_fabric": false,
         });
-        assert_eq!(audit_row(&event), "2026-09-21T10:00:00Z\tuser_tokens_revoked\t-\t-\t0 tokens revoked");
+        assert_eq!(
+            audit_line(&event),
+            "2026-09-21T10:00:00Z  user_tokens_revoked  -        -         0 tokens revoked"
+        );
     }
 
     /// The detail is gateway-supplied text, so it must not drive the terminal
@@ -11089,10 +11174,10 @@ mod observability_tests {
     #[test]
     fn audit_row_sanitises_the_event_detail() {
         let event = json!({"event": "trace_terminated", "detail": "a\u{1b}[2J\rb\tc\nd"});
-        assert_eq!(audit_row(&event), "-\ttrace_terminated\t-\t-\ta[2Jb c d");
+        assert_eq!(audit_line(&event), "-          trace_terminated  -        -         a[2J b c d");
 
         let blank = json!({"event": "trace_terminated", "detail": "\u{1b}"});
-        assert_eq!(audit_row(&blank), "-\ttrace_terminated\t-\t-\t-");
+        assert_eq!(audit_line(&blank), "-          trace_terminated  -        -         -");
     }
 
     /// Every cell is stored gateway text, so none can clear the screen or add
@@ -11104,7 +11189,7 @@ mod observability_tests {
             "event": {"policy\tdecision": {"decision": "deny\u{7}", "surface_id": "sales\nsupport"}},
             "detail": "\u{1b}",
         });
-        assert_eq!(audit_row(&event), "2026-09-21[2J\tpolicy decision\tsales support\tdeny\t-");
+        assert_eq!(audit_line(&event), "2026-09-21[2J  policy decision  sales support  deny      -");
     }
 
     #[test]
@@ -11113,7 +11198,10 @@ mod observability_tests {
             PaymentStore::X402,
             &json!({"id": "tx\u{1b}[2J1", "surface_id": "sales\tsupport", "status": "Verified\n", "amount": "\u{7}", "asset": "USDC", "created_at": 100}),
         );
-        assert_eq!(payment_table_row(&row), "tx[2J1\tx402\tsales support\tVerified \t-\tUSDC\t100");
+        assert_eq!(
+            tables::render_list(&tables::PAYMENTS, &[row])[1],
+            "tx[2J1  x402   sales support  Verified   -       USDC      100"
+        );
     }
 
     #[test]
@@ -11184,7 +11272,10 @@ mod observability_tests {
     #[test]
     fn payment_table_row_renders_missing_fields_as_dashes() {
         let row = payment_row(PaymentStore::Mpp, &json!({"id": "mpp-1", "created_at": 200}));
-        assert_eq!(payment_table_row(&row), "mpp-1\tmpp\t-\t-\t-\t-\t200");
+        assert_eq!(
+            tables::render_list(&tables::PAYMENTS, &[row])[1],
+            "mpp-1  mpp    -        -       -       -         200"
+        );
     }
 
     #[test]
@@ -12220,12 +12311,7 @@ fn print_value(
 
 fn print_table(value: &Value) {
     match value {
-        Value::Array(rows) if rows.is_empty() => println!("No results."),
-        Value::Array(rows) => {
-            for row in rows {
-                print_row(row);
-            }
-        }
+        Value::Array(rows) => print_rows(&tables::GENERIC, rows),
         // A single entity: show the full configuration, matching the UX config view.
         Value::Object(_) => match serde_json::to_string_pretty(value) {
             Ok(text) => println!("{text}"),
@@ -12235,46 +12321,138 @@ fn print_table(value: &Value) {
     }
 }
 
-fn print_row(value: &Value) {
-    if let Some(object) = value.as_object() {
-        let id = ["surface_id", "id", "gateway_id", "connection_point_id", "user_id", "key_id"]
-            .iter()
-            .find_map(|key| {
-                object
-                    .get(*key)
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("-");
-        let name = object
-            .get("name")
-            .or_else(|| object.get("username"))
-            .or_else(|| object.get("did"))
-            .and_then(Value::as_str)
-            .unwrap_or("-");
-        let description = object
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        println!("{id}\t{name}\t{description}");
-    } else {
-        println!("{value}");
+fn print_rows(
+    layout: &Layout,
+    rows: &[Value],
+) {
+    for line in tables::render_list(layout, rows) {
+        println!("{line}");
     }
 }
 
-/// The confirmation a delete prints in table mode when the gateway answers
-/// 204 with no body, the counterpart of `is_create_command`. Without one the
-/// shared printer puts the literal `null` of that empty body on standard
-/// output. API keys are absent because `run_api_keys` prints its own.
+/// Prints a list in the layout of its resource. `--output json` and anything
+/// that is not a plain list go through the shared printer unchanged.
+fn print_list(
+    value: &Value,
+    output: Output,
+    layout: &Layout,
+) -> Result<()> {
+    match (output, value) {
+        (Output::Table, Value::Array(rows)) => {
+            print_rows(layout, rows);
+            Ok(())
+        }
+        _ => print_value(value, output, false),
+    }
+}
+
+/// The columns a command that prints a list of records uses, or `None` for
+/// any other command.
+fn list_layout(command: &Command) -> Option<&'static Layout> {
+    Some(match command {
+        Command::Surfaces { command: SurfaceCommand::List } => &tables::SURFACES,
+        Command::Connections { command: CrudCommand::List } => &tables::CONNECTIONS,
+        Command::ConnectionPoints { command: CrudCommand::List } => &tables::CONNECTION_POINTS,
+        Command::Policies { command: PolicyCommand::List } => &tables::POLICIES,
+        Command::Policies {
+            command: PolicyCommand::Versions { .. },
+        } => &tables::POLICY_VERSIONS,
+        Command::Issuers { command: CrudCommand::List } => &tables::ISSUERS,
+        Command::Authorities { command: CrudCommand::List } => &tables::AUTHORITIES,
+        Command::TrustRegistries { command: CrudCommand::List } => &tables::TRUST_REGISTRIES,
+        Command::Mediators { command: CrudCommand::List } => &tables::MEDIATORS,
+        Command::McpProxies { command: CrudCommand::List } => &tables::MCP_PROXIES,
+        Command::A2aProxies { command: CrudCommand::List } => &tables::A2A_PROXIES,
+        Command::StsClients { command: CrudCommand::List } => &tables::STS_CLIENTS,
+        Command::CredentialProviders { command: CrudCommand::List } => &tables::CREDENTIAL_PROVIDERS,
+        Command::Certificates { command: CrudCommand::List, .. } => &tables::CERTIFICATES,
+        Command::Secrets {
+            command: SecretCommand::List { .. },
+            ..
+        } => &tables::SECRETS,
+        Command::Integrations { command: CrudCommand::List } => &tables::INTEGRATIONS,
+        Command::Users { command: UserCommand::List } => &tables::USERS,
+        Command::Identities { command: IdentityCommand::List } => &tables::IDENTITIES,
+        Command::DelegationVault {
+            command: DelegationVaultCommand::List,
+        } => &tables::GRANTS,
+        Command::JwtVerificationStrategies {
+            command: JwtStrategyCommand::Crud(CrudCommand::List),
+        } => &tables::JWT_STRATEGIES,
+        _ => return None,
+    })
+}
+
+/// The line a delete prints in table mode, such as `Deleted issuer 'i-1'`.
+/// Most deletes answer with an empty body, which the shared printer would show
+/// as the word `null`, and a surface answers with a document nobody asked to
+/// read. `--output json` still prints whatever the gateway returned. Deletes
+/// that print their own line (certificates, secrets, grant revoke, token
+/// revoke, API keys, payments) are absent.
 fn delete_confirmation(command: &Command) -> Option<String> {
-    match command {
+    let (kind, id) = match command {
         Command::Users {
             command: UserCommand::Delete { user_id },
-        } => Some(format!("Deleted user '{user_id}'")),
+        } => ("user", user_id),
+        Command::Identities {
+            command: IdentityCommand::Deactivate { id },
+        } => return Some(removal_line("Deactivated", "identity", id)),
+        Command::Surfaces {
+            command: SurfaceCommand::Delete { surface_id },
+        } => ("surface", surface_id),
+        Command::Policies {
+            command: PolicyCommand::Delete { policy_id },
+        } => ("policy", policy_id),
+        Command::Connections {
+            command: CrudCommand::Delete { id },
+        } => ("connection", id),
+        Command::ConnectionPoints {
+            command: CrudCommand::Delete { id },
+        } => ("connection point", id),
+        Command::Issuers {
+            command: CrudCommand::Delete { id },
+        } => ("issuer", id),
+        Command::Authorities {
+            command: CrudCommand::Delete { id },
+        } => ("authority", id),
+        Command::TrustRegistries {
+            command: CrudCommand::Delete { id },
+        } => ("trust registry", id),
+        Command::Mediators {
+            command: CrudCommand::Delete { id },
+        } => ("mediator", id),
+        Command::McpProxies {
+            command: CrudCommand::Delete { id },
+        } => ("MCP proxy", id),
+        Command::A2aProxies {
+            command: CrudCommand::Delete { id },
+        } => ("A2A proxy", id),
+        Command::StsClients {
+            command: CrudCommand::Delete { id },
+        } => ("STS client", id),
+        Command::CredentialProviders {
+            command: CrudCommand::Delete { id },
+        } => ("credential provider", id),
+        Command::Integrations {
+            command: CrudCommand::Delete { id },
+        } => ("integration", id),
         Command::JwtVerificationStrategies {
             command: JwtStrategyCommand::Crud(CrudCommand::Delete { id }),
-        } => Some(format!("Deleted JWT verification strategy '{id}'")),
-        _ => None,
-    }
+        } => ("JWT verification strategy", id),
+        _ => return None,
+    };
+    Some(removal_line("Deleted", kind, id))
+}
+
+/// The one line every delete or revoke prints in table mode, such as
+/// `Deleted issuer 'i-1'`. The id is what the user typed, so it is cleaned
+/// with [`tables::flatten`] and never cut.
+fn removal_line(
+    verb: &str,
+    kind: &str,
+    id: &str,
+) -> String {
+    format!("{verb} {kind} '{}'", tables::flatten(id))
 }
 
 fn is_create_command(command: &Command) -> bool {
@@ -13210,7 +13388,7 @@ mod tests {
         });
         let row = access_token_row(&token);
         assert_eq!(row[4], "2027-01-01T00:00:00Z");
-        assert_eq!(row[5], "-");
+        assert_eq!(row[5], "never");
     }
 
     #[test]

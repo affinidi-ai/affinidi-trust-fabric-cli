@@ -456,14 +456,24 @@ fn redact_json(
 /// normally trusted, but this is the last line of defense if a misconfigured
 /// or compromised backend ever puts something unexpected in a response.
 pub(crate) fn sanitize_for_terminal(input: &str) -> String {
+    printable(input)
+        .take(500)
+        .collect()
+}
+
+/// Like [`sanitize_for_terminal`] without the length cap, for an identifier
+/// the user typed that has to be shown whole.
+pub(crate) fn sanitize_whole(input: &str) -> String {
+    printable(input).collect()
+}
+
+fn printable(input: &str) -> impl Iterator<Item = char> + '_ {
     input
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .filter(
             |c| !matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'),
         )
-        .take(500)
-        .collect()
 }
 
 pub fn id_from_response(value: &Value) -> Option<&str> {
