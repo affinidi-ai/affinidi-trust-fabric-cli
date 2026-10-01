@@ -2,7 +2,8 @@
 all-features = true
 # Only the platforms the CLI ships for. `webpki-root-certs` (CDLA-Permissive-2.0,
 # not on the approved list) is only pulled in for wasm32 builds, which the CLI
-# never targets.
+# never targets. There is no release pipeline yet, so whoever adds one or a new
+# build target (for example Windows ARM or musl Linux) must update this list.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -23,8 +24,10 @@ wildcards = "deny"
 version = 2
 confidence-threshold = 0.93
 # Exactly the approved list in "Affinidi Software License Policies (Closed,
-# Open-Source Licenses)". Anything else needs Legal first, so it is added here
-# only after they clear it, not as a per-crate exception.
+# Open-Source Licenses)", last synced 2026-10-01:
+# https://lemmatree.atlassian.net/wiki/spaces/ISMS/pages/2735348416591
+# Anything else needs Legal first, so it is added here only after they clear it,
+# not as a per-crate exception. Unicode-3.0 was cleared by Legal on 2026-10-01.
 unused-allowed-license = "allow"
 allow = [
     # Permissive
@@ -58,7 +61,8 @@ allow = [
     "Unlicense",
     "WTFPL",
     "Zlib",
-    # Weak copyleft, approved as long as we don't modify the dependency
+    # Weak copyleft, approved as long as we don't modify the dependency. Check
+    # new MPL-2.0 crates and any `[patch]` entry in review, as cargo-deny can't.
     "MPL-2.0",
 ]
 
