@@ -679,7 +679,8 @@ enum SurfaceCommand {
     /// given, show which of them it has and where each one is set.
     ///
     /// The names shown are the ones `add-feature` and `remove-feature` take.
-    /// On or off reflects the surface itself, not what its variants override.
+    /// On or off reflects the surface itself, and a note says when an enabled
+    /// variant sets a feature or, being complete, replaces whole blocks.
     Features {
         /// Surface ID or name (see `fabric agent-gateway surfaces list`).
         surface_id: Option<String>,
@@ -3807,6 +3808,176 @@ mod gateway_config_tests {
         write_features(Output::Json, &mut json).expect("json prints");
         let rows: Value = serde_json::from_slice(&json).expect("json output");
         assert_eq!(rows.as_array().map(Vec::len), Some(features::FEATURES.len()));
+    }
+
+    /// Prints the features of `surface` through a gateway that serves it.
+    async fn printed_features_of(
+        surface: &Value,
+        output: Output,
+    ) -> String {
+        let body: &'static str = Box::leak(
+            surface
+                .to_string()
+                .into_boxed_str(),
+        );
+        let (host, _) = scripted_server(vec![("HTTP/1.1 200 OK", body)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let mut printed = Vec::new();
+        show_surface_features(&client, "s-1", output, &mut printed)
+            .await
+            .expect("the features should print");
+        String::from_utf8(printed).expect("utf-8 output")
+    }
+
+    fn surface_with_default_variant(overrides: Value) -> Value {
+        json!({
+            "surface_id": "s-1",
+            "target": {"policy": {"policy_definition_id": "p"}, "networking": {"timeout_secs": 5}},
+            "default_variant_id": "v1",
+            "variants": [{"id": "v1", "alias": "blue", "overrides": overrides}],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_default_variant_that_overrides_a_feature_is_noted_in_the_table_and_the_json() {
+        let surface = surface_with_default_variant(json!({"target": {"policy": {"policy_definition_id": "q"}}}));
+        let note = "The default variant 'blue' sets policy; this table reads only the surface itself.";
+
+        let table = printed_features_of(&surface, Output::Table).await;
+        assert!(table.ends_with(&format!("\nNotes\n  - {note}\n")), "{table}");
+
+        let json: Value = serde_json::from_str(&printed_features_of(&surface, Output::Json).await).expect("json");
+        let rows = json
+            .as_array()
+            .expect("still a list of features");
+        assert_eq!(rows.len(), features::FEATURES.len());
+        for row in rows {
+            if row["feature"] == "policy" {
+                assert_eq!(row["variant_notes"], json!([note]));
+            } else {
+                assert!(
+                    row.get("variant_notes")
+                        .is_none(),
+                    "{row}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_null_override_in_a_sparse_variant_gives_no_note() {
+        let surface = surface_with_default_variant(json!({"target": {"policy": null}}));
+
+        assert!(
+            !printed_features_of(&surface, Output::Table)
+                .await
+                .contains("Notes")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_variant_that_sets_two_features_names_both() {
+        let surface = surface_with_default_variant(
+            json!({"target": {"policy": {"policy_definition_id": "q"}, "networking": {"timeout_secs": 1}}}),
+        );
+
+        let table = printed_features_of(&surface, Output::Table).await;
+
+        assert!(
+            table.contains(
+                "The default variant 'blue' sets policy, networking; this table reads only the surface itself."
+            ),
+            "{table}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_variant_that_is_not_the_default_is_noted_as_a_variant() {
+        let mut surface = surface_with_default_variant(json!({}));
+        surface["variants"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": "v2", "alias": "green", "overrides": {"target": {"networking": {"timeout_secs": 1}}}}));
+
+        let table = printed_features_of(&surface, Output::Table).await;
+
+        assert!(
+            table.ends_with(
+                "\nNotes\n  - The variant 'green' sets networking; this table reads only the surface itself.\n"
+            ),
+            "{table}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_variant_with_only_an_endpoint_or_a_transit_point_change_gives_no_note() {
+        for overrides in [
+            json!({}),
+            json!({"target": {"endpoint": "http://x"}}),
+            json!({"transit": {"points": [{"alias": "gh", "policy": {"policy_definition_id": "q"}}]}}),
+        ] {
+            let surface = surface_with_default_variant(overrides);
+            assert!(
+                !printed_features_of(&surface, Output::Table)
+                    .await
+                    .contains("Notes")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_complete_variant_says_which_blocks_it_replaces_and_marks_the_features_in_them() {
+        let mut surface = surface_with_default_variant(json!({
+            "complete": true,
+            "target": {"endpoint": "http://x"},
+            "transit": {"points": []},
+            "outbound_credentials": [],
+        }));
+        surface["access_point"] = json!({"rate_limit": {"requests": 1}});
+        let note = "The default variant 'blue' is complete, so it replaces the target, the transit points and the outbound credentials, and features it leaves out of them are off for the gateway even if this table shows them on.";
+
+        let table = printed_features_of(&surface, Output::Table).await;
+        assert!(table.ends_with(&format!("\nNotes\n  - {note}\n")), "{table}");
+
+        let json: Value = serde_json::from_str(&printed_features_of(&surface, Output::Json).await).expect("json");
+        for row in json
+            .as_array()
+            .expect("still a list of features")
+        {
+            let noted = row.get("variant_notes") == Some(&json!([note]));
+            let expected = row["feature"] == "policy" || row["feature"] == "networking";
+            assert_eq!(noted, expected, "{row}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_complete_variant_with_a_null_feature_does_not_say_it_clears_it() {
+        let surface = surface_with_default_variant(json!({"complete": true, "target": {"policy": null}}));
+
+        let table = printed_features_of(&surface, Output::Table).await;
+
+        assert!(table.contains("is complete, so it replaces the target,"), "{table}");
+        assert!(!table.contains("clears") && !table.contains("sets policy"), "{table}");
+    }
+
+    #[tokio::test]
+    async fn a_surface_with_no_variants_or_only_disabled_ones_has_no_notes() {
+        let plain = json!({"surface_id": "s-1", "target": {"policy": {"policy_definition_id": "p"}}});
+        let mut disabled = surface_with_default_variant(json!({"target": {"policy": {"policy_definition_id": "q"}}}));
+        disabled["variants"][0]["enabled"] = json!(false);
+
+        for surface in [plain, disabled] {
+            assert!(
+                !printed_features_of(&surface, Output::Table)
+                    .await
+                    .contains("Notes")
+            );
+            assert!(
+                !printed_features_of(&surface, Output::Json)
+                    .await
+                    .contains("variant_notes")
+            );
+        }
     }
 
     #[tokio::test]
@@ -7253,30 +7424,41 @@ fn render_surface_tool_gate_preview(
     render_tool_gate_preview(&gating, tools, conditions, variant_gating_notes(surface), output)
 }
 
-/// Notes on the variants of `surface` that change its tool gating. The gateway
-/// builds the surface's gating from its default variant, so a default variant
-/// that sets gating replaces the saved gating, and a complete one with none
-/// clears it.
-fn variant_gating_notes(surface: &Value) -> Vec<String> {
+/// What an enabled variant of a surface overrides at some JSON pointers.
+struct VariantOverrides {
+    /// The variant's alias, name or id, whichever is first set.
+    label: String,
+    /// Whether it is the surface's default variant.
+    is_default: bool,
+    /// The pointers (among those asked for) the variant gives a value. A
+    /// `null` is not one: in a sparse variant it means inherit the surface's
+    /// value.
+    sets: Vec<&'static str>,
+    /// Whether the variant is complete and has its own `target`.
+    complete_with_target: bool,
+    /// Whether the variant is complete.
+    complete: bool,
+    /// The blocks the variant has, which a complete variant replaces whole:
+    /// among `target`, `access_point`, `transit`, `identity_slots` and
+    /// `outbound_credentials`.
+    blocks: Vec<&'static str>,
+}
+
+/// The enabled variants of `surface` with what each overrides at `pointers`.
+fn enabled_variant_overrides(
+    surface: &Value,
+    pointers: &[&'static str],
+) -> Vec<VariantOverrides> {
     let default_id = surface
         .get("default_variant_id")
         .and_then(Value::as_str);
-    let mut others: Vec<String> = Vec::new();
-    let mut notes = Vec::new();
+    let mut found = Vec::new();
     for variant in surface
         .get("variants")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
-        let overrides = variant.get("overrides");
-        let sets_gating = overrides
-            .and_then(|overrides| overrides.get("target"))
-            .and_then(|target| target.get("mcp_tool_gating"))
-            .is_some_and(|gating| !gating.is_null());
-        let has_target = overrides
-            .and_then(|overrides| overrides.get("target"))
-            .is_some_and(|target| !target.is_null());
         let enabled = variant
             .get("enabled")
             .and_then(Value::as_bool)
@@ -7284,10 +7466,31 @@ fn variant_gating_notes(surface: &Value) -> Vec<String> {
         if !enabled {
             continue;
         }
+        let overrides = variant.get("overrides");
+        let mut sets = Vec::new();
+        for pointer in pointers {
+            if overrides
+                .and_then(|overrides| overrides.pointer(pointer))
+                .is_some_and(|value| !value.is_null())
+            {
+                sets.push(*pointer);
+            }
+        }
+        let blocks = ["target", "access_point", "transit", "identity_slots", "outbound_credentials"]
+            .into_iter()
+            .filter(|block| {
+                overrides
+                    .and_then(|overrides| overrides.get(*block))
+                    .is_some_and(|value| !value.is_null())
+            })
+            .collect();
         let complete = overrides
             .and_then(|overrides| overrides.get("complete"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let has_target = overrides
+            .and_then(|overrides| overrides.get("target"))
+            .is_some_and(|target| !target.is_null());
         let id = variant
             .get("id")
             .and_then(Value::as_str);
@@ -7300,8 +7503,28 @@ fn variant_gating_notes(surface: &Value) -> Vec<String> {
                     .filter(|text| !text.is_empty())
             })
             .unwrap_or("unnamed");
-        let is_default = id.is_some() && id == default_id;
-        match (is_default, sets_gating, complete && has_target) {
+        found.push(VariantOverrides {
+            label: label.to_owned(),
+            is_default: id.is_some() && id == default_id,
+            sets,
+            complete_with_target: complete && has_target,
+            complete,
+            blocks,
+        });
+    }
+    found
+}
+
+/// Notes on the variants of `surface` that change its tool gating. The gateway
+/// builds the surface's gating from its default variant, so a default variant
+/// that sets gating replaces the saved gating, and a complete one with none
+/// clears it.
+fn variant_gating_notes(surface: &Value) -> Vec<String> {
+    let mut others: Vec<String> = Vec::new();
+    let mut notes = Vec::new();
+    for variant in enabled_variant_overrides(surface, &["/target/mcp_tool_gating"]) {
+        let label = &variant.label;
+        match (variant.is_default, !variant.sets.is_empty(), variant.complete_with_target) {
             (true, true, _) => notes.push(format!(
                 "The default variant '{label}' sets its own tool gating, and the gateway builds the surface's gating \
                  from the default variant, so this preview does not match what the gateway serves."
@@ -9929,11 +10152,142 @@ async fn show_surface_features(
     let surface = client
         .request(Method::GET, &entity_path("/v1/surfaces", surface_id), None)
         .await?;
+    let notes = variant_feature_notes(&surface);
     match output {
-        Output::Json => writeln!(out, "{}", serde_json::to_string_pretty(&features::describe_on_surface(&surface))?),
-        Output::Table => write!(out, "{}", surface_features_table(&surface)),
+        Output::Json => {
+            let mut rows = features::describe_on_surface(&surface);
+            for row in rows
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                let about: Vec<&String> = notes
+                    .iter()
+                    .filter(|(_, keys)| {
+                        row["feature"]
+                            .as_str()
+                            .is_some_and(|key| keys.contains(&key))
+                    })
+                    .map(|(text, _)| text)
+                    .collect();
+                if !about.is_empty() {
+                    row["variant_notes"] = json!(about);
+                }
+            }
+            writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)
+        }
+        Output::Table => {
+            write!(out, "{}", surface_features_table(&surface))?;
+            if notes.is_empty() {
+                return Ok(());
+            }
+            let lines: Vec<String> = notes
+                .iter()
+                .map(|(text, _)| format!("  - {text}"))
+                .collect();
+            write!(out, "\nNotes\n{}\n", lines.join("\n"))
+        }
     }
     .context("print the surface's features")
+}
+
+/// Notes on the enabled variants of `surface` that change what the gateway
+/// serves, each with the features it is about. A sparse variant that gives a
+/// feature a value gets a note naming it. A complete variant replaces whole
+/// the blocks it has, so it gets one note naming the blocks and is about every
+/// feature that is on in them. Changes to one transit point's features are not
+/// itemized. The table and JSON read only the surface itself.
+fn variant_feature_notes(surface: &Value) -> Vec<(String, Vec<&'static str>)> {
+    let mut pointers: Vec<&'static str> = Vec::new();
+    for placement in features::FEATURES
+        .iter()
+        .flat_map(|feature| feature.placements)
+    {
+        if !placement
+            .pointer
+            .contains("{tp}")
+            && !pointers.contains(&placement.pointer)
+        {
+            pointers.push(placement.pointer);
+        }
+    }
+    let on_surface = features::on_surface(surface);
+    let mut notes = Vec::new();
+    for variant in enabled_variant_overrides(surface, &pointers) {
+        let who = if variant.is_default {
+            format!("The default variant '{}'", variant.label)
+        } else {
+            format!("The variant '{}'", variant.label)
+        };
+        if variant.complete {
+            let replaced: Vec<(&str, &str)> = variant
+                .blocks
+                .iter()
+                .filter_map(|block| match *block {
+                    "target" => Some(("the target", "/target/")),
+                    "access_point" => Some(("the access point", "/access_point/")),
+                    "transit" => Some(("the transit points", "/transit/points/")),
+                    "identity_slots" => Some(("the identity slots", "/identity_slots/")),
+                    "outbound_credentials" => Some(("the outbound credentials", "/outbound_credentials")),
+                    _ => None,
+                })
+                .collect();
+            if replaced.is_empty() {
+                continue;
+            }
+            let keys = on_surface
+                .iter()
+                .filter(|state| {
+                    state
+                        .places
+                        .iter()
+                        .any(|place| {
+                            replaced
+                                .iter()
+                                .any(|(_, prefix)| {
+                                    place
+                                        .pointer
+                                        .starts_with(prefix)
+                                })
+                        })
+                })
+                .map(|state| state.feature.key)
+                .collect();
+            let names: Vec<&str> = replaced
+                .iter()
+                .map(|(name, _)| *name)
+                .collect();
+            let list = match names.split_last() {
+                Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+                _ => names.join(", "),
+            };
+            notes.push((
+                format!(
+                    "{who} is complete, so it replaces {list}, and features it leaves out of them are off for the gateway even if this table shows them on."
+                ),
+                keys,
+            ));
+            continue;
+        }
+        let sets: Vec<&'static str> = features::FEATURES
+            .iter()
+            .filter(|feature| {
+                feature
+                    .placements
+                    .iter()
+                    .any(|placement| {
+                        variant
+                            .sets
+                            .contains(&placement.pointer)
+                    })
+            })
+            .map(|feature| feature.key)
+            .collect();
+        if !sets.is_empty() {
+            notes.push((format!("{who} sets {}; this table reads only the surface itself.", sets.join(", ")), sets));
+        }
+    }
+    notes
 }
 
 /// A table of every feature with whether the surface has it, where it is set
