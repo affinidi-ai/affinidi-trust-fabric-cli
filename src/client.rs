@@ -477,7 +477,8 @@ fn printable(input: &str) -> impl Iterator<Item = char> + '_ {
 }
 
 pub fn id_from_response(value: &Value) -> Option<&str> {
-    const ID_KEYS: &[&str] = &["surface_id", "connection_point_id", "gateway_id", "policy_id", "id"];
+    // `id` comes before `gateway_id`: a connection point carries both, and its own id is the first.
+    const ID_KEYS: &[&str] = &["surface_id", "connection_point_id", "policy_id", "id", "gateway_id"];
     let object = value.as_object()?;
     for key in ID_KEYS {
         if let Some(id) = object
@@ -506,6 +507,22 @@ mod tests {
     fn extracts_nested_entity_id() {
         let value = serde_json::json!({"connection_point": {"id": "cp-1"}});
         assert_eq!(id_from_response(&value), Some("cp-1"));
+    }
+
+    #[test]
+    fn a_connection_point_answer_gives_its_own_id_not_its_gateways() {
+        let value = serde_json::json!({"connection_point": {"id": "cp-1", "gateway_id": "gw-9", "name": "Door"}});
+        assert_eq!(id_from_response(&value), Some("cp-1"));
+    }
+
+    #[test]
+    fn the_other_create_answers_keep_giving_their_ids() {
+        let surface = serde_json::json!({"surface_id": "s-1", "name": "Sales"});
+        let gateway = serde_json::json!({"id": "g-1", "name": "Partner", "did": "did:x"});
+        let policy = serde_json::json!({"id": "p-1", "name": "Header"});
+        assert_eq!(id_from_response(&surface), Some("s-1"));
+        assert_eq!(id_from_response(&gateway), Some("g-1"));
+        assert_eq!(id_from_response(&policy), Some("p-1"));
     }
 
     /// Starts a one-shot HTTP server that replies with the given status line

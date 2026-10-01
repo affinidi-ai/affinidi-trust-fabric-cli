@@ -249,7 +249,7 @@ fn deleting_a_surface_by_name_keeps_the_note_on_standard_error() {
     assert_eq!(out.stdout, "Deleted surface 's-1'\n");
     assert!(
         out.stderr
-            .contains("using surface s-1 (Sales)"),
+            .contains("note: using surface s-1 (Sales)"),
         "{}",
         out.stderr
     );
@@ -417,7 +417,7 @@ fn payments_list_prints_a_header_and_aligned_rows() {
 
     assert_eq!(
         out.stdout,
-        "ID    STORE  SURFACE  STATUS    AMOUNT  CURRENCY  CREATED\ntx-1  x402   sales    verified  5       USDC      1790000000\n"
+        "ID    STORE  SURFACE  STATUS    AMOUNT  CURRENCY  CREATED\ntx-1  x402   sales    verified  5       USDC      2026-09-21T14:13:20Z\n"
     );
 }
 
@@ -438,6 +438,13 @@ fn an_empty_audit_list_says_so_and_keeps_the_notes_on_standard_error() {
     let out = fabric(vec![reply("GET", "/v1/audit", "200 OK", r#"{"events":[],"total":0}"#)], &["audit", "list"]);
 
     assert_eq!(out.stdout, "No audit events yet.\n");
+    assert!(
+        out.stderr
+            .lines()
+            .all(|line| line.starts_with("note: ")),
+        "got: {}",
+        out.stderr
+    );
     assert!(
         out.stderr
             .contains("admin API calls such as creating an identity are not audited"),
@@ -571,6 +578,7 @@ fn json_output_for_tokens_payments_api_keys_and_config_lists_is_the_gateways_doc
     assert_eq!(parse(&tokens_out.stdout), parse(tokens));
     assert_eq!(parse(&payments_out.stdout)[0]["id"], "tx-1");
     assert_eq!(parse(&payments_out.stdout)[0]["currency"], "USDC");
+    assert_eq!(parse(&payments_out.stdout)[0]["created_at"], 1);
     assert_eq!(parse(&keys_out.stdout), parse(keys));
     let config = parse(&config_out.stdout);
     assert_eq!(config[0]["name"], "test");
@@ -606,5 +614,322 @@ fn an_identity_history_is_still_printed_as_the_gateways_document() {
             .contains("\"total_versions\": 1"),
         "{}",
         out.stdout
+    );
+}
+
+/// Writes a JSON request document into a new temporary directory. Keep the
+/// directory alive for as long as the command runs.
+fn request_file(contents: &str) -> (TempDir, String) {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir
+        .path()
+        .join("request.json");
+    fs::write(&path, contents).expect("request file");
+    (
+        dir,
+        path.to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[test]
+fn creating_a_shared_resource_prints_one_line_and_json_keeps_the_answer() {
+    let (_dir, file) = request_file(r#"{"name":"Acme"}"#);
+    let answer = r#"{"id":"i-1","name":"Acme","did":"did:web:x","created_at":"x","updated_at":"y"}"#;
+    let routes = || vec![reply("POST", "/v1/issuers", "200 OK", answer)];
+
+    let table = fabric(routes(), &["issuers", "create", "--file", &file]);
+    let json = fabric(routes(), &["-o", "json", "issuers", "create", "--file", &file]);
+
+    assert_eq!(table.stdout, "Created issuer 'i-1'\n");
+    let printed: serde_json::Value = serde_json::from_str(&json.stdout).expect("json");
+    assert_eq!(printed["did"], "did:web:x");
+}
+
+#[test]
+fn creating_an_access_token_prints_the_confirmation_then_the_token_and_a_note() {
+    let answer = r#"{"id":"t-1","name":"ci","token":"agpat_secret"}"#;
+    let routes = || vec![reply("POST", "/v1/access-tokens", "200 OK", answer)];
+
+    let table = fabric(routes(), &["tokens", "create", "--name", "ci"]);
+    let json = fabric(routes(), &["-o", "json", "tokens", "create", "--name", "ci"]);
+
+    assert_eq!(table.stdout, "Created access token 't-1'\nagpat_secret\n");
+    assert!(
+        table
+            .stderr
+            .contains("note: this is the only time the access token secret is shown, so store it securely now."),
+        "{}",
+        table.stderr
+    );
+    let printed: serde_json::Value = serde_json::from_str(&json.stdout).expect("json");
+    assert_eq!(printed["token"], "agpat_secret");
+}
+
+#[test]
+fn rotating_an_access_token_names_it_and_prints_the_new_token() {
+    let answer = r#"{"token":"agpat_new"}"#;
+    let table = fabric(
+        vec![reply("POST", "/v1/access-tokens/t-1/rotate", "200 OK", answer)],
+        &["tokens", "rotate", "t-1", "--yes"],
+    );
+
+    assert_eq!(table.stdout, "Rotated access token 't-1'\nagpat_new\n");
+}
+
+#[test]
+fn creating_and_rotating_an_api_key_print_the_confirmation_then_the_secret() {
+    let created = r#"{"key_id":"k-1","secret":"sk_live","status":"active"}"#;
+    let create_routes = || vec![reply("POST", "/v1/api-keys/s-1", "200 OK", created)];
+    let rotate_routes = || vec![reply("POST", "/v1/api-keys/s-1/k-1/rotate", "200 OK", created)];
+
+    let create = fabric(create_routes(), &["api-keys", "create", "s-1", "--client-id", "billing"]);
+    let rotate = fabric(rotate_routes(), &["api-keys", "rotate", "k-1", "--agent-id", "s-1"]);
+    let json = fabric(create_routes(), &["-o", "json", "api-keys", "create", "s-1", "--client-id", "billing"]);
+
+    assert_eq!(create.stdout, "Created API key 'k-1'\nsk_live\n");
+    assert_eq!(rotate.stdout, "Rotated API key 'k-1'\nsk_live\n");
+    assert!(
+        create
+            .stderr
+            .contains("note: this is the only time the API key secret is shown, so store it securely now."),
+        "{}",
+        create.stderr
+    );
+    let printed: serde_json::Value = serde_json::from_str(&json.stdout).expect("json");
+    assert_eq!(printed["secret"], "sk_live");
+}
+
+#[test]
+fn updating_a_shared_resource_prints_one_line_and_json_keeps_the_answer() {
+    let (_dir, file) = request_file(r#"{"name":"Acme"}"#);
+    let answer = r#"{"id":"i-1","name":"Acme"}"#;
+    let routes = || vec![reply("PUT", "/v1/issuers/i-1", "200 OK", answer)];
+
+    let table = fabric(routes(), &["issuers", "update", "i-1", "--file", &file]);
+    let json = fabric(routes(), &["-o", "json", "issuers", "update", "i-1", "--file", &file]);
+
+    assert_eq!(table.stdout, "Updated issuer 'i-1'\n");
+    let printed: serde_json::Value = serde_json::from_str(&json.stdout).expect("json");
+    assert_eq!(printed["name"], "Acme");
+}
+
+#[test]
+fn updating_a_user_a_policy_and_a_secret_print_one_line_each() {
+    let (_dir, file) = request_file(r#"{"name":"x"}"#);
+    let user = fabric(
+        vec![reply("PUT", "/v1/users/u-1", "200 OK", r#"{"user_id":"u-1"}"#)],
+        &["users", "update", "u-1", "--file", &file],
+    );
+    let policy = fabric(
+        vec![reply("PUT", "/v1/policy-definitions/p-1", "200 OK", r#"{"id":"p-1"}"#)],
+        &["policies", "update", "p-1", "--file", &file],
+    );
+    let secret = fabric(
+        vec![
+            reply("GET", "/v1/secrets", "200 OK", KNOWN_ID_LIST),
+            reply("PUT", "/v1/secrets/11111111-2222-4333-8444-555555555555", "200 OK", r#"{"id":"x","value":"v"}"#),
+        ],
+        &["secrets", "update", SECRET_ID, "--file", &file],
+    );
+
+    assert_eq!(user.stdout, "Updated user 'u-1'\n");
+    assert_eq!(policy.stdout, "Updated policy 'p-1'\n");
+    assert_eq!(secret.stdout, format!("Updated secret '{SECRET_ID}'\n"));
+}
+
+#[test]
+fn updating_a_surface_from_a_file_prints_one_line_and_json_keeps_the_surface() {
+    let surface = r#"{"name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
+    let (_dir, file) = request_file(surface);
+    let routes = || {
+        vec![
+            reply("GET", "/v1/surfaces", "200 OK", SURFACES),
+            reply("PUT", "/v1/surfaces/s-1", "200 OK", r#"{"surface_id":"s-1","name":"Sales"}"#),
+        ]
+    };
+
+    let table = fabric(routes(), &["surfaces", "update", "s-1", "--file", &file]);
+    let json = fabric(routes(), &["-o", "json", "surfaces", "update", "s-1", "--file", &file]);
+
+    assert_eq!(table.stdout, "Updated surface 's-1'\n");
+    let printed: serde_json::Value = serde_json::from_str(&json.stdout).expect("json");
+    assert_eq!(printed["surface_id"], "s-1");
+}
+
+#[test]
+fn notes_and_warnings_on_standard_error_carry_a_prefix() {
+    let body = r#"{"verifications":[{"id":"tx-1","created_at":1}]}"#;
+    let payments = fabric(
+        vec![reply("GET", "/admin/x402/transactions", "200 OK", body)],
+        &["payments", "list", "--store", "x402"],
+    );
+    let identity = fabric(
+        vec![reply("GET", "/v1/identities/i-1", "200 OK", r#"{"id":"i-1","key_pair":{"private_key":{"d":"k"}}}"#)],
+        &["identities", "get", "i-1"],
+    );
+
+    assert!(
+        payments
+            .stderr
+            .contains("note: x402: 1 record(s)"),
+        "{}",
+        payments.stderr
+    );
+    assert!(
+        identity
+            .stderr
+            .contains("note: hid 'key_pair'"),
+        "{}",
+        identity.stderr
+    );
+}
+
+#[test]
+fn updating_a_certificate_by_name_prints_the_resolved_id() {
+    let (_dir, file) = request_file(r#"{"name":"Edge"}"#);
+    let list = r#"[{"id":"11111111-2222-4333-8444-555555555555","name":"Edge","certificate_id":"c"}]"#;
+    let routes = || {
+        vec![
+            reply("GET", "/v1/certificates", "200 OK", list),
+            reply("PUT", "/v1/certificates/11111111-2222-4333-8444-555555555555", "200 OK", r#"{"id":"x"}"#),
+        ]
+    };
+
+    let table = fabric(routes(), &["certificates", "update", "Edge", "--file", &file]);
+    let json = fabric(routes(), &["-o", "json", "certificates", "update", "Edge", "--file", &file]);
+
+    assert_eq!(table.stdout, format!("Updated certificate '{SECRET_ID}'\n"));
+    assert!(
+        json.stdout
+            .contains("\"id\": \"x\""),
+        "{}",
+        json.stdout
+    );
+}
+
+#[test]
+fn updating_a_secret_by_name_prints_the_resolved_id() {
+    let (_dir, file) = request_file(r#"{"name":"Stripe"}"#);
+    let list = r#"[{"id":"11111111-2222-4333-8444-555555555555","name":"Stripe","secret_id":"stripe"}]"#;
+    let out = fabric(
+        vec![
+            reply("GET", "/v1/secrets", "200 OK", list),
+            reply("PUT", "/v1/secrets/11111111-2222-4333-8444-555555555555", "200 OK", r#"{"id":"x"}"#),
+        ],
+        &["secrets", "update", "Stripe", "--file", &file],
+    );
+
+    assert_eq!(out.stdout, format!("Updated secret '{SECRET_ID}'\n"));
+}
+
+#[test]
+fn a_surface_dry_run_prints_no_updated_line() {
+    let surface = SURFACES;
+    let patched = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
+    let out = fabric(
+        vec![
+            reply("GET", "/v1/surfaces", "200 OK", surface),
+            reply("GET", "/v1/surfaces/s-1", "200 OK", patched),
+            reply("PATCH", "/v1/surfaces/s-1", "200 OK", patched),
+        ],
+        &["surfaces", "update", "s-1", "--set", "name=Renamed", "--dry-run"],
+    );
+
+    assert!(
+        !out.stdout
+            .contains("Updated surface"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("Dry run"), "{} / {}", out.stdout, out.stderr);
+}
+
+#[test]
+fn a_gateway_error_on_create_or_update_prints_no_confirmation_line() {
+    let (_dir, file) = request_file(r#"{"name":"Acme"}"#);
+    let failing =
+        |method: &'static str, path: &'static str| vec![reply(method, path, "400 Bad Request", r#"{"error":"nope"}"#)];
+
+    let create = fabric(failing("POST", "/v1/issuers"), &["issuers", "create", "--file", &file]);
+    let update = fabric(failing("PUT", "/v1/issuers/i-1"), &["issuers", "update", "i-1", "--file", &file]);
+
+    for out in [create, update] {
+        assert_eq!(out.stdout, "");
+        assert!(out.stderr.contains("error:"), "{}", out.stderr);
+    }
+}
+
+#[test]
+fn a_token_note_is_printed_in_json_mode_too_without_changing_standard_output() {
+    let answer = r#"{"id":"t-1","token":"agpat_secret"}"#;
+    let out = fabric(
+        vec![reply("POST", "/v1/access-tokens", "200 OK", answer)],
+        &["-o", "json", "tokens", "create", "--name", "ci"],
+    );
+
+    assert!(
+        out.stderr
+            .contains("note: this is the only time the access token secret is shown"),
+        "{}",
+        out.stderr
+    );
+    let printed: serde_json::Value = serde_json::from_str(&out.stdout).expect("json only on standard output");
+    assert_eq!(printed["token"], "agpat_secret");
+}
+
+#[test]
+fn creating_a_connection_point_prints_its_own_id_not_the_gateways() {
+    let (_dir, file) = request_file(r#"{"name":"Door"}"#);
+    let answer = r#"{"connection_point":{"id":"cp-1","gateway_id":"gw-9","name":"Door","use_count":0}}"#;
+    let table = fabric(
+        vec![reply("POST", "/v1/connection-points", "200 OK", answer)],
+        &["connection-points", "create", "--file", &file],
+    );
+
+    assert_eq!(table.stdout, "Created connection point 'cp-1'\n");
+}
+
+#[test]
+fn a_payment_record_shows_an_iso_time_in_table_mode_and_seconds_in_json() {
+    let record = r#"{"id":"tx-1","surface_id":"sales","status":"verified","created_at":1790000000}"#;
+    let routes = || vec![reply("GET", "/admin/x402/transactions/tx-1", "200 OK", record)];
+
+    let table = fabric(routes(), &["payments", "get", "tx-1", "--store", "x402"]);
+    let json = fabric(routes(), &["-o", "json", "payments", "get", "tx-1", "--store", "x402"]);
+
+    assert!(
+        table
+            .stdout
+            .contains("\"created_at\": \"2026-09-21T14:13:20Z\""),
+        "{}",
+        table.stdout
+    );
+    assert!(
+        json.stdout
+            .contains("\"created_at\": 1790000000"),
+        "{}",
+        json.stdout
+    );
+}
+
+#[test]
+fn updating_a_surface_by_name_prints_the_resolved_id() {
+    let surface = r#"{"name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
+    let (_dir, file) = request_file(surface);
+    let out = fabric(
+        vec![
+            reply("GET", "/v1/surfaces", "200 OK", SURFACES),
+            reply("PUT", "/v1/surfaces/s-1", "200 OK", r#"{"surface_id":"s-1"}"#),
+        ],
+        &["surfaces", "update", "Sales", "--file", &file],
+    );
+
+    assert_eq!(out.stdout, "Updated surface 's-1'\n");
+    assert!(
+        out.stderr
+            .contains("note: using surface s-1 (Sales)"),
+        "{}",
+        out.stderr
     );
 }
