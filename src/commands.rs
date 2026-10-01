@@ -679,6 +679,7 @@ enum SurfaceCommand {
     /// given, show which of them it has and where each one is set.
     ///
     /// The names shown are the ones `add-feature` and `remove-feature` take.
+    /// On or off reflects the surface itself, not what its variants override.
     Features {
         /// Surface ID or name (see `fabric agent-gateway surfaces list`).
         surface_id: Option<String>,
@@ -1095,10 +1096,7 @@ async fn dispatch_with(
         }
         Command::Surfaces {
             command: SurfaceCommand::Features { surface_id: None },
-        } => {
-            print_features(cli.output);
-            Ok(())
-        }
+        } => write_features(cli.output, &mut io::stdout()).context("print the features"),
         command => {
             let (connection_name, saved) = config.resolve(cli.connection.as_deref())?;
             let host = cli
@@ -3776,6 +3774,42 @@ mod gateway_config_tests {
     }
 
     #[tokio::test]
+    async fn features_through_dispatch_reads_the_surface_by_id_and_by_name() {
+        for reference in ["s-1", "Sales"] {
+            let requests = dispatched_requests(
+                &["fabric", "agent-gateway", "--token", "agpat_valid", "surfaces", "features", reference],
+                vec![LIST_OK, ("HTTP/1.1 200 OK", FEATURES_SURFACE)],
+            )
+            .await;
+
+            assert_eq!(requests, [LIST_REQUEST, "GET /api/v1/surfaces/s-1 HTTP/1.1"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn features_with_no_surface_through_dispatch_calls_no_gateway() {
+        let requests =
+            dispatched_requests(&["fabric", "agent-gateway", "--token", "agpat_valid", "surfaces", "features"], vec![])
+                .await;
+
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn the_catalogue_lists_every_feature_with_its_places() {
+        let mut table = Vec::new();
+        write_features(Output::Table, &mut table).expect("table prints");
+        let table = String::from_utf8(table).expect("utf-8 output");
+        assert!(table.starts_with("policy  (aliases: opa)\n    OPA policy reference"), "{table}");
+        assert!(table.contains("    ap-ma/request -> /access_point/rate_limit [object]\n"), "{table}");
+
+        let mut json = Vec::new();
+        write_features(Output::Json, &mut json).expect("json prints");
+        let rows: Value = serde_json::from_slice(&json).expect("json output");
+        assert_eq!(rows.as_array().map(Vec::len), Some(features::FEATURES.len()));
+    }
+
+    #[tokio::test]
     async fn features_prints_the_table_for_a_surface_id() {
         let (requests, printed) = shown_features("s-1", Output::Table).await;
 
@@ -3872,14 +3906,25 @@ mod gateway_config_tests {
                 "response_policy": {"policy_definition_id": "r"},
                 "networking": {"timeout_secs": 1},
                 "mcp_tool_gating": {"allow": ["b"]},
+            }, {
+                "alias": "my gh",
+                "policy": {"policy_definition_id": "p"},
+                "response_policy": {"policy_definition_id": "r"},
             }]},
         });
         let mut checked = 0;
         for state in features::on_surface(&surface) {
             for place in state.places {
-                let flags = place.remove_flags;
+                let features::RemoveBy::Flags(flags) = place.remove else {
+                    panic!("every place here can be picked");
+                };
+                let words = shell_words::split(&flags).expect("the flags should split like a shell would");
                 let mut args = vec!["fabric", "agent-gateway", "surfaces", "remove-feature", "s-1", state.feature.key];
-                args.extend(flags.split_whitespace());
+                args.extend(
+                    words
+                        .iter()
+                        .map(String::as_str),
+                );
                 let Command::Surfaces {
                     command: SurfaceCommand::RemoveFeature(parsed),
                 } = command_of(&args)
@@ -3904,7 +3949,27 @@ mod gateway_config_tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 16);
+        assert_eq!(checked, 18);
+    }
+
+    #[test]
+    fn the_features_table_says_when_remove_feature_cannot_pick_a_transit_point() {
+        let policy = json!({"policy_definition_id": "p"});
+        let surface = json!({"transit": {"points": [
+            {"alias": "gh", "policy": policy},
+            {"policy": policy},
+            {"alias": "gh", "policy": policy},
+        ]}});
+        let table = surface_features_table(&surface);
+
+        assert!(
+            table.contains(
+                "transit point gh: policy (remove with --transit-point gh); \
+                 transit point 1 (no alias): policy (remove-feature can't pick it, it has no alias); \
+                 transit point gh: policy (remove-feature can't pick it, an earlier transit point has the same alias)"
+            ),
+            "{table}"
+        );
     }
 
     #[test]
@@ -9817,13 +9882,16 @@ fn build_feature_value(
     bail!("provide the feature configuration with --json '<json>' or --file <path>")
 }
 
-fn print_features(output: Output) {
+fn write_features(
+    output: Output,
+    out: &mut impl io::Write,
+) -> io::Result<()> {
     match output {
         Output::Json => {
             let value = features::describe();
             match serde_json::to_string_pretty(&value) {
-                Ok(text) => println!("{text}"),
-                Err(_) => println!("{value}"),
+                Ok(text) => writeln!(out, "{text}")?,
+                Err(_) => writeln!(out, "{value}")?,
             }
         }
         Output::Table => {
@@ -9833,20 +9901,22 @@ fn print_features(output: Output) {
                 } else {
                     format!("  (aliases: {})", feature.aliases.join(", "))
                 };
-                println!("{}{}", feature.key, aliases);
-                println!("    {}", feature.description);
+                writeln!(out, "{}{}", feature.key, aliases)?;
+                writeln!(out, "    {}", feature.description)?;
                 for placement in feature.placements {
-                    println!(
+                    writeln!(
+                        out,
                         "    {}/{} -> {} [{}]",
                         placement.edge.label(),
                         placement.direction.label(),
                         placement.pointer,
                         placement.kind.label()
-                    );
+                    )?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Reads the surface and writes its features to `out`.
@@ -9882,9 +9952,18 @@ fn surface_features_table(surface: &Value) -> String {
                         .places
                         .iter()
                         .map(|place| {
-                            let remove = match place.remove_flags.as_str() {
-                                "" => "remove with no flags".to_owned(),
-                                flags => format!("remove with {flags}"),
+                            let remove = match &place.remove {
+                                features::RemoveBy::Flags(flags) if flags.is_empty() => {
+                                    "remove with no flags".to_owned()
+                                }
+                                features::RemoveBy::Flags(flags) => format!("remove with {flags}"),
+                                features::RemoveBy::NoAlias => {
+                                    "remove-feature can't pick it, it has no alias".to_owned()
+                                }
+                                features::RemoveBy::SharedAlias => {
+                                    "remove-feature can't pick it, an earlier transit point has the same alias"
+                                        .to_owned()
+                                }
                             };
                             one_line(&format!("{}: {} ({remove})", place.area, place.field))
                         })

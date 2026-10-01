@@ -745,9 +745,22 @@ pub struct FoundPlace {
     pub pointer: String,
     /// The placement of the feature this place is.
     pub placement: &'static Placement,
-    /// The flags `remove-feature` needs to take the feature from this place,
-    /// empty when none are needed.
-    pub remove_flags: String,
+    /// How `remove-feature` takes the feature from this place.
+    pub remove: RemoveBy,
+    /// The transit point's alias and position in the list, for a place on a
+    /// transit point.
+    pub transit_point: Option<(Option<String>, usize)>,
+}
+
+/// How `remove-feature` can pick a place.
+pub enum RemoveBy {
+    /// With these flags, none when the feature name is enough.
+    Flags(String),
+    /// It can't: the transit point has no alias.
+    NoAlias,
+    /// It can't: an earlier transit point has the same alias, and the command
+    /// takes the first one.
+    SharedAlias,
 }
 
 /// One feature and every place it is set on a surface, none when it is off.
@@ -757,8 +770,9 @@ pub struct FeatureState {
 }
 
 /// Every feature with the places it is set on `surface`. A place counts when it
-/// holds a value other than `null` or an empty list, so an empty list counts as
-/// off here even though `remove-feature` would still accept it.
+/// holds a value other than `null` or an empty list, so an empty object counts
+/// as on and an empty list as off, though `remove-feature` accepts both. This
+/// reads the surface itself and leaves out what its variants override.
 pub fn on_surface(surface: &Value) -> Vec<FeatureState> {
     let points = surface
         .pointer("/transit/points")
@@ -775,23 +789,40 @@ pub fn on_surface(surface: &Value) -> Vec<FeatureState> {
                             .pointer
                             .replace("{tp}", &index.to_string());
                         if is_set(surface.pointer(&pointer)) {
-                            let Some(alias) = point
+                            let alias = point
                                 .get("alias")
-                                .and_then(Value::as_str)
-                            else {
-                                continue;
-                            };
+                                .and_then(Value::as_str);
                             let field = placement
                                 .pointer
                                 .rsplit('/')
                                 .next()
                                 .unwrap_or_default();
+                            let (area, remove) = match alias {
+                                None => (format!("transit point {index} (no alias)"), RemoveBy::NoAlias),
+                                Some(alias) => {
+                                    let first = points
+                                        .iter()
+                                        .position(|other| {
+                                            other
+                                                .get("alias")
+                                                .and_then(Value::as_str)
+                                                == Some(alias)
+                                        });
+                                    let remove = if first == Some(index) {
+                                        RemoveBy::Flags(transit_point_flags(feature, placement, alias))
+                                    } else {
+                                        RemoveBy::SharedAlias
+                                    };
+                                    (format!("transit point {alias}"), remove)
+                                }
+                            };
                             places.push(FoundPlace {
-                                area: format!("transit point {alias}"),
+                                area,
                                 field: field.to_owned(),
                                 pointer,
                                 placement,
-                                remove_flags: transit_point_flags(feature, placement, alias),
+                                remove,
+                                transit_point: Some((alias.map(str::to_owned), index)),
                             });
                         }
                     }
@@ -823,7 +854,7 @@ fn transit_point_flags(
     placement: &Placement,
     alias: &str,
 ) -> String {
-    let flag = format!("--transit-point {alias}");
+    let flag = format!("--transit-point {}", shell_words::quote(alias));
     let by_name = feature
         .select_placement(None, true, false)
         .is_ok_and(|chosen| chosen.same_place(placement));
@@ -889,7 +920,8 @@ fn found_place(
         field: field.replace('/', "."),
         pointer: pointer.to_owned(),
         placement,
-        remove_flags: shortest_flags(feature, placement),
+        remove: RemoveBy::Flags(shortest_flags(feature, placement)),
+        transit_point: None,
     }
 }
 
@@ -912,7 +944,18 @@ pub fn describe_on_surface(surface: &Value) -> Value {
                             "kind": place.placement.kind.label(),
                             "place": place.area,
                             "field": place.field,
-                            "remove_flags": place.remove_flags,
+                            "transit_point": place
+                                .transit_point
+                                .as_ref()
+                                .map(|(alias, _)| alias),
+                            "index": place
+                                .transit_point
+                                .as_ref()
+                                .map(|(_, index)| index),
+                            "remove_flags": match &place.remove {
+                                RemoveBy::Flags(flags) => Some(flags),
+                                RemoveBy::NoAlias | RemoveBy::SharedAlias => None,
+                            },
                         }))
                         .collect::<Vec<_>>(),
                 })
@@ -1480,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_a_feature_in_several_places_and_skips_a_transit_point_with_no_alias() {
+    fn finds_a_feature_in_several_places_including_a_transit_point_with_no_alias() {
         let surface = json!({
             "target": {"mcp_tool_gating": {"allow": ["a"]}, "policy": {"policy_definition_id": "p"}},
             "transit": {"points": [
@@ -1490,8 +1533,15 @@ mod tests {
             ]},
         });
         let states = on_surface(&surface);
-        assert_eq!(found(&states, "mcp-tool-gating"), ["target: mcp_tool_gating", "transit point gh: mcp_tool_gating"]);
-        assert_eq!(found(&states, "policy"), ["target: policy"]);
+        assert_eq!(
+            found(&states, "mcp-tool-gating"),
+            [
+                "target: mcp_tool_gating",
+                "transit point gh: mcp_tool_gating",
+                "transit point 2 (no alias): mcp_tool_gating"
+            ]
+        );
+        assert_eq!(found(&states, "policy"), ["target: policy", "transit point 2 (no alias): policy"]);
     }
 
     #[test]
@@ -1512,6 +1562,8 @@ mod tests {
                 "kind": "object",
                 "place": "access point",
                 "field": "rate_limit",
+                "transit_point": null,
+                "index": null,
                 "remove_flags": "",
             }]})
         );
@@ -1525,14 +1577,17 @@ mod tests {
     fn flags_found(
         surface: &Value,
         key: &str,
-    ) -> Vec<String> {
+    ) -> Vec<Option<String>> {
         on_surface(surface)
             .into_iter()
             .find(|state| state.feature.key == key)
             .expect("feature")
             .places
             .into_iter()
-            .map(|place| place.remove_flags)
+            .map(|place| match place.remove {
+                RemoveBy::Flags(flags) => Some(flags),
+                RemoveBy::NoAlias | RemoveBy::SharedAlias => None,
+            })
             .collect()
     }
 
@@ -1553,7 +1608,7 @@ mod tests {
             ]},
         });
         let flags = |key| flags_found(&surface, key);
-        let some = |text: &str| text.to_owned();
+        let some = |text: &str| Some(text.to_owned());
         assert_eq!(flags("rate-limit"), [some("")]);
         assert_eq!(flags("trust-recorder"), [some("")]);
         assert_eq!(flags("trust-check"), [some(""), some("--edge ma-tp")]);
@@ -1566,8 +1621,64 @@ mod tests {
     }
 
     #[test]
-    fn skips_a_transit_point_with_no_alias() {
-        let surface = json!({"transit": {"points": [{"policy": {"policy_definition_id": "p"}}]}});
-        assert!(flags_found(&surface, "policy").is_empty());
+    fn a_transit_point_with_no_alias_or_a_repeated_alias_cannot_be_picked() {
+        let policy = json!({"policy_definition_id": "p"});
+        let surface = json!({"transit": {"points": [
+            {"alias": "gh", "policy": policy},
+            {"policy": policy},
+            {"alias": "gh", "policy": policy},
+            {"alias": "pay", "policy": policy},
+        ]}});
+        let states = on_surface(&surface);
+        let places = &states
+            .iter()
+            .find(|state| state.feature.key == "policy")
+            .unwrap()
+            .places;
+        assert!(matches!(&places[0].remove, RemoveBy::Flags(flags) if flags == "--transit-point gh"));
+        assert!(matches!(places[1].remove, RemoveBy::NoAlias));
+        assert_eq!(places[1].area, "transit point 1 (no alias)");
+        assert!(matches!(places[2].remove, RemoveBy::SharedAlias));
+        assert!(matches!(&places[3].remove, RemoveBy::Flags(flags) if flags == "--transit-point pay"));
+    }
+
+    #[test]
+    fn quotes_a_transit_point_alias_that_needs_it() {
+        let surface = json!({"transit": {"points": [{"alias": "my gh", "policy": {"policy_definition_id": "p"}}]}});
+        let flags = flags_found(&surface, "policy");
+        assert_eq!(flags, [Some("--transit-point 'my gh'".to_owned())]);
+        let words = shell_words::split(flags[0].as_deref().unwrap()).unwrap();
+        assert_eq!(words, ["--transit-point", "my gh"]);
+        let surface = json!({"transit": {"points": [{"alias": "gh", "policy": {"policy_definition_id": "p"}}]}});
+        assert_eq!(flags_found(&surface, "policy"), [Some("--transit-point gh".to_owned())]);
+    }
+
+    #[test]
+    fn json_names_the_transit_point_and_its_position() {
+        let surface = json!({"transit": {"points": [
+            {"alias": "gh", "policy": {"policy_definition_id": "p"}},
+            {"policy": {"policy_definition_id": "p"}},
+        ]}});
+        let described = describe_on_surface(&surface);
+        let policy = described
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["feature"] == "policy")
+            .unwrap();
+        let placements = &policy["placements"];
+        assert_eq!(placements[0]["transit_point"], "gh");
+        assert_eq!(placements[0]["index"], 0);
+        assert_eq!(placements[0]["remove_flags"], "--transit-point gh");
+        assert!(placements[1]["transit_point"].is_null());
+        assert_eq!(placements[1]["index"], 1);
+        assert!(placements[1]["remove_flags"].is_null());
+    }
+
+    #[test]
+    fn an_empty_object_counts_as_on_and_an_empty_list_as_off() {
+        let states = on_surface(&json!({"access_point": {"rate_limit": {}, "trust_check_list": []}}));
+        assert_eq!(found(&states, "rate-limit"), ["access point: rate_limit"]);
+        assert!(found(&states, "trust-check").is_empty());
     }
 }
