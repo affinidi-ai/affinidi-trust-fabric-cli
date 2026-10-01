@@ -110,6 +110,44 @@ impl Patterns {
     }
 }
 
+/// Refuse a pattern the gateway would not save: blank, longer than the
+/// gateway's limit, or not valid regex. `pattern` is the text as given, since
+/// the gateway measures its length before trimming.
+pub fn check_pattern(pattern: &str) -> Result<()> {
+    if pattern.trim().is_empty() {
+        bail!("a pattern can't be blank");
+    }
+    if pattern.len() > PATTERN_BYTES_MAX {
+        bail!(
+            "the pattern is {} bytes, and the gateway will refuse to save one longer than {PATTERN_BYTES_MAX} bytes",
+            pattern.len()
+        );
+    }
+    let compiled = Patterns::compile(&[pattern.to_owned()]);
+    if let Some(bad) = compiled.not_valid.first() {
+        bail!("the pattern {} is not valid regex, and the gateway will refuse to save it", quote(bad));
+    }
+    if let Some(big) = compiled.too_large.first() {
+        bail!("the pattern {} is too large to compile, so the gateway will most likely refuse to save it", quote(big));
+    }
+    Ok(())
+}
+
+/// Refuse a gate holding more patterns than the gateway saves, blank ones not
+/// counted.
+pub fn check_pattern_count(patterns: &[String]) -> Result<()> {
+    let count = patterns
+        .iter()
+        .filter(|pattern| !pattern.trim().is_empty())
+        .count();
+    if count > PATTERNS_MAX {
+        bail!(
+            "the gate would have {count} patterns, and the gateway will refuse to save more than {PATTERNS_MAX} in one gate"
+        );
+    }
+    Ok(())
+}
+
 /// One gate read from a surface, in the order the surface lists it.
 #[derive(Debug, Clone)]
 pub struct Gate {
@@ -1932,6 +1970,42 @@ mod tests {
                 .compiled
                 .not_valid
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn check_pattern_accepts_a_good_pattern_and_refuses_each_kind_of_bad_one() {
+        assert!(check_pattern("^fs_.*$").is_ok());
+        assert!(check_pattern(&"a".repeat(PATTERN_BYTES_MAX)).is_ok());
+        let message = |pattern: &str| {
+            check_pattern(pattern)
+                .expect_err("refused")
+                .to_string()
+        };
+        assert_eq!(message("  "), "a pattern can't be blank");
+        assert_eq!(message("^a("), "the pattern '^a(' is not valid regex, and the gateway will refuse to save it");
+        assert_eq!(
+            message("(?:\\w{100}){100}"),
+            "the pattern '(?:\\w{100}){100}' is too large to compile, so the gateway will most likely refuse to save it"
+        );
+        assert!(message(&format!("{} ", "a".repeat(PATTERN_BYTES_MAX))).contains("513 bytes"));
+    }
+
+    #[test]
+    fn check_pattern_count_ignores_blank_patterns() {
+        let patterns = |blank: usize, real: usize| -> Vec<String> {
+            (0..blank)
+                .map(|_| " ".to_owned())
+                .chain((0..real).map(|n| format!("p{n}")))
+                .collect()
+        };
+
+        assert!(check_pattern_count(&patterns(10, PATTERNS_MAX)).is_ok());
+        assert_eq!(
+            check_pattern_count(&patterns(0, PATTERNS_MAX + 1))
+                .expect_err("one too many")
+                .to_string(),
+            "the gate would have 65 patterns, and the gateway will refuse to save more than 64 in one gate"
         );
     }
 

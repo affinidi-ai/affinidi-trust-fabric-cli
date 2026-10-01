@@ -263,6 +263,8 @@ fabric agent-gateway surfaces update <surface-id> --set access_point.rate_limit.
 fabric agent-gateway surfaces update "Sales Agent" --set access_point.rate_limit.requests=200
 fabric agent-gateway surfaces update <surface-id> --add tags=beta --remove transit.points=billing
 fabric agent-gateway surfaces update <surface-id> --set access_point.route=/billing --dry-run
+fabric agent-gateway surfaces update <surface-id> --add 'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'   # add one tool pattern to one gate, quoted for the shell
+fabric agent-gateway surfaces update <surface-id> --remove 'transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
 fabric agent-gateway policies create --id allow-sales --name "Allow sales" --policy-file allow-sales.rego
 fabric agent-gateway surfaces add-feature <surface-id-or-name> rate-limit --json '{"requests":100,"window_secs":60}'
 fabric agent-gateway surfaces tool-gate-preview <surface-id> --tool delete_user,get_user
