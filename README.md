@@ -73,6 +73,25 @@ fabric agent-gateway surfaces list
 fabric agent-gateway policies list
 ```
 
+How lists and deletes print:
+
+- Every `list` prints one table with a header row and the columns that matter for that resource, for example `NAME  ID  PROTOCOL  ROUTE  TARGET  TRANSIT POINTS` for surfaces. `audit list` and `payments list` use the same table.
+- A list with nothing in it prints a short line such as `No surfaces yet.`, or `No matching secrets.` when a filter (`--tag`, `--status`, `--decision` and so on) was given, or when you ask for a page past the first, or `No payments returned.` when a payments store failed to answer (a store that is not set up does not change the line).
+- A list cell that mixes named and unnamed items shows the names and then `+N more`.
+- Long values end in `...`, except IDs, DIDs and names you can pass to another command, which always print whole.
+- A raw `api` call that returns a list prints a `NAME  ID  DESCRIPTION` table.
+- `surfaces features` and `tokens scopes` are catalogues and print plain lines.
+- Every `delete` prints one line such as `Deleted credential provider '<id>'`. Secret, certificate and grant deletes get a 204 from the gateway, and surface and identity deletes get a body back but still print one line in table mode.
+- `metrics truncate` and `logs truncate` do not delete one item and still print the gateway's result.
+- Every `create` prints `Created <kind> '<id>'` and every `update` prints `Updated <kind> '<id>'`. A secret the gateway shows only once (a token or API key secret) is printed alone on standard output, and the confirmation line and a `note:` go to standard error.
+- Messages on standard error start with `note:`, `warning:` or `error:`. The browser sign-in instruction lines (opening the browser, the URL to visit) stay plain.
+- `--output json` prints what the gateway returned for lists, creates, updates and deletes, which is `null` for the empty body most deletes get back. The one exception is `identities list`, which prints the list without the gateway's `count` wrapper.
+- A yes or no flag such as `ENABLED` prints `yes` or `no` (`true` or `false` in JSON).
+- An empty expiry prints `never`, and an empty STS client scope list prints `any`, since the gateway reads both as no limit.
+- The raw `api` table never cuts a value.
+
+Columns are padded with spaces, not tabs, so a script that split these on tabs should use `--output json`.
+
 Global `--host` and `--token` options are temporary overrides for a single command. Use `fabric agent-gateway login` when the settings should be remembered.
 
 `fabric agent-gateway logout` and `fabric agent-gateway config remove <name>` remove both the local profile and its OS credential-store entry.
@@ -134,7 +153,7 @@ fabric agent-gateway tokens revoke <token-id> --yes
 
 `scopes` lists the scopes you can grant a new token, one per line. It is based on your own role and, when you are logged in with a scoped personal access token, narrowed to that token's scopes.
 
-`create` takes `--name` (required unless `--file` is given), `--description`, `--scope` (repeat it for each scope) and `--expires-at`, an RFC 3339 timestamp such as `2027-01-01T00:00:00Z`; omit `--expires-at` for a token that never expires. A token created without any `--scope` carries your whole role. `--file` takes a complete creation document instead, with `-` reading standard input; the other creation flags are ignored when it is given. The gateway keeps only a hash of the secret, so this is the one time it is shown: in table mode `create` prints the secret on its own line so it can be captured (`PAT=$(fabric agent-gateway tokens create ...)`) and says so on standard error, and `--output json` prints the whole response, secret included.
+`create` takes `--name` (required unless `--file` is given), `--description`, `--scope` (repeat it for each scope) and `--expires-at`, an RFC 3339 timestamp such as `2027-01-01T00:00:00Z`; omit `--expires-at` for a token that never expires. A token created without any `--scope` carries your whole role. `--file` takes a complete creation document instead, with `-` reading standard input; the other creation flags are ignored when it is given. The gateway keeps only a hash of the secret, so this is the one time it is shown: in table mode `create` prints the secret alone on standard output, so `PAT=$(fabric agent-gateway tokens create ...)` captures just that, and sends `Created access token '<id>'` and a `note:` about the secret to standard error. `--output json` prints the whole response, secret included. A secret with control characters is refused in table mode; read it with `--output json`.
 
 Two more flags narrow where a token works. `--required-header name=pattern` names a header the caller must send and a regex its whole value must match, and can be repeated; a value that is not `name=pattern` with both parts non-empty is refused before anything is sent. `--resource-pattern` limits the token to the resources it matches; omit it for an appliance-wide token. It has to take the form `TENANT:${header}:<resource-kind>:<resource-id-pattern>`, where `${header}` names one of the token's required headers and the resource kind is a path family such as `surfaces`, `gateways` or `secrets`. Anything else is refused with a 400. The caller picks that header's value on each request, so it decides the tenant, and the gateway therefore refuses a header pattern that could match more than one value unless the deployment sets `tenancy.trusted_tenant_header` for a proxy that overwrites the header:
 
@@ -160,7 +179,7 @@ fabric agent-gateway audit list --flow access_point --decision deny
 fabric agent-gateway audit list --all --output json > audit.json
 ```
 
-Rows are `timestamp  event  surface_id  decision  detail`, with `-` for a field the event lacks. Audit events carry no `id`, `name`, or `description`, so they use their own row format instead of the shared `id  name  description` summary. `detail` is the gateway's own note on the event, such as `0 tokens revoked` on a `user_tokens_revoked` event. Every cell is stripped of control characters, and its line breaks and tabs become spaces, so each event stays on one row with its columns in place. `--all` pages through the whole log rather than one page, which is the main thing the dashboard view cannot do.
+`audit list` prints the shared table with the header `TIMESTAMP  EVENT  SURFACE  DECISION  DETAIL`, with `-` for a field the event lacks and `No audit events yet.` when there are none. Audit events carry no `id`, `name`, or `description`, so the table has its own columns. `detail` is the gateway's own note on the event, such as `0 tokens revoked` on a `user_tokens_revoked` event. Every cell is stripped of control characters, and its line breaks and tabs become spaces, so each event stays on one row with its columns in place; a long `detail` ends in `...`. `--all` pages through the whole log rather than one page, which is the main thing the dashboard view cannot do.
 
 The audit log records gateway traffic, not administration: delegation consent and tokens, policy decisions, trust checks, VP injection, payments, and trace terminations. Admin API calls, such as creating an identity, are not audited and never appear here; the one exception is revoking delegation tokens, which records `token_revoked` or `user_tokens_revoked`. The gateway settings gate three kinds of event, and only while `audit_enabled` is on: `audit_categories.policies` records policy decisions, `audit_categories.trust_checks` records trust checks, and `audit_categories.identity` records VP-injection events, not changes to identities. Every other event is recorded whatever those settings say. An empty table result says what the log records, and that admin API calls are not audited, on standard error.
 
@@ -176,7 +195,7 @@ Three things to know about the filters:
 
 - `--filter` is matched by the gateway against the raw JSON of each event, so it also matches field names and the base64 body of an embedded JWT, not only the values a row displays.
 - `--flow`, `--scope`, and `--decision` restrict the view to policy decisions. Setting any of them drops every other kind of event rather than narrowing the policy decisions within a wider set.
-- An empty result is ambiguous. The gateway answers HTTP 200 with no events when the audit log is genuinely empty, when its audit subsystem failed to start, and when it cannot read the audit file or the file is not valid UTF-8. It also drops any line of the file it cannot parse without saying so, so a listing can be short as well as empty.
+- An empty result is ambiguous. The gateway answers HTTP 200 with no events when the audit log is genuinely empty, when its audit subsystem failed to start, and when it cannot read the audit file or the file is not valid UTF-8. It also drops any line of the file it cannot parse without saying so, so a listing can be short as well as empty. The CLI explains this on standard error, with each line starting with `note:`.
 
 `--all` walks pages until the gateway repeats one, because it clamps a page past the end back into range instead of returning an empty page. Paging is by offset over a newest-first list, so events written while a long `--all` run is in progress shift the offsets and can push rows past the page boundary the run already passed; take the export when the gateway is quiet if it has to be exact.
 
@@ -184,7 +203,7 @@ Audit events carry the caller's raw email and display name and, for a VP injecti
 
 ### Payments
 
-The gateway keeps payment records in two independent stores, x402 and MPP, behind separate endpoints. `fabric agent-gateway payments list` reads both by default and merges them into one table of `id  store  surface_id  status  amount  currency  created_at`, newest first — the one thing `fabric agent-gateway api` cannot do here, because it takes two calls.
+The gateway keeps payment records in two independent stores, x402 and MPP, behind separate endpoints. `fabric agent-gateway payments list` reads both by default and merges them into one table of `ID  STORE  SURFACE  STATUS  AMOUNT  CURRENCY  CREATED`, newest first, which `fabric agent-gateway api` cannot do here because it takes two calls.
 
 ```sh
 fabric agent-gateway payments list
@@ -199,7 +218,7 @@ fabric agent-gateway payments delete <transaction-id> --yes
 - `--status` is a query parameter on x402 but not on MPP, so MPP records are filtered after they are fetched. Matching ignores case on both, which is what lets one value select from both: the two stores share `verified` and `failed` and differ only in case. x402's filterable status is the verification status — `Pending`, `Verified`, `Failed`, `Timeout` — and MPP's is `verified`, `failed`, or `challengeissued`. Settlement is a separate x402 field that the merged `list` row drops, so no `--status` value selects on it; read it from `payments get`.
 - A full record from `get` carries the signed `PaymentReceiptCredential` and `PaymentRejectionCredential` JWTs and, for x402, the payer's signature. Those are replaced with `[redacted]` unless `--reveal` is passed; the `sha256:` fingerprint beside each JWT is kept, so a redacted record is still verifiable.
 - x402 computes its record total after applying the limit, so it can only ever equal the number of rows returned. Only the MPP footer reports a real "N of total".
-- Timestamps are Unix seconds, exactly as both stores return them.
+- Table output shows `created_at` as an ISO 8601 UTC time, like the tokens and audit tables. `--output json` keeps the Unix seconds both stores return.
 - Every cell of the merged table is cleaned like an audit row: control characters stripped, line breaks and tabs turned into spaces.
 - On a gateway with no payment stores configured these routes do not exist at all, which the CLI reports as "payments are not enabled on this gateway".
 - The two stores are authorised differently: x402 needs only a session, while MPP additionally requires the `payments.view` permission, because its records carry the payer, amount, and method. An operator without it gets x402's rows and a rejection from MPP. `list` prints the rows it did read and names the store it could not on standard error; it fails only when no store could be read at all.
@@ -274,11 +293,11 @@ fabric agent-gateway connections list
 fabric agent-gateway tokens rotate <token-id> --yes
 ```
 
-The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID. Finding a surface by name needs the `surfaces.view` permission, so a token without it must pass the surface ID (a UUID), including for `update --set`, as with secrets.
+The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `note: using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID. Finding a surface by name needs the `surfaces.view` permission, so a token without it must pass the surface ID (a UUID), including for `update --set`, as with secrets.
 
 `tool-gate-preview` shows whether each tool would be allowed or denied (RESULT) and which gate, or the default, decided it (DECIDED BY).
 
-Create commands print the created entity ID in table mode. Use `--output json` to receive the complete response. Full JSON documents preserve access to the complete Gateway model without duplicating every nested setting as a CLI flag.
+Create commands print `Created <kind> '<id>'` in table mode. Use `--output json` to receive the complete response, which is also how a script reads the new ID. Full JSON documents preserve access to the complete Gateway model without duplicating every nested setting as a CLI flag.
 
 `surfaces update --file` replaces the whole surface. `--set <path>=<value>` and `--unset <path>` instead change single fields, and `--add <path>=<item>` and `--remove <path>=<item>` add or remove one list item; all four can be repeated and none can be combined with `--file`. They go to the gateway as one JSON Merge Patch, so fields they do not name keep their current values. A path is dot-separated field names (`--add` and `--remove` can also pick one gate in square brackets, shown below), and a value or item is read as JSON when it parses (`100`, `true`, `'"100"'`, `'{"requests":100}'`) and as plain text otherwise. Wrap a value in quotes (`'"1.0"'`) to send something that looks like a number, boolean or JSON as text. Setting an object merges it into the existing object rather than replacing it, and setting a list replaces the whole list.
 
@@ -292,7 +311,7 @@ Every surface edit (`update`, `add-feature` and `remove-feature`) is checked on 
 
 ### Identity and access
 
-Users, did:webvh identities, API keys, tenant ownership, and JWT verification strategies each have their own command, because none of them is plain CRUD. Every `--file` in this section is a request document, not the entity it acts on; [Request documents](#request-documents) lists the keys each one requires. The `users`, `api-keys` and `jwt-verification-strategies` deletes confirm on standard output in table mode, and `--output json` keeps the gateway's own answer, which is `null` for the empty body a delete returns.
+Users, did:webvh identities, API keys, tenant ownership, and JWT verification strategies each have their own command, because none of them is plain CRUD. Every `--file` in this section is a request document, not the entity it acts on; [Request documents](#request-documents) lists the keys each one requires. Their deletes print one line in table mode, and `--output json` prints the gateway's own answer, which is `null` for the empty body most of them return.
 
 ```sh
 fabric agent-gateway users list
@@ -319,7 +338,7 @@ fabric agent-gateway identities trust-policy set <id> --file trust-policy.json
 fabric agent-gateway identities deactivate <id>
 ```
 
-`get` returns the identity's stored key pair, private key included, so the CLI drops `key_pair` from the output unless `--reveal` asks for it. `list`, `create`, `rotate-keys` and `history` carry public key material only. `deactivate` is the delete route: it clears the identity's active flag and keeps the record, which stays readable afterwards. `create` and `rotate-keys` have the gateway generate the key pair when no `--file` supplies one, and both refuse a `--file` document that carries a key pair outside its wrapper, which is `key_pair` for `create` and `new_key_pair` for `rotate-keys`; the refusal prints a template of the document to send, with placeholder Ed25519 JWKs. Table output identifies an identity by its UUID and DID; `--output json` returns the whole record.
+`get` returns the identity's stored key pair, private key included, so the CLI drops `key_pair` from the output unless `--reveal` asks for it. `list`, `create`, `rotate-keys` and `history` carry public key material only. `deactivate` is the delete route: it clears the identity's active flag and keeps the record, which stays readable afterwards. `create` and `rotate-keys` have the gateway generate the key pair when no `--file` supplies one, and both refuse a `--file` document that carries a key pair outside its wrapper, which is `key_pair` for `create` and `new_key_pair` for `rotate-keys`; the refusal prints a template of the document to send, with placeholder Ed25519 JWKs. `list` prints `DID  ID  VERSION  ACTIVE  UPDATED`, and `--output json` prints the list of identities without the gateway's `count` wrapper; `get` returns the whole record.
 
 `identities trust-policy` reads and writes a per-identity trust-score policy — a minimum score and the weights of its components. It is unrelated to `fabric agent-gateway policies`, which manages the Rego policy definitions the gateway enforces on traffic: the gateway stores a trust-score policy in the identity's metadata and hands it back on request, but nothing in the gateway applies it. `trust-policy get` answers with the gateway's built-in defaults for an identity that has never had one set, so a result does not prove one was configured.
 
@@ -336,7 +355,7 @@ fabric agent-gateway api-keys delete <key-id> --agent-id <surface-id>
 
 `get`, `revoke`, `rotate` and `delete` take the key's own ID. The gateway addresses a key by its Agent Surface and then its ID, so the CLI reads `GET /v1/api-keys` first and takes the surface from the key's own record. `--agent-id` names the surface and skips that lookup — needed when the token carries `api_keys.edit` or `api_keys.delete` but not `api_keys.view`, since the key's own route is open to it and the collection is not. A key id no visible surface carries is reported as not found, and a key id on two surfaces is refused by name rather than guessed at: the gateway generates key ids at random and does not enforce their uniqueness. `create` still takes its surface as a positional, because a new key has no ID to look up.
 
-`create` and `rotate` return a secret the gateway keeps only as a hash and will never show again; in table mode they print that secret on its own so it can be captured (`SECRET=$(fabric agent-gateway api-keys create ...)`), and report the key ID on standard error. `--output json` prints the whole response. A key cannot be edited after creation — `rotate` replaces its secret in place, keeping the key ID. The gateway refuses to rotate a key that has already been revoked, so replace a revoked key with a new one. `revoke` and `rotate` take `--actor`, the name recorded against the change in the key's audit trail; it defaults to `api`.
+`create` and `rotate` return a secret the gateway keeps only as a hash and will never show again; in table mode they print the secret alone on standard output, so `SECRET=$(fabric agent-gateway api-keys create ...)` captures just that, and send `Created API key '<key-id>'` (or `Rotated API key '<key-id>'`) and the same `note:` that tokens use to standard error. `--output json` prints the whole response. A key cannot be edited after creation, and `rotate` replaces its secret in place, keeping the key ID. The gateway refuses to rotate a key that has already been revoked, so replace a revoked key with a new one. `revoke` and `rotate` take `--actor`, the name recorded against the change in the key's audit trail; it defaults to `api`.
 
 ```sh
 fabric agent-gateway tenant-ownership impact surfaces <surface-id>
@@ -442,7 +461,7 @@ fabric agent-gateway surfaces remove-feature <id> rate-limit
 fabric agent-gateway surfaces remove-feature <id> policy --response
 ```
 
-`add-feature` and `remove-feature` fetch the surface and send only the part they change as a JSON Merge Patch, returning the updated surface. Adding an object feature replaces what was there, a list feature is appended to its list, and a transit point feature sends the whole transit point list with that one point changed. A value holding `null` inside an object is refused, because the gateway would read it as removing that field. Both commands run the same local check as `surfaces update` and take `--dry-run` to preview the change without saving it.
+`add-feature` and `remove-feature` fetch the surface and send only the part they change as a JSON Merge Patch, printing `Updated surface '<id>'` in table mode and returning the updated surface with `--output json`. Adding an object feature replaces what was there, a list feature is appended to its list, and a transit point feature sends the whole transit point list with that one point changed. A value holding `null` inside an object is refused, because the gateway would read it as removing that field. Both commands run the same local check as `surfaces update` and take `--dry-run` to preview the change without saving it.
 
 ### Secrets and certificates
 
@@ -505,7 +524,7 @@ printf '{"value":"%s","update_value":true,"description":"Billing API key"}' "$NE
 
 Neither command exposes `--tenant-id`. An appliance-wide personal access token is rejected with 403 if it tries to assign tenant ownership, and a tenant-scoped token can only create inside its own tenant.
 
-A delete returns no document. Table output confirms what it removed; `--output json` prints `null`, the same as every other delete command.
+Table output confirms what a delete removed in one line. `--output json` prints what the gateway returned, which is `null` when the answer is empty.
 
 ### Delegated credential grants
 
@@ -518,7 +537,7 @@ fabric agent-gateway delegation-vault revoke <id>
 fabric agent-gateway delegation-vault revoke-user sha256:<hex>
 ```
 
-`revoke-user` takes a user identity hash rather than a grant ID and revokes every grant held for that user, reporting how many it removed in both output modes. A single `revoke` returns no document, so it confirms the grant in table output and prints `null` under `--output json`. Grants carry no name or description, so the table listing shows IDs only — use `--output json` for the agent DID, provider, user hash, and expiry.
+`revoke-user` takes a user identity hash rather than a grant ID and revokes every grant held for that user, answering `{"revoked": N}`. In table output it prints `Revoked N grants for user '<hash>'`, and `--output json` prints that answer. A single `revoke` returns no document, so it confirms the grant in table output and prints `null` under `--output json`. The table listing shows `ID  AGENT DID  PROVIDER  EXPIRES  EXPIRED`; use `--output json` for the user hash, scopes and token type.
 
 Revoking needs a session token or an appliance-wide personal access token. A token created with `--resource-pattern` can list grants but never revoke one, because the delegation vault is not among the path families that pattern scoping recognises.
 
@@ -528,7 +547,7 @@ A failed request prints the reason from the response body, stripped of control c
 
 A permission refusal that names the permission it needed keeps the gateway's own wording, which tells a role that lacks the permission apart from a personal access token whose scopes leave it out, for example `access token scope does not include 'access_tokens.view'`. When the gateway names only the permission, the CLI reports `missing required scope '<permission>'`. A `401` is reported as `gateway rejected the bearer token:` followed by the gateway's reason.
 
-A `get` (single entity) prints the **entire configuration** — the same document shown in the dashboard's config view — as formatted JSON. A `list` prints a compact `id  name  description` summary, one row per entity. `--output json` returns full JSON for both. `create` prints the new entity ID in table mode so it can be captured in a variable (`ID=$(fabric agent-gateway surfaces create ...)`).
+A `get` (single entity) prints the **entire configuration**, the same document shown in the dashboard's config view, as formatted JSON. A `list` prints a table with a header row, one row per entity. `--output json` returns full JSON for both. `create` prints `Created <kind> '<id>'` in table mode, and `update` prints `Updated <kind> '<id>'`. To capture the new ID in a script use `--output json` (`ID=$(fabric agent-gateway -o json surfaces create ... | jq -r .surface_id)`).
 
 The reusable CRUD commands also cover Issuers, Authorities, Trust Registries, Mediators, MCP and A2A Proxies, STS clients, credential providers, certificates, and integrations. The authenticated API command covers every remaining endpoint:
 

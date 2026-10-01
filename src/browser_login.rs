@@ -45,7 +45,7 @@ pub async fn browser_login(host: &str) -> Result<String> {
 
     eprintln!("Opening your browser to sign in...");
     if open::that(&authorize_url).is_err() {
-        eprintln!("Could not open a browser automatically.");
+        eprintln!("warning: could not open a browser automatically");
     }
     eprintln!("If the browser did not open, visit this URL to continue:\n  {authorize_url}");
 

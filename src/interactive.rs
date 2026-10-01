@@ -22,7 +22,7 @@ pub async fn run(initial: Cli) -> Result<()> {
                 editor.add_history_entry(line)?;
                 match parse_line(&prefix, line) {
                     Ok(cli) if cli.is_interactive() => {
-                        eprintln!("already in the interactive shell; type a command such as `surfaces list`");
+                        eprintln!("note: already in the interactive shell; type a command such as `surfaces list`");
                     }
                     Ok(mut cli) => {
                         if cli.login_wants_paste_prompt() {
@@ -36,7 +36,7 @@ pub async fn run(initial: Cli) -> Result<()> {
                                     cli.set_login_token(token);
                                 }
                                 Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
-                                    eprintln!("login cancelled");
+                                    eprintln!("note: login cancelled");
                                     continue;
                                 }
                                 Err(error) => {
