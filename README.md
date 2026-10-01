@@ -7,12 +7,12 @@ Commands take the shape `fabric <appliance> <command>`. Agent Gateway commands l
 ## Build
 
 ```sh
-make cli-build
+make build
 ```
 
-On macOS this also codesigns the binary with a stable identifier so the Keychain "Always Allow" prompt (for reading stored credentials) survives rebuilds — a plain `cargo build` produces an ad-hoc/unsigned binary whose Keychain code requirement is pinned to its content hash, so the prompt reappears on every rebuild. The binary is written to `cli/target/debug/fabric`.
+On macOS this also codesigns the binary with a stable identifier so the Keychain "Always Allow" prompt (for reading stored credentials) survives rebuilds. A plain `cargo build` produces an unsigned binary whose Keychain code requirement is pinned to its content hash, so the prompt reappears on every rebuild. The binary is written to `target/debug/fabric`.
 
-For a release build: `make cli-build-release` (writes to `cli/target/release/fabric`).
+For a release build: `make build-release` (writes to `target/release/fabric`). Run `make` on its own to list every target.
 
 ## Interactive shell
 

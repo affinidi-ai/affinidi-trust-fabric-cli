@@ -57,6 +57,9 @@ jobs:
       rustflags: '-D warnings'
 
   rust-scan:
+    # Pull requests from forks don't get repository secrets, so the scan would
+    # fail on them. Forks are scanned once their change reaches main.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: affinidi/pipeline-security/.github/workflows/rust-scanner.yml@0ca1f3d0e4da833304b3474dbb27942b64501932
     secrets:
       SNYK_SCANNER_TOKEN: ${{ secrets.SNYK_SCANNER_TOKEN }}
