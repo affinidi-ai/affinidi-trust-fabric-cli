@@ -293,7 +293,7 @@ fabric agent-gateway connections list
 fabric agent-gateway tokens rotate <token-id> --yes
 ```
 
-The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `note: using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID. Finding a surface by name needs the `surfaces.view` permission, so a token without it must pass the surface ID (a UUID), including for `update --set`, as with secrets.
+The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `features`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `note: using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID. Finding a surface by name needs the `surfaces.view` permission, so a token without it must pass the surface ID (a UUID), including for `update --set`, as with secrets.
 
 `tool-gate-preview` shows whether each tool would be allowed or denied (RESULT) and which gate, or the default, decided it (DECIDED BY).
 
@@ -426,6 +426,13 @@ Agent Surfaces are composed from features, the same elements shown in the dashbo
 ```sh
 fabric agent-gateway surfaces features
 fabric agent-gateway surfaces features --output json
+```
+
+Give a surface ID or name to see which of those features it already has. The table shows each feature, whether it is `on` or `off`, and where it is set, with the flags `remove-feature` needs to take it from that place (`remove with no flags` when the feature name is enough). A place with a value of `{}` counts as `on` and an empty list as `off`. On or off reflects the surface itself, so when an enabled variant changes what the gateway serves a `Notes` section under the table says which variant and features, for example `The default variant 'blue' sets policy; this table reads only the surface itself.` A variant that is complete replaces whole the blocks it has (target, access point, transit points, identity slots, outbound credentials), so it gets one note naming those blocks and any feature it sets, and every feature that can sit in them is marked, on or off, because the ones it leaves out are off for the gateway. A variant that is not complete and has transit points gets a note that transit point features may not match, on the features that can sit on a transit point, since its transit point changes are not itemized. In JSON the affected features get a `variant_notes` list (the JSON stays a list of features, and features with no note have no `variant_notes`). A `null` in a variant that is not complete means it keeps the surface's value, so it is not noted. The feature names shown are the ones `add-feature` and `remove-feature` take. With `--output json` each feature has `on` and a `placements` list, and each placement has `place`, `field`, `transit_point` (the alias, or `null`), `index` (the transit point's position in the list, `null` when the place is not on a transit point) and `remove_flags`: `""` means no flags are needed and `null` means `remove-feature` can't pick it.
+
+```sh
+fabric agent-gateway surfaces features <id-or-name>
+fabric agent-gateway surfaces features <id-or-name> --output json
 ```
 
 Add a feature to a surface. The surface ID or name and the feature are positional, in that order; the place is worked out from the feature name, so `--edge` (`ap-ma`, `ma-external` or `ma-tp`), `--response` and `--transit-point <alias>` are optional overrides, needed only when the command says the feature can go in more than one place.
