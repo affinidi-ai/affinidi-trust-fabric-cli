@@ -272,7 +272,7 @@ fabric agent-gateway connections list
 fabric agent-gateway tokens rotate <token-id> --yes
 ```
 
-The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID. Finding a surface by name needs the `surfaces.view` permission, so a token without it must pass the surface ID (a UUID), including for `update --set`, as with secrets.
+The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `features`, `add-feature`, `remove-feature` and `tool-gate-preview`) also accept the surface's name when only one surface has it, and print `using surface <id> (<name>)` to standard error when they do. When more than one does, the CLI lists the matching IDs and asks for the ID. Finding a surface by name needs the `surfaces.view` permission, so a token without it must pass the surface ID (a UUID), including for `update --set`, as with secrets.
 
 `tool-gate-preview` shows whether each tool would be allowed or denied (RESULT) and which gate, or the default, decided it (DECIDED BY).
 
@@ -403,6 +403,13 @@ Agent Surfaces are composed from features, the same elements shown in the dashbo
 ```sh
 fabric agent-gateway surfaces features
 fabric agent-gateway surfaces features --output json
+```
+
+Give a surface ID or name to see which of those features it already has. The table shows each feature, whether it is `on` or `off`, and where it is set, with the flags `remove-feature` needs to take it from that place (`remove with no flags` when the feature name is enough). The feature names shown are the ones `add-feature` and `remove-feature` take. With `--output json` each feature has `on` and a `placements` list, and each placement has `remove_flags`: `""` means no flags are needed.
+
+```sh
+fabric agent-gateway surfaces features <id-or-name>
+fabric agent-gateway surfaces features <id-or-name> --output json
 ```
 
 Add a feature to a surface. The surface ID or name and the feature are positional, in that order; the place is worked out from the feature name, so `--edge` (`ap-ma`, `ma-external` or `ma-tp`), `--response` and `--transit-point <alias>` are optional overrides, needed only when the command says the feature can go in more than one place.

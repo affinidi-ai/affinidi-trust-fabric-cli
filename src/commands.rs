@@ -675,8 +675,14 @@ enum SurfaceCommand {
         /// Surface ID or name (see `fabric agent-gateway surfaces list`).
         surface_id: String,
     },
-    /// List the features that can be added to a surface.
-    Features,
+    /// List the features that can be added to a surface, or with a surface
+    /// given, show which of them it has and where each one is set.
+    ///
+    /// The names shown are the ones `add-feature` and `remove-feature` take.
+    Features {
+        /// Surface ID or name (see `fabric agent-gateway surfaces list`).
+        surface_id: Option<String>,
+    },
     /// Add a feature to an Agent Surface.
     ///
     /// Where the feature goes is worked out from its name, so no edge flags
@@ -1088,7 +1094,7 @@ async fn dispatch_with(
             .await
         }
         Command::Surfaces {
-            command: SurfaceCommand::Features,
+            command: SurfaceCommand::Features { surface_id: None },
         } => {
             print_features(cli.output);
             Ok(())
@@ -3720,6 +3726,213 @@ mod gateway_config_tests {
             .await
             .expect("the command should succeed");
         request_lines(requests)
+    }
+
+    const FEATURES_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"rate_limit":{"requests":100}},"target":{"mcp_tool_gating":{"allow":["a"]}},"transit":{"points":[{"alias":"gh","mcp_tool_gating":{"allow":["b"]}}]}}"#;
+
+    #[tokio::test]
+    async fn features_with_no_surface_looks_nothing_up() {
+        let (host, requests) = scripted_server(vec![]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command =
+            resolve_surface_command(&client, surface_command(&["fabric", "agent-gateway", "surfaces", "features"]))
+                .await
+                .expect("nothing to look up");
+
+        assert!(matches!(command, SurfaceCommand::Features { surface_id: None }));
+        assert!(request_lines(requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn features_takes_a_surface_name() {
+        let command = resolved_command(&["fabric", "agent-gateway", "surfaces", "features", "Sales"]).await;
+
+        assert!(matches!(command, SurfaceCommand::Features { surface_id: Some(id) } if id == "s-1"));
+    }
+
+    /// Runs `surfaces features <reference>` the way dispatch does, against a
+    /// gateway that answers with the surface list and then `FEATURES_SURFACE`,
+    /// and returns the requests it received and what was printed.
+    async fn shown_features(
+        reference: &str,
+        output: Output,
+    ) -> (Vec<String>, String) {
+        let (host, requests) = scripted_server(vec![LIST_OK, ("HTTP/1.1 200 OK", FEATURES_SURFACE)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command = resolve_surface_command(
+            &client,
+            surface_command(&["fabric", "agent-gateway", "surfaces", "features", reference]),
+        )
+        .await
+        .expect("the surface should resolve");
+        let SurfaceCommand::Features { surface_id: Some(surface_id) } = command else {
+            panic!("expected `surfaces features` with a surface");
+        };
+        let mut printed = Vec::new();
+        show_surface_features(&client, &surface_id, output, &mut printed)
+            .await
+            .expect("the features should print");
+        (request_lines(requests), String::from_utf8(printed).expect("utf-8 output"))
+    }
+
+    #[tokio::test]
+    async fn features_prints_the_table_for_a_surface_id() {
+        let (requests, printed) = shown_features("s-1", Output::Table).await;
+
+        assert_eq!(requests, [LIST_REQUEST, "GET /api/v1/surfaces/s-1 HTTP/1.1"]);
+        assert!(printed.starts_with("FEATURE  "), "{printed}");
+        assert!(
+            printed.contains("rate-limit             on   access point: rate_limit (remove with no flags)\n"),
+            "{printed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn features_prints_the_feature_list_as_json_for_a_surface_name() {
+        let (requests, printed) = shown_features("Sales", Output::Json).await;
+
+        assert_eq!(requests, [LIST_REQUEST, "GET /api/v1/surfaces/s-1 HTTP/1.1"]);
+        let rows: Value = serde_json::from_str(&printed).expect("json output");
+        let rows = rows
+            .as_array()
+            .expect("a list of features");
+        assert_eq!(rows.len(), features::FEATURES.len());
+        let gating = rows
+            .iter()
+            .find(|row| row["feature"] == "mcp-tool-gating")
+            .expect("tool gating row");
+        assert_eq!(gating["on"], true);
+        assert_eq!(gating["placements"][1]["pointer"], "/transit/points/0/mcp_tool_gating");
+        assert_eq!(gating["placements"][1]["remove_flags"], "--transit-point gh");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["on"] == true)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn features_says_when_several_surfaces_or_none_have_the_name() {
+        let (host, _) = scripted_server(vec![LIST_OK, LIST_OK]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        for (name, expected) in [
+            ("Billing", "'Billing' matches more than one surface; pass one of these ids instead:"),
+            ("Support", "surface not found: no surface has the ID or name 'Support'"),
+        ] {
+            let error = resolve_surface_command(
+                &client,
+                surface_command(&["fabric", "agent-gateway", "surfaces", "features", name]),
+            )
+            .await
+            .expect_err("the name should not resolve");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn the_features_table_shows_each_feature_on_or_off_and_where() {
+        let surface: Value = serde_json::from_str(FEATURES_SURFACE).unwrap();
+        let table = surface_features_table(&surface);
+        let lines: Vec<&str> = table.lines().collect();
+
+        assert_eq!(lines.len(), features::FEATURES.len() + 1);
+        assert_eq!(lines[0], "FEATURE                ON   WHERE");
+        assert!(
+            lines.contains(&"rate-limit             on   access point: rate_limit (remove with no flags)"),
+            "{table}"
+        );
+        assert!(
+            lines.contains(&"mcp-tool-gating        on   target: mcp_tool_gating (remove with no flags); transit point gh: mcp_tool_gating (remove with --transit-point gh)"),
+            "{table}"
+        );
+        assert!(lines.contains(&"payment                off  -"), "{table}");
+    }
+
+    #[test]
+    fn the_remove_flags_in_the_table_parse_and_pick_the_place_shown() {
+        let surface = json!({
+            "access_point": {
+                "trust_check_list": [{"id": "a"}],
+                "rate_limit": {"requests": 1},
+                "trust_recorder": {"x": 1},
+            },
+            "target": {
+                "response_custom_metadata": {"a": 1},
+                "policy": {"policy_definition_id": "p"},
+                "response_policy": {"policy_definition_id": "r"},
+                "trust_check_list": [{"id": "t"}],
+                "networking": {"timeout_secs": 5},
+                "mcp_tool_gating": {"allow": ["a"]},
+            },
+            "identity_slots": {"inbound": {"a": 1}, "protected": {"a": 1}, "external": {"a": 1}},
+            "transit": {"points": [{
+                "alias": "gh",
+                "policy": {"policy_definition_id": "p"},
+                "response_policy": {"policy_definition_id": "r"},
+                "networking": {"timeout_secs": 1},
+                "mcp_tool_gating": {"allow": ["b"]},
+            }]},
+        });
+        let mut checked = 0;
+        for state in features::on_surface(&surface) {
+            for place in state.places {
+                let flags = place.remove_flags;
+                let mut args = vec!["fabric", "agent-gateway", "surfaces", "remove-feature", "s-1", state.feature.key];
+                args.extend(flags.split_whitespace());
+                let Command::Surfaces {
+                    command: SurfaceCommand::RemoveFeature(parsed),
+                } = command_of(&args)
+                else {
+                    panic!("expected `surfaces remove-feature`");
+                };
+                let chosen = state
+                    .feature
+                    .select_placement(
+                        parsed
+                            .placement
+                            .edge
+                            .map(Into::into),
+                        parsed
+                            .placement
+                            .transit_point
+                            .is_some(),
+                        parsed.placement.response,
+                    )
+                    .expect("the flags should pick a place");
+                assert_eq!(chosen.pointer, place.placement.pointer, "{} {flags}", state.feature.key);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 16);
+    }
+
+    #[test]
+    fn the_features_table_for_a_bare_surface_has_every_feature_off() {
+        let table = surface_features_table(&json!({"surface_id": "s-1"}));
+
+        assert!(
+            table
+                .lines()
+                .skip(1)
+                .all(|line| line.contains("  off  -")),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn the_features_table_names_features_the_way_remove_feature_takes_them() {
+        let table = surface_features_table(&json!({}));
+        let names: Vec<&str> = table
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+
+        assert_eq!(names.len(), features::FEATURES.len());
+        for name in names {
+            assert_eq!(features::find(name).map(|feature| feature.key), Some(name));
+        }
     }
 
     #[tokio::test]
@@ -6918,7 +7131,13 @@ async fn run_surfaces(
             .map(Some),
         SurfaceCommand::AddFeature(args) => add_feature(client, args, output).await,
         SurfaceCommand::RemoveFeature(args) => remove_feature(client, args, output).await,
-        SurfaceCommand::Features => unreachable!("features listing is handled before client setup"),
+        SurfaceCommand::Features { surface_id: Some(surface_id) } => {
+            show_surface_features(client, &surface_id, output, &mut io::stdout()).await?;
+            Ok(None)
+        }
+        SurfaceCommand::Features { surface_id: None } => {
+            unreachable!("features listing is handled before client setup")
+        }
         SurfaceCommand::ToolGatePreview(_) => {
             unreachable!("the tool gate preview is handled before the surfaces commands run")
         }
@@ -9354,7 +9573,11 @@ async fn resolve_surface_command(
             }
             SurfaceCommand::ToolGatePreview(args)
         }
-        command @ (SurfaceCommand::List | SurfaceCommand::Create(_) | SurfaceCommand::Features) => command,
+        SurfaceCommand::Features { surface_id: Some(reference) } => SurfaceCommand::Features {
+            surface_id: Some(resolve_surface_id(client, &reference).await?),
+        },
+        command
+        @ (SurfaceCommand::List | SurfaceCommand::Create(_) | SurfaceCommand::Features { surface_id: None }) => command,
     })
 }
 
@@ -9624,6 +9847,57 @@ fn print_features(output: Output) {
             }
         }
     }
+}
+
+/// Reads the surface and writes its features to `out`.
+async fn show_surface_features(
+    client: &GatewayClient,
+    surface_id: &str,
+    output: Output,
+    out: &mut impl io::Write,
+) -> Result<()> {
+    let surface = client
+        .request(Method::GET, &entity_path("/v1/surfaces", surface_id), None)
+        .await?;
+    match output {
+        Output::Json => writeln!(out, "{}", serde_json::to_string_pretty(&features::describe_on_surface(&surface))?),
+        Output::Table => write!(out, "{}", surface_features_table(&surface)),
+    }
+    .context("print the surface's features")
+}
+
+/// A table of every feature with whether the surface has it, where it is set
+/// and the flags `remove-feature` needs for that place. It has one row per
+/// feature and a `;` between the places of a feature that is set in several.
+fn surface_features_table(surface: &Value) -> String {
+    let rows: Vec<[String; 3]> = features::on_surface(surface)
+        .into_iter()
+        .map(|state| {
+            let (on, places) = if state.places.is_empty() {
+                ("off", "-".to_owned())
+            } else {
+                (
+                    "on",
+                    state
+                        .places
+                        .iter()
+                        .map(|place| {
+                            let remove = match place.remove_flags.as_str() {
+                                "" => "remove with no flags".to_owned(),
+                                flags => format!("remove with {flags}"),
+                            };
+                            one_line(&format!("{}: {} ({remove})", place.area, place.field))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            };
+            [state.feature.key.to_owned(), on.to_owned(), places]
+        })
+        .collect();
+    let mut table = format_table(&["FEATURE", "ON", "WHERE"], &rows).join("\n");
+    table.push('\n');
+    table
 }
 
 async fn run_policies(
