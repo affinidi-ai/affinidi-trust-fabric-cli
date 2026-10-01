@@ -634,9 +634,11 @@ enum SurfaceCommand {
     /// that list between the read and the write is overwritten), and the
     /// edited surface is checked for its required fields before it is sent.
     ///
-    /// To change one tool pattern without resending its gate, put the gate's
+    /// To change one tool pattern without retyping its gate, put the gate's
     /// id (or name) in square brackets, and quote the flag so the shell leaves
-    /// the brackets alone:
+    /// the brackets alone. The CLI sends the surface's whole gates list, or
+    /// the whole transit.points list for a transit point, so a change someone
+    /// else makes to that list between the read and the write is overwritten:
     ///
     ///   --add 'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
     ///

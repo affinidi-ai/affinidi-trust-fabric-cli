@@ -7,7 +7,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
 
-use crate::tool_gate_preview;
+use crate::{client::sanitize_for_terminal, tool_gate_preview};
 
 /// One field a flag edits: the dot path as the user wrote it, split into its
 /// keys, and the value the patch gives it (`null` for `--unset`).
@@ -181,14 +181,7 @@ fn list_edits<'a>(
                 bail!("{flag} '{given}' needs an item: use {flag} <path>=<item>");
             };
             if path.contains('[') {
-                let edit = parse_pattern_edit(path, raw, flag, is_add)?;
-                if pattern_edits
-                    .iter()
-                    .any(|seen| seen.is_add == is_add && seen.names_same_pattern(&edit))
-                {
-                    bail!("{flag} {path}={raw} is given more than once");
-                }
-                pattern_edits.push(edit);
+                pattern_edits.push(parse_pattern_edit(path, raw, flag, is_add)?);
                 continue;
             }
             let keys = parse_path(path, flag)?;
@@ -268,15 +261,6 @@ struct PatternEdit<'a> {
     is_add: bool,
 }
 
-impl PatternEdit<'_> {
-    fn names_same_pattern(
-        &self,
-        other: &Self,
-    ) -> bool {
-        self.owner == other.owner && self.gate == other.gate && self.pattern == other.pattern
-    }
-}
-
 /// The path segments of `path`, each a field name and the item picked in
 /// square brackets, as in `gates[g-1]`. `None` where a bracket is not closed,
 /// is empty or is not followed by a `.`.
@@ -338,7 +322,7 @@ fn parse_pattern_edit<'a>(
     };
     let pattern = raw.trim();
     if is_add {
-        tool_gate_preview::check_pattern(raw).with_context(|| format!("{flag} {path}={raw}"))?;
+        tool_gate_preview::check_pattern(pattern).with_context(|| format!("{flag} {path}={raw}"))?;
     } else if pattern.is_empty() {
         bail!("{flag} {path}= needs the pattern to remove");
     }
@@ -452,13 +436,14 @@ fn find_point(
             _ => {}
         }
     }
-    let known: Vec<&str> = points
+    let known: Vec<String> = points
         .iter()
         .filter_map(|point| {
             point
                 .get("alias")
                 .or_else(|| point.get("id"))
                 .and_then(Value::as_str)
+                .map(sanitize_for_terminal)
         })
         .collect();
     if known.is_empty() {
@@ -489,12 +474,13 @@ fn find_gate(
             _ => {}
         }
     }
-    let known: Vec<&str> = gates
+    let known: Vec<String> = gates
         .iter()
         .filter_map(|gate| {
             gate.get("id")
                 .or_else(|| gate.get("name"))
                 .and_then(Value::as_str)
+                .map(sanitize_for_terminal)
         })
         .collect();
     if known.is_empty() {
@@ -540,6 +526,23 @@ fn change_gates(
                 .filter(|(other, edit)| *other == index && edit.is_add == is_add)
                 .map(|(_, edit)| edit)
             {
+                if resolved
+                    .iter()
+                    .take_while(|(_, other)| !std::ptr::eq(*other, *edit))
+                    .any(|(other_index, other)| {
+                        *other_index == index && other.is_add == is_add && other.pattern == edit.pattern
+                    })
+                {
+                    bail!(
+                        "{} '{}' is given more than once for gate '{named}' on {owner}",
+                        if is_add {
+                            "--add"
+                        } else {
+                            "--remove"
+                        },
+                        edit.pattern
+                    );
+                }
                 let at = patterns
                     .iter()
                     .position(|existing| {
@@ -587,9 +590,10 @@ fn change_gates(
 
 /// ", it has a, b" listing the text in `patterns`, or nothing when it has none.
 fn held(patterns: &[Value]) -> String {
-    let text: Vec<&str> = patterns
+    let text: Vec<String> = patterns
         .iter()
         .filter_map(Value::as_str)
+        .map(sanitize_for_terminal)
         .collect();
     if text.is_empty() {
         String::new()
@@ -1531,11 +1535,12 @@ mod tests {
     }
 
     #[test]
-    fn the_pattern_length_limit_counts_the_text_as_given_like_the_gateway_does() {
+    fn the_pattern_length_limit_counts_the_trimmed_text_that_is_sent() {
         let at_limit = "a".repeat(512);
 
-        assert!(pattern_patch(&[&format!("{OWN}={at_limit}")], &[]).is_ok());
-        let error = pattern_patch(&[&format!("{OWN}={at_limit} ")], &[]).expect_err("513 bytes with its space");
+        let patch = pattern_patch(&[&format!("{OWN}={at_limit} ")], &[]).expect("512 bytes once trimmed");
+        assert_eq!(patch["target"]["mcp_tool_gating"]["gates"][0]["action"]["patterns"][2], json!(at_limit));
+        let error = pattern_patch(&[&format!("{OWN}={at_limit}a")], &[]).expect_err("513 bytes");
         assert!(format!("{error:#}").contains("513 bytes"), "{error:#}");
     }
 
@@ -1699,5 +1704,70 @@ mod tests {
         .expect("patch");
 
         assert_eq!(patch["transit"]["points"][0]["mcp_tool_gating"]["gates"][0]["action"]["patterns"], json!(["a_.*"]));
+    }
+
+    #[test]
+    fn names_and_patterns_from_the_surface_are_cleaned_in_errors() {
+        let mut surface = gated_surface();
+        surface["target"]["mcp_tool_gating"]["gates"][0]["name"] = json!("fi\u{1b}[2Jles");
+        surface["target"]["mcp_tool_gating"]["gates"][0]
+            .as_object_mut()
+            .expect("a gate")
+            .remove("id");
+        surface["target"]["mcp_tool_gating"]["gates"][1]["action"]["patterns"] = json!(["\u{1b}]0;pwned\u{7}^get_"]);
+        surface["transit"]["points"][0]["alias"] = json!("bil\u{1b}[2Jling");
+        let error_of = |flag: &str, path: &str| {
+            let (adds, removes) = if flag == "--add" {
+                (vec![path], vec![])
+            } else {
+                (vec![], vec![path])
+            };
+            build_patch(&[], &[], &strings(&adds), &strings(&removes), &surface)
+                .expect_err("refused")
+                .to_string()
+        };
+
+        let gates = error_of("--add", "target.mcp_tool_gating.gates[nope].action.patterns=a");
+        assert!(gates.contains("the gates are fi[2Jles, g-2"), "{gates}");
+        assert!(!gates.contains('\u{1b}'), "{gates}");
+        let held = error_of("--remove", "target.mcp_tool_gating.gates[g-2].action.patterns=nope");
+        assert!(held.contains("it has ]0;pwned^get_"), "{held}");
+        assert!(!held.contains('\u{1b}') && !held.contains('\u{7}'), "{held}");
+        let points = error_of("--add", "transit.points[nope].mcp_tool_gating.gates[tg-1].action.patterns=a");
+        assert!(points.contains("the transit points are bil[2Jling"), "{points}");
+        assert!(!points.contains('\u{1b}'), "{points}");
+    }
+
+    #[test]
+    fn the_same_pattern_added_or_removed_twice_under_two_names_of_one_gate_is_refused() {
+        let twice_add = pattern_error(
+            &[
+                "target.mcp_tool_gating.gates[g-1].action.patterns=a",
+                "target.mcp_tool_gating.gates[files].action.patterns= a",
+            ],
+            &[],
+        );
+        assert_eq!(twice_add, "--add 'a' is given more than once for gate 'g-1' on the surface");
+        let twice_remove = pattern_error(
+            &[],
+            &[
+                "target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*",
+                "target.mcp_tool_gating.gates[files].action.patterns=fs_.*",
+            ],
+        );
+        assert_eq!(twice_remove, "--remove 'fs_.*' is given more than once for gate 'g-1' on the surface");
+    }
+
+    #[test]
+    fn the_same_pattern_added_twice_under_a_transit_point_id_and_alias_is_refused() {
+        let error = pattern_error(
+            &[
+                "transit.points[tp-1].mcp_tool_gating.gates[tg-1].action.patterns=a",
+                "transit.points[billing].mcp_tool_gating.gates[tg-1].action.patterns=a",
+            ],
+            &[],
+        );
+
+        assert!(error.contains("is given more than once for gate 'tg-1' on transit point"), "{error}");
     }
 }
