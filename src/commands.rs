@@ -13,7 +13,7 @@ use crate::{
     config::{Config, Connection, normalize_host, normalize_user_host},
     credentials::{CredentialStore, OsCredentialStore},
     features, surface_patch, surface_validate,
-    tables::{self, Layout, table_cell},
+    tables::{self, Layout, Scope, table_cell},
     tool_gate_preview::{self, Conditions, Gating, Preview, ToolPreview, Verdict},
 };
 
@@ -1133,6 +1133,7 @@ async fn dispatch_with(
             let created = create_kind(&command);
             let confirmation = delete_confirmation(&command).or_else(|| update_confirmation(&command));
             let layout = list_layout(&command);
+            let scope = list_scope(&command);
             let value = match command {
                 Command::Runtime { command } => run_runtime(&client, command).await?,
                 Command::Settings { command } => run_settings(&client, command).await?,
@@ -1207,7 +1208,7 @@ async fn dispatch_with(
             match confirmation {
                 Some(confirmation) => print_outcome(&value, cli.output, &confirmation),
                 None => match layout {
-                    Some(layout) => print_list(&value, cli.output, layout),
+                    Some(layout) => print_list(&value, cli.output, layout, scope),
                     None => print_created_or_value(&value, cli.output, created),
                 },
             }
@@ -1609,7 +1610,7 @@ fn run_config(
     match command {
         ConfigCommand::List => {
             let rows: Vec<Value> = config.connections.iter().map(|(name, connection)| json!({"name": name, "host": connection.host, "current": config.current.as_deref() == Some(name)})).collect();
-            print_list(&Value::Array(rows), output, &tables::CONNECTION_SETTINGS)
+            print_list(&Value::Array(rows), output, &tables::CONNECTION_SETTINGS, Scope::All)
         }
         ConfigCommand::Use { name } => {
             if !config
@@ -5311,13 +5312,13 @@ async fn run_certificates(
         command => run_crud(client, CERTIFICATES_PATH, command).await?,
     };
     if let Some(id) = deleted {
-        return Ok(report_removal(value, removal_line("Deleted", "certificate", &id), output));
+        return Ok(confirm_empty(value, &confirmation_line("Deleted", "certificate", &id), output));
     }
     if !reveal {
         mask_keys(&mut value, &["private_key_pem"]);
     }
     if let Some(id) = updated {
-        return Ok(report_update(value, removal_line("Updated", "certificate", &id), output));
+        return Ok(report_update(value, confirmation_line("Updated", "certificate", &id), output));
     }
     Ok(Some(value))
 }
@@ -5375,14 +5376,14 @@ async fn run_secrets(
             let value = client
                 .request(Method::DELETE, &encoded_path(SECRETS_PATH, &id), None)
                 .await?;
-            return Ok(report_removal(value, removal_line("Deleted", "secret", &id), output));
+            return Ok(confirm_empty(value, &confirmation_line("Deleted", "secret", &id), output));
         }
     };
     if !reveal {
         mask_keys(&mut value, &["value"]);
     }
     if let Some(id) = updated {
-        return Ok(report_update(value, removal_line("Updated", "secret", &id), output));
+        return Ok(report_update(value, confirmation_line("Updated", "secret", &id), output));
     }
     Ok(Some(value))
 }
@@ -5409,7 +5410,7 @@ async fn run_delegation_vault(
             let value = client
                 .request(Method::DELETE, &encoded_path(DELEGATION_VAULT_PATH, &id), None)
                 .await?;
-            Ok(report_removal(value, removal_line("Revoked", "grant", &id), output))
+            Ok(confirm_empty(value, &confirmation_line("Revoked", "grant", &id), output))
         }
         // A mass revoke answers with `{"revoked": N}`. Table output says how
         // many went in one line and `--output json` keeps the answer.
@@ -5684,22 +5685,6 @@ fn is_uuid(value: &str) -> bool {
                 8 | 13 | 18 | 23 => byte == b'-',
                 _ => byte.is_ascii_hexdigit(),
             })
-}
-
-/// Reports a removal the gateway answered with an empty body. Table output
-/// prints the confirmation line and has nothing to print afterwards. JSON
-/// output keeps the `null` that body parses to, and an answer with content is
-/// passed on untouched in both modes.
-fn report_removal(
-    value: Value,
-    line: String,
-    output: Output,
-) -> Option<Value> {
-    if value.is_null() && matches!(output, Output::Table) {
-        println!("{line}");
-        return None;
-    }
-    Some(value)
 }
 
 /// Reports an update by the resolved id. Table output prints the confirmation
@@ -7832,7 +7817,7 @@ async fn run_api_keys(
             let value = client
                 .request(Method::GET, &path, None)
                 .await?;
-            print_api_keys(&value, output)
+            print_api_keys(&value, output, agent_id.is_some())
         }
         ApiKeyCommand::Get { key_id, surface } => {
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
@@ -7859,7 +7844,7 @@ async fn run_api_keys(
             let value = client
                 .request(Method::POST, &path, Some(json!({"actor": actor})))
                 .await?;
-            print_outcome(&value, output, &removal_line("Revoked", "API key", &key_id))
+            print_outcome(&value, output, &confirmation_line("Revoked", "API key", &key_id))
         }
         ApiKeyCommand::Rotate { key_id, surface, actor } => {
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
@@ -7874,7 +7859,7 @@ async fn run_api_keys(
             let value = client
                 .request(Method::DELETE, &api_key_path(&agent_id, &key_id), None)
                 .await?;
-            print_outcome(&value, output, &removal_line("Deleted", "API key", &key_id))
+            print_outcome(&value, output, &confirmation_line("Deleted", "API key", &key_id))
         }
     }
 }
@@ -7939,12 +7924,16 @@ fn surfaces_carrying_key<'a>(
 
 /// Prints the outcome of a delete or an update: the confirmation line in table
 /// mode, even when the gateway sent a document back, and the gateway's own
-/// answer with `--output json`.
+/// answer with `--output json`. A document that says it did not happen
+/// (`deleted` or `success` set to false) is printed instead of the line.
 fn print_outcome(
     value: &Value,
     output: Output,
     confirmation: &str,
 ) -> Result<()> {
+    if says_it_did_not_happen(value) {
+        return print_value(value, output);
+    }
     match outcome_line(output, confirmation) {
         Some(line) => {
             println!("{line}");
@@ -7952,6 +7941,13 @@ fn print_outcome(
         }
         None => print_value(value, output),
     }
+}
+
+/// Whether a gateway answer reports that the change was not made.
+fn says_it_did_not_happen(value: &Value) -> bool {
+    ["deleted", "success"]
+        .iter()
+        .any(|key| value.get(*key) == Some(&Value::Bool(false)))
 }
 
 /// Chooses what a delete or revoke puts on standard output, whether the
@@ -8016,8 +8012,14 @@ fn print_api_key_secret(
 fn print_api_keys(
     value: &Value,
     output: Output,
+    filtered: bool,
 ) -> Result<()> {
-    print_list(value, output, &tables::API_KEYS)
+    let scope = if filtered {
+        Scope::Filtered
+    } else {
+        Scope::All
+    };
+    print_list(value, output, &tables::API_KEYS, scope)
 }
 
 async fn run_tenant_ownership(
@@ -8917,11 +8919,11 @@ mod identity_access_tests {
     }
 
     #[test]
-    fn a_removal_line_keeps_a_typed_id_on_one_line_and_whole() {
-        assert_eq!(removal_line("Deleted", "issuer", "a\nb\tc\rd"), "Deleted issuer 'a b c d'");
+    fn a_confirmation_line_keeps_a_typed_id_on_one_line_and_whole() {
+        assert_eq!(confirmation_line("Deleted", "issuer", "a\nb\tc\rd"), "Deleted issuer 'a b c d'");
 
         let long = "i".repeat(800);
-        assert_eq!(removal_line("Revoked", "grant", &long), format!("Revoked grant '{long}'"));
+        assert_eq!(confirmation_line("Revoked", "grant", &long), format!("Revoked grant '{long}'"));
     }
 
     #[test]
@@ -9009,7 +9011,6 @@ mod identity_access_tests {
             (vec!["integrations", "create", "-f", "x"], "integration"),
             (vec!["identities", "create"], "identity"),
             (vec!["jwt-verification-strategies", "create", "-f", "x"], "JWT verification strategy"),
-            (vec!["tokens", "create", "--name", "n"], "access token"),
         ] {
             let mut full = vec!["fabric", "agent-gateway"];
             full.extend(&arguments);
@@ -9117,11 +9118,12 @@ mod identity_access_tests {
     }
 }
 
-/// Runs an `access-tokens` command and prints the result. `list` renders a
-/// table and `revoke` prints a confirmation for the default table output, while
-/// `get`/`create`/`rotate` reuse the shared value printer and `scopes` prints one
-/// grantable scope per line. `--output json` always emits the raw gateway
-/// response (or, for `scopes`, the filtered scope array).
+/// Runs an `access-tokens` command and prints the result. `list` renders the
+/// shared table, `revoke` prints a confirmation line, `create` and `rotate`
+/// print the new secret alone with their confirmation on standard error, `get`
+/// uses the shared value printer and `scopes` prints one grantable scope per
+/// line. `--output json` always emits the raw gateway response (or, for
+/// `scopes`, the filtered scope array).
 async fn run_access_tokens(
     client: &GatewayClient,
     command: AccessTokenCommand,
@@ -9142,7 +9144,9 @@ async fn run_access_tokens(
             let value = client
                 .request(Method::DELETE, &entity_path("/v1/access-tokens", &args.id), None)
                 .await?;
-            print_json_or_else(&value, output, || println!("{}", removal_line("Revoked", "access token", &args.id)))?;
+            print_json_or_else(&value, output, || {
+                println!("{}", confirmation_line("Revoked", "access token", &args.id))
+            })?;
         }
         AccessTokenCommand::Rotate(args) => {
             if !args.yes
@@ -9304,7 +9308,7 @@ fn print_access_token_table(value: &Value) {
         .iter()
         .map(access_token_entry)
         .collect();
-    print_rows(&tables::TOKENS, &entries);
+    print_rows(&tables::TOKENS, &entries, Scope::All);
 }
 
 /// A token as the cells of [`tables::TOKENS`]: the status and the scope
@@ -10223,7 +10227,21 @@ async fn run_audit(
     let response = audit_document(response, args.reveal);
     match output {
         Output::Json => println!("{}", serde_json::to_string_pretty(&response)?),
-        Output::Table => print_audit_table(&response)?,
+        Output::Table => {
+            let filtered = args.filter.is_some()
+                || args.category.is_some()
+                || args.flow.is_some()
+                || args.scope.is_some()
+                || args.decision.is_some();
+            print_audit_table(
+                &response,
+                if filtered {
+                    Scope::Filtered
+                } else {
+                    Scope::All
+                },
+            )?
+        }
     }
     Ok(())
 }
@@ -10330,18 +10348,24 @@ const EMPTY_AUDIT_NOTES: [&str; 2] = [
      except revoking delegation tokens.",
 ];
 
-fn print_audit_table(response: &Value) -> Result<()> {
-    write_audit_table(response, &mut io::stdout().lock(), &mut io::stderr().lock()).context("print the audit table")
+fn print_audit_table(
+    response: &Value,
+    scope: Scope,
+) -> Result<()> {
+    write_audit_table(response, &mut io::stdout().lock(), &mut io::stderr().lock(), scope)
+        .context("print the audit table")
 }
 
 /// Writes the events to `rows` as the shared audit table, or, for an empty
-/// result, "No audit events yet." to `rows` and [`EMPTY_AUDIT_NOTES`] to `notes`,
+/// result, "No audit events yet." (or "No matching audit events." when a filter
+/// was given) to `rows` and [`EMPTY_AUDIT_NOTES`] to `notes`,
 /// so piped output stays clean. `rows` is standard output and `notes` standard
 /// error.
 fn write_audit_table(
     response: &Value,
     rows: &mut impl io::Write,
     notes: &mut impl io::Write,
+    scope: Scope,
 ) -> io::Result<()> {
     let events: Vec<Value> = response
         .get("events")
@@ -10351,7 +10375,7 @@ fn write_audit_table(
         .iter()
         .map(audit_row)
         .collect();
-    for line in tables::render_list(&tables::AUDIT, &events) {
+    for line in tables::render_scoped(&tables::AUDIT, &events, scope) {
         writeln!(rows, "{line}")?;
     }
     if events.is_empty() {
@@ -10547,7 +10571,14 @@ async fn list_payments(
                 .iter()
                 .map(payment_row_with_iso_time)
                 .collect();
-            print_rows(&tables::PAYMENTS, &shown);
+            let scope = if !absent.is_empty() || !failed.is_empty() {
+                Scope::Partial
+            } else if args.surface.is_some() || args.status.is_some() {
+                Scope::Filtered
+            } else {
+                Scope::All
+            };
+            print_rows(&tables::PAYMENTS, &shown, scope);
             for footer in &footers {
                 eprintln!("note: {footer}");
             }
@@ -10628,7 +10659,7 @@ async fn delete_payment(
         // The gateway answers 204 with no body, which would otherwise print
         // `null` where a reader expects a result.
         Output::Table => {
-            println!("{}", removal_line("Deleted", "x402 payment", id));
+            println!("{}", confirmation_line("Deleted", "x402 payment", id));
             Ok(())
         }
         // Mirror `GatewayClient::request`, which reports an empty body as a
@@ -11297,7 +11328,7 @@ mod observability_tests {
     /// standard error.
     fn audit_table(response: &Value) -> (String, String) {
         let (mut rows, mut notes) = (Vec::new(), Vec::new());
-        write_audit_table(response, &mut rows, &mut notes).expect("write to memory");
+        write_audit_table(response, &mut rows, &mut notes, Scope::All).expect("write to memory");
         (String::from_utf8(rows).expect("UTF-8 rows"), String::from_utf8(notes).expect("UTF-8 notes"))
     }
 
@@ -12459,11 +12490,13 @@ fn shown_once_notice(kind: &str) -> String {
 }
 
 /// Prints the answer to a create or a rotate. Table output is the confirmation
-/// line, `Created surface '<id>'`, taking the id from the answer or else from
-/// `requested_id`, then the secret the answer carries in `secret_field` (a
-/// token or key the user has to keep), on a line of its own. `--output json`
-/// prints the answer as it is, and an answer with neither an id nor a secret
-/// is printed as the shared printer would.
+/// line, `Created surface '<id>'`, using `requested_id` when the command knows
+/// the id and else the one in the answer. When the answer carries a secret in
+/// `secret_field` (a token or key the user has to keep), standard output is
+/// that secret alone and the confirmation goes to standard error. A secret
+/// with control characters is refused. `--output json` prints the answer as it
+/// is, and an answer with neither an id nor a secret is printed as the shared
+/// printer would.
 fn print_issued(
     value: &Value,
     output: Output,
@@ -12475,6 +12508,15 @@ fn print_issued(
     let secret = secret_field
         .and_then(|field| value.get(field))
         .and_then(Value::as_str);
+    if matches!(output, Output::Table)
+        && secret.is_some_and(|secret| {
+            secret
+                .chars()
+                .any(char::is_control)
+        })
+    {
+        bail!("the {kind} secret contains control characters, which are not safe to print; read it with --output json");
+    }
     // The reminder goes to standard error in both modes, so it never touches
     // what a script reads from standard output.
     if secret.is_some() {
@@ -12483,12 +12525,19 @@ fn print_issued(
     if matches!(output, Output::Json) {
         return print_value(value, output);
     }
-    let id = id_from_response(value).or(requested_id);
+    let id = requested_id.or_else(|| id_from_response(value));
     if id.is_none() && secret.is_none() {
         return print_value(value, output);
     }
+    // A secret goes alone to standard output, so `$(...)` captures just that;
+    // the confirmation then moves to standard error.
     if let Some(id) = id {
-        println!("{}", removal_line(verb, kind, id));
+        let line = confirmation_line(verb, kind, id);
+        if secret.is_some() {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
     }
     if let Some(secret) = secret {
         println!("{secret}");
@@ -12504,17 +12553,14 @@ fn print_created_or_value(
     created: Option<&str>,
 ) -> Result<()> {
     match created {
-        Some(kind) => {
-            let secret_field = (kind == "access token").then_some("token");
-            print_issued(value, output, "Created", kind, None, secret_field)
-        }
+        Some(kind) => print_issued(value, output, "Created", kind, None, None),
         None => print_value(value, output),
     }
 }
 
 fn print_table(value: &Value) {
     match value {
-        Value::Array(rows) => print_rows(&tables::GENERIC, rows),
+        Value::Array(rows) => print_rows(&tables::GENERIC, rows, Scope::All),
         // A single entity: show the full configuration, matching the UX config view.
         Value::Object(_) => match serde_json::to_string_pretty(value) {
             Ok(text) => println!("{text}"),
@@ -12527,8 +12573,9 @@ fn print_table(value: &Value) {
 fn print_rows(
     layout: &Layout,
     rows: &[Value],
+    scope: Scope,
 ) {
-    for line in tables::render_list(layout, rows) {
+    for line in tables::render_scoped(layout, rows, scope) {
         println!("{line}");
     }
 }
@@ -12539,13 +12586,26 @@ fn print_list(
     value: &Value,
     output: Output,
     layout: &Layout,
+    scope: Scope,
 ) -> Result<()> {
     match (output, value) {
         (Output::Table, Value::Array(rows)) => {
-            print_rows(layout, rows);
+            print_rows(layout, rows, scope);
             Ok(())
         }
         _ => print_value(value, output),
+    }
+}
+
+/// Why an empty list from this command is empty: nothing exists yet, or
+/// nothing matched the filter the command was given.
+fn list_scope(command: &Command) -> Scope {
+    match command {
+        Command::Secrets {
+            command: SecretCommand::List { tag: Some(_) },
+            ..
+        } => Scope::Filtered,
+        _ => Scope::All,
     }
 }
 
@@ -12599,7 +12659,7 @@ fn delete_confirmation(command: &Command) -> Option<String> {
         } => ("user", user_id),
         Command::Identities {
             command: IdentityCommand::Deactivate { id },
-        } => return Some(removal_line("Deactivated", "identity", id)),
+        } => return Some(confirmation_line("Deactivated", "identity", id)),
         Command::Surfaces {
             command: SurfaceCommand::Delete { surface_id },
         } => ("surface", surface_id),
@@ -12644,13 +12704,13 @@ fn delete_confirmation(command: &Command) -> Option<String> {
         } => ("JWT verification strategy", id),
         _ => return None,
     };
-    Some(removal_line("Deleted", kind, id))
+    Some(confirmation_line("Deleted", kind, id))
 }
 
 /// The one line every delete, revoke, create or update prints in table mode,
 /// such as `Deleted issuer 'i-1'`. The id may be what the user typed, so it is
 /// cleaned with [`tables::flatten`] and never cut.
-fn removal_line(
+fn confirmation_line(
     verb: &str,
     kind: &str,
     id: &str,
@@ -12658,7 +12718,8 @@ fn removal_line(
     format!("{verb} {kind} '{}'", tables::flatten(id))
 }
 
-/// The kind a create command makes, named as the delete lines name it.
+/// The kind a shared create command makes, named as the delete lines name it.
+/// Access token and API key creates print themselves.
 fn create_kind(command: &Command) -> Option<&'static str> {
     Some(match command {
         Command::Surfaces {
@@ -12714,9 +12775,6 @@ fn create_kind(command: &Command) -> Option<&'static str> {
         Command::JwtVerificationStrategies {
             command: JwtStrategyCommand::Crud(CrudCommand::Create(_)),
         } => "JWT verification strategy",
-        Command::AccessTokens {
-            command: AccessTokenCommand::Create(_),
-        } => "access token",
         _ => return None,
     })
 }
@@ -12776,9 +12834,15 @@ fn update_confirmation(command: &Command) -> Option<String> {
         Command::Identities {
             command: IdentityCommand::Update { id, .. },
         } => ("identity", id),
+        Command::Surfaces {
+            command: SurfaceCommand::AddFeature(AddFeatureArgs { surface_id, .. }),
+        }
+        | Command::Surfaces {
+            command: SurfaceCommand::RemoveFeature(FeaturePlacementArgs { surface_id, .. }),
+        } => ("surface", surface_id),
         _ => return None,
     };
-    Some(removal_line("Updated", kind, id))
+    Some(confirmation_line("Updated", kind, id))
 }
 
 #[cfg(test)]

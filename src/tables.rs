@@ -21,6 +21,17 @@ pub struct Column {
     when_empty: &'static str,
 }
 
+/// Why a list came back empty, which decides the line printed for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Nothing was asked for but everything: an empty list means none yet.
+    All,
+    /// A filter was given: an empty list means nothing matched it.
+    Filtered,
+    /// Some of the sources failed: an empty list means nothing came back.
+    Partial,
+}
+
 /// The columns of one resource's list, and what to print when it is empty.
 pub struct Layout {
     empty: &'static str,
@@ -350,12 +361,23 @@ pub static CONNECTION_SETTINGS: Layout = Layout {
 /// Renders a list as a header row and one row per entry, or the layout's
 /// "nothing yet" line when the list is empty. Rows that are not objects are
 /// printed as they are, one per line.
+#[cfg(test)]
 pub fn render_list(
     layout: &Layout,
     rows: &[Value],
 ) -> Vec<String> {
+    render_scoped(layout, rows, Scope::All)
+}
+
+/// Like [`render_list`], with the empty line worded for why the list is empty:
+/// `No secrets yet.`, `No matching secrets.` or `No secrets returned.`
+pub fn render_scoped(
+    layout: &Layout,
+    rows: &[Value],
+    scope: Scope,
+) -> Vec<String> {
     if rows.is_empty() {
-        return vec![layout.empty.to_owned()];
+        return vec![empty_line(layout, scope)];
     }
     if rows
         .iter()
@@ -506,6 +528,21 @@ fn value_text(value: &Value) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+fn empty_line(
+    layout: &Layout,
+    scope: Scope,
+) -> String {
+    let noun = layout
+        .empty
+        .strip_prefix("No ")
+        .and_then(|rest| rest.strip_suffix(" yet."));
+    match (scope, noun) {
+        (Scope::Filtered, Some(noun)) => format!("No matching {noun}."),
+        (Scope::Partial, Some(noun)) => format!("No {noun} returned."),
+        _ => layout.empty.to_owned(),
+    }
+}
+
 fn list_text(items: &[Value]) -> String {
     let names: Vec<String> = items
         .iter()
@@ -522,8 +559,12 @@ fn list_text(items: &[Value]) -> String {
             _ => None,
         })
         .collect();
+    let unnamed = items.len() - names.len();
     if names.is_empty() && !items.is_empty() {
         return format!("{} items", items.len());
+    }
+    if unnamed > 0 {
+        return format!("{} +{unnamed} more", names.join(","));
     }
     names.join(",")
 }
@@ -724,6 +765,23 @@ mod tests {
             .map(str::trim)
             .filter(|cell| !cell.is_empty())
             .collect()
+    }
+
+    #[test]
+    fn an_empty_list_is_worded_for_why_it_is_empty() {
+        assert_eq!(render_scoped(&SECRETS, &[], Scope::All), ["No secrets yet."]);
+        assert_eq!(render_scoped(&SECRETS, &[], Scope::Filtered), ["No matching secrets."]);
+        assert_eq!(render_scoped(&PAYMENTS, &[], Scope::Partial), ["No payments returned."]);
+        assert_eq!(render_scoped(&AUDIT, &[], Scope::Filtered), ["No matching audit events."]);
+    }
+
+    #[test]
+    fn a_mixed_list_shows_the_names_and_counts_the_rest() {
+        let rows = [
+            json!({"id": "s", "name": "n", "transit": {"points": [{"alias": "gh"}, {"x": 1}, {"alias": "slack"}, {"y": 2}]}}),
+        ];
+
+        assert!(render_list(&SURFACES, &rows)[1].ends_with("gh,slack +2 more"));
     }
 
     #[test]

@@ -62,6 +62,32 @@ fn fabric(
                     Ok(read) => request.extend_from_slice(&chunk[..read]),
                 }
             }
+            // Read the whole request body before answering, so a reply never
+            // races a client that is still sending.
+            let head_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map_or(request.len(), |position| position + 4);
+            let wanted = String::from_utf8_lossy(&request[..head_end])
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| {
+                            value
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() < head_end + wanted {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
             let text = String::from_utf8_lossy(&request).into_owned();
             let mut line = text
                 .lines()
@@ -654,7 +680,14 @@ fn creating_an_access_token_prints_the_confirmation_then_the_token_and_a_note() 
     let table = fabric(routes(), &["tokens", "create", "--name", "ci"]);
     let json = fabric(routes(), &["-o", "json", "tokens", "create", "--name", "ci"]);
 
-    assert_eq!(table.stdout, "Created access token 't-1'\nagpat_secret\n");
+    assert_eq!(table.stdout, "agpat_secret\n");
+    assert!(
+        table
+            .stderr
+            .contains("Created access token 't-1'"),
+        "{}",
+        table.stderr
+    );
     assert!(
         table
             .stderr
@@ -674,7 +707,14 @@ fn rotating_an_access_token_names_it_and_prints_the_new_token() {
         &["tokens", "rotate", "t-1", "--yes"],
     );
 
-    assert_eq!(table.stdout, "Rotated access token 't-1'\nagpat_new\n");
+    assert_eq!(table.stdout, "agpat_new\n");
+    assert!(
+        table
+            .stderr
+            .contains("Rotated access token 't-1'"),
+        "{}",
+        table.stderr
+    );
 }
 
 #[test]
@@ -687,8 +727,22 @@ fn creating_and_rotating_an_api_key_print_the_confirmation_then_the_secret() {
     let rotate = fabric(rotate_routes(), &["api-keys", "rotate", "k-1", "--agent-id", "s-1"]);
     let json = fabric(create_routes(), &["-o", "json", "api-keys", "create", "s-1", "--client-id", "billing"]);
 
-    assert_eq!(create.stdout, "Created API key 'k-1'\nsk_live\n");
-    assert_eq!(rotate.stdout, "Rotated API key 'k-1'\nsk_live\n");
+    assert_eq!(create.stdout, "sk_live\n");
+    assert_eq!(rotate.stdout, "sk_live\n");
+    assert!(
+        create
+            .stderr
+            .contains("Created API key 'k-1'"),
+        "{}",
+        create.stderr
+    );
+    assert!(
+        rotate
+            .stderr
+            .contains("Rotated API key 'k-1'"),
+        "{}",
+        rotate.stderr
+    );
     assert!(
         create
             .stderr
@@ -931,5 +985,164 @@ fn updating_a_surface_by_name_prints_the_resolved_id() {
             .contains("note: using surface s-1 (Sales)"),
         "{}",
         out.stderr
+    );
+}
+
+#[test]
+fn an_api_key_line_names_the_key_even_when_the_answer_has_other_ids_inside() {
+    let created = r#"{"labels":{"id":"label-1"},"issuer":{"id":"issuer-1"},"key_id":"k-1","secret":"sk_live"}"#;
+    let create = fabric(
+        vec![reply("POST", "/v1/api-keys/s-1", "200 OK", created)],
+        &["api-keys", "create", "s-1", "--client-id", "billing"],
+    );
+    let rotate = fabric(
+        vec![reply("POST", "/v1/api-keys/s-1/k-1/rotate", "200 OK", created)],
+        &["api-keys", "rotate", "k-1", "--agent-id", "s-1"],
+    );
+    let token = fabric(
+        vec![reply(
+            "POST",
+            "/v1/access-tokens/t-1/rotate",
+            "200 OK",
+            r#"{"issuer":{"id":"issuer-1"},"token":"agpat_new"}"#,
+        )],
+        &["tokens", "rotate", "t-1", "--yes"],
+    );
+
+    assert!(
+        create
+            .stderr
+            .contains("Created API key 'k-1'"),
+        "{}",
+        create.stderr
+    );
+    assert!(
+        rotate
+            .stderr
+            .contains("Rotated API key 'k-1'"),
+        "{}",
+        rotate.stderr
+    );
+    assert!(
+        token
+            .stderr
+            .contains("Rotated access token 't-1'"),
+        "{}",
+        token.stderr
+    );
+}
+
+#[test]
+fn a_secret_with_control_characters_is_refused_in_table_mode_but_kept_in_json() {
+    let answer = r#"{"id":"t-1","token":"agpat_\u001b[31mred"}"#;
+    let routes = || vec![reply("POST", "/v1/access-tokens", "200 OK", answer)];
+
+    let table = fabric(routes(), &["tokens", "create", "--name", "ci"]);
+    let json = fabric(routes(), &["-o", "json", "tokens", "create", "--name", "ci"]);
+
+    assert_eq!(table.stdout, "");
+    assert!(
+        table
+            .stderr
+            .contains("control characters")
+            && table
+                .stderr
+                .contains("--output json"),
+        "{}",
+        table.stderr
+    );
+    assert!(json.stdout.contains("agpat_"), "{}", json.stdout);
+}
+
+#[test]
+fn an_empty_list_names_why_it_is_empty() {
+    let secrets =
+        fabric(vec![reply("GET", "/v1/secrets/tag/prod", "200 OK", "[]")], &["secrets", "list", "--tag", "prod"]);
+    let all_secrets = fabric(vec![reply("GET", "/v1/secrets", "200 OK", "[]")], &["secrets", "list"]);
+    let audit = fabric(
+        vec![reply("GET", "/v1/audit", "200 OK", r#"{"events":[],"total":0}"#)],
+        &["audit", "list", "--decision", "deny"],
+    );
+    let payments = fabric(
+        vec![reply("GET", "/admin/x402/transactions", "200 OK", r#"{"verifications":[]}"#)],
+        &["payments", "list", "--store", "x402", "--status", "failed"],
+    );
+    let keys =
+        fabric(vec![reply("GET", "/v1/api-keys/s-1", "200 OK", "[]")], &["api-keys", "list", "--agent-id", "s-1"]);
+
+    assert_eq!(secrets.stdout, "No matching secrets.\n");
+    assert_eq!(all_secrets.stdout, "No secrets yet.\n");
+    assert_eq!(audit.stdout, "No matching audit events.\n");
+    assert_eq!(payments.stdout, "No matching payments.\n");
+    assert_eq!(keys.stdout, "No matching API keys.\n");
+}
+
+#[test]
+fn payments_with_a_failing_store_say_none_were_returned() {
+    let out = fabric(
+        vec![
+            reply("GET", "/admin/x402/transactions", "200 OK", r#"{"verifications":[]}"#),
+            reply("GET", "/admin/mpp/transactions", "500 Internal Server Error", r#"{"error":"down"}"#),
+        ],
+        &["payments", "list"],
+    );
+
+    assert_eq!(out.stdout, "No payments returned.\n");
+    assert!(
+        out.stderr
+            .contains("warning:"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_delete_body_that_says_it_did_not_happen_is_printed() {
+    let body = r#"{"deleted":false,"reason":"in use"}"#;
+    let out = fabric(
+        vec![reply("GET", "/v1/surfaces", "200 OK", SURFACES), reply("DELETE", "/v1/surfaces/s-1", "200 OK", body)],
+        &["surfaces", "delete", "s-1"],
+    );
+
+    assert!(
+        out.stdout
+            .contains("\"reason\": \"in use\""),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout
+            .contains("Deleted surface"),
+        "{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn adding_and_removing_a_feature_print_one_line_in_table_mode() {
+    let bare = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
+    let limited = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales","rate_limit":{"requests":10,"window_secs":60}},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
+    let routes = |current: &'static str| {
+        vec![
+            reply("GET", "/v1/surfaces", "200 OK", SURFACES),
+            reply("GET", "/v1/surfaces/s-1", "200 OK", current),
+            reply("PATCH", "/v1/surfaces/s-1", "200 OK", current),
+        ]
+    };
+
+    let added = fabric(
+        routes(bare),
+        &["surfaces", "add-feature", "s-1", "rate-limit", "--json", r#"{"requests":10,"window_secs":60}"#],
+    );
+    let removed = fabric(routes(limited), &["surfaces", "remove-feature", "s-1", "rate-limit"]);
+    let json = fabric(routes(limited), &["-o", "json", "surfaces", "remove-feature", "s-1", "rate-limit"]);
+
+    assert_eq!(added.stdout, "Updated surface 's-1'\n", "{}", added.stderr);
+    assert_eq!(removed.stdout, "Updated surface 's-1'\n", "{}", removed.stderr);
+    assert!(
+        json.stdout
+            .contains("\"surface_id\": \"s-1\""),
+        "{}",
+        json.stdout
     );
 }
