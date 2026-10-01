@@ -633,6 +633,16 @@ enum SurfaceCommand {
     /// list with only their items changed (a change someone else makes to
     /// that list between the read and the write is overwritten), and the
     /// edited surface is checked for its required fields before it is sent.
+    ///
+    /// To change one tool pattern without retyping its gate, put the gate's
+    /// id (or name) in square brackets, and quote the flag so the shell leaves
+    /// the brackets alone. The CLI sends the surface's whole gates list, or
+    /// the whole transit.points list for a transit point, so a change someone
+    /// else makes to that list between the read and the write is overwritten:
+    ///
+    ///   --add 'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
+    ///
+    ///   --remove 'transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
     #[command(group(ArgGroup::new("change").required(true).multiple(true).args(["file", "set", "unset", "add", "remove"])))]
     Update {
         /// Surface ID or name (see `fabric agent-gateway surfaces list`).
@@ -654,14 +664,20 @@ enum SurfaceCommand {
         /// Add one item to a list, as the list's dot path and the item, read
         /// the same way as a --set value (`tags=beta`,
         /// `access_point.trust_check_list='{"id":"tc-1",...}'`). An item
-        /// already in the list is refused. Repeatable.
+        /// already in the list is refused. To add one tool pattern to a gate,
+        /// name the gate in brackets:
+        /// `'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'`.
+        /// Repeatable.
         #[arg(long, value_name = "PATH=ITEM")]
         add: Vec<String>,
         /// Remove one item from a list, named by its value for a list of text
         /// (`tags=beta`) and for a list of objects by its `id`, else its
         /// `alias` (`transit.points=billing`), else some of its fields as JSON.
         /// Removes run before adds, so removing an item and adding it back
-        /// replaces it. Repeatable.
+        /// replaces it. To remove one tool pattern from a gate, name the gate
+        /// in brackets, on a transit point too:
+        /// `'transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns=fs_.*'`.
+        /// Repeatable.
         #[arg(long, value_name = "PATH=ITEM")]
         remove: Vec<String>,
         /// Check the change with the gateway and show what it would change,
@@ -3125,6 +3141,101 @@ mod gateway_config_tests {
 
     const READ_AND_DRY_RUN: [&str; 2] =
         ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1?dry_run=true HTTP/1.1"];
+
+    const PATTERN_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000","mcp_tool_gating":{"default_effect":"allow","gates":[{"id":"g-1","name":"files","action":{"effect":"deny","patterns":["fs_.*"]}},{"id":"g-2","action":{"effect":"deny","patterns":["rm_.*"]}}]}},"transit":{"points":[{"id":"tp-1","alias":"gh","mcp_tool_gating":{"gates":[{"id":"tg-1","action":{"effect":"deny","patterns":["push_.*"]}}]}}]}}"#;
+
+    const ADD_OWN_PATTERN: &str = "target.mcp_tool_gating.gates[g-1].action.patterns=shell_.*";
+
+    /// What the patch for `ADD_OWN_PATTERN` holds: the surface's gates, with
+    /// only the first gate's patterns changed.
+    fn own_pattern_patch() -> Value {
+        json!({"target": {"mcp_tool_gating": {"gates": [
+            {"id": "g-1", "name": "files", "action": {"effect": "deny", "patterns": ["fs_.*", "shell_.*"]}},
+            {"id": "g-2", "action": {"effect": "deny", "patterns": ["rm_.*"]}}
+        ]}}})
+    }
+
+    fn body_of(request: &str) -> Value {
+        let body = request
+            .split_once("\r\n\r\n")
+            .expect("request body")
+            .1;
+        serde_json::from_str(body).expect("patch body is JSON")
+    }
+
+    #[tokio::test]
+    async fn a_pattern_swap_on_a_transit_point_gate_sends_the_transit_point_list() {
+        let requests = feature_dry_run(
+            &[
+                "update",
+                "s-1",
+                "--add",
+                "transit.points[gh].mcp_tool_gating.gates[tg-1].action.patterns=pull_.*",
+                "--remove",
+                "transit.points[gh].mcp_tool_gating.gates[tg-1].action.patterns=push_.*",
+            ],
+            PATTERN_SURFACE,
+        )
+        .await
+        .expect("the pattern should be swapped");
+
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"id": "tp-1", "alias": "gh", "mcp_tool_gating": {"gates": [
+                {"id": "tg-1", "action": {"effect": "deny", "patterns": ["pull_.*"]}}
+            ]}}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_tool_pattern_edit_sends_nothing_after_the_read() {
+        let (host, requests) = scripted_server(vec![(DRY_RUN_GATEWAY_OK, PATTERN_SURFACE)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let edit = "target.mcp_tool_gating.gates[g-9].action.patterns=a";
+        let command = surface_command(&["fabric", "agent-gateway", "surfaces", "update", "s-1", "--add", edit]);
+
+        let error = run_surfaces(&client, command, Output::Json)
+            .await
+            .expect_err("the edit should be refused");
+
+        assert!(format!("{error:#}").contains("the gates are g-1, g-2"), "{error:#}");
+        assert_eq!(request_lines(requests), [S1_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn a_tool_pattern_dry_run_sends_only_that_gates_list_as_a_dry_run() {
+        let requests = feature_dry_run(&["update", "s-1", "--add", ADD_OWN_PATTERN], PATTERN_SURFACE)
+            .await
+            .expect("the dry run should succeed");
+
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(patch_body(&requests), own_pattern_patch());
+    }
+
+    #[tokio::test]
+    async fn a_tool_pattern_is_saved_to_a_surface_picked_by_name() {
+        let (host, requests) = scripted_server(vec![
+            LIST_OK,
+            (DRY_RUN_GATEWAY_OK, PATTERN_SURFACE),
+            ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1"}"#),
+        ])
+        .await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command = resolve_surface_command(
+            &client,
+            surface_command(&["fabric", "agent-gateway", "surfaces", "update", "Sales", "--add", ADD_OWN_PATTERN]),
+        )
+        .await
+        .expect("the surface should resolve");
+
+        run_surfaces(&client, command, Output::Json)
+            .await
+            .expect("the pattern should be saved");
+
+        let requests = full_requests(requests);
+        assert_eq!(start_lines(&requests), [LIST_REQUEST, S1_REQUEST, "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]);
+        assert_eq!(body_of(&requests[2]), own_pattern_patch());
+    }
 
     #[tokio::test]
     async fn add_feature_finds_the_surface_wide_place_for_tool_gating_with_no_flags() {

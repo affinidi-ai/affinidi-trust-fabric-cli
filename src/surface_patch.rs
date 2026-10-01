@@ -4,8 +4,10 @@
 //! Nothing here talks to the gateway, so the patch can be checked before it is
 //! sent.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
+
+use crate::{client::sanitize_for_terminal, tool_gate_preview};
 
 /// One field a flag edits: the dot path as the user wrote it, split into its
 /// keys, and the value the patch gives it (`null` for `--unset`).
@@ -28,6 +30,14 @@ struct Edit<'a> {
 /// removes applied before adds so removing an item and adding it back
 /// replaces it. Paths that repeat or overlap each other are refused, because
 /// one would silently undo the other.
+///
+/// A gate's patterns can be edited without resending the gate by naming the
+/// gate by its `id`, else its `name`, in square brackets: `--add
+/// 'target.mcp_tool_gating.gates[g-1].action.patterns=^fs_'`. A transit point
+/// is named the same way, by `id` else `alias`
+/// (`transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns`).
+/// The pattern is always text, and the patch holds the surrounding list with
+/// only that gate's patterns changed.
 pub fn build_patch(
     sets: &[String],
     unsets: &[String],
@@ -116,6 +126,12 @@ fn parse_path<'a>(
     if path.is_empty() {
         bail!("{flag} needs a field path, such as target.endpoint");
     }
+    if path.contains('[') {
+        bail!(
+            "{flag} can't use brackets in '{path}': brackets only work with --add and --remove on a gate's patterns, \
+             such as --add 'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'"
+        );
+    }
     let keys: Vec<&str> = path.split('.').collect();
     if keys
         .iter()
@@ -158,11 +174,16 @@ fn list_edits<'a>(
     surface: &Value,
 ) -> Result<Vec<Edit<'a>>> {
     let mut changes: Vec<ListChange<'a>> = Vec::new();
+    let mut pattern_edits: Vec<PatternEdit<'a>> = Vec::new();
     for (flags, flag, is_add) in [(removes, "--remove", false), (adds, "--add", true)] {
         for given in flags {
-            let Some((path, raw)) = given.split_once('=') else {
+            let Some((path, raw)) = split_flag(given) else {
                 bail!("{flag} '{given}' needs an item: use {flag} <path>=<item>");
             };
+            if path.contains('[') {
+                pattern_edits.push(parse_pattern_edit(path, raw, flag, is_add)?);
+                continue;
+            }
             let keys = parse_path(path, flag)?;
             let item = ListItem { raw, value: parse_value(raw) };
             let change = match changes
@@ -196,7 +217,7 @@ fn list_edits<'a>(
             items.push(item);
         }
     }
-    changes
+    let mut edits = changes
         .into_iter()
         .map(|change| {
             let list = edited_list(&change, surface)?;
@@ -206,7 +227,379 @@ fn list_edits<'a>(
                 value: Value::Array(list),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    edits.extend(pattern_list_edits(&pattern_edits, surface)?);
+    Ok(edits)
+}
+
+/// Split an `--add` or `--remove` flag at its first `=` outside square
+/// brackets, so an item named as `gates[g=1]` keeps its `=`. A bracket that is
+/// never closed splits at the first `=`, and the path is refused later.
+fn split_flag(given: &str) -> Option<(&str, &str)> {
+    let mut inside = false;
+    for (index, c) in given.char_indices() {
+        match c {
+            '[' => inside = true,
+            ']' => inside = false,
+            '=' if !inside => return Some((&given[..index], &given[index + 1..])),
+            _ => {}
+        }
+    }
+    given.split_once('=')
+}
+
+/// Where a gate sits: on the surface itself or on one transit point, named by
+/// its `id` or `alias`.
+type GateOwner<'a> = Option<&'a str>;
+
+/// One `--add` or `--remove` of one tool pattern on one gate.
+struct PatternEdit<'a> {
+    owner: GateOwner<'a>,
+    gate: &'a str,
+    /// The pattern as the gateway keeps it, without surrounding spaces.
+    pattern: &'a str,
+    is_add: bool,
+}
+
+/// The path segments of `path`, each a field name and the item picked in
+/// square brackets, as in `gates[g-1]`. `None` where a bracket is not closed,
+/// is empty or is not followed by a `.`.
+fn split_segments(path: &str) -> Option<Vec<(&str, Option<&str>)>> {
+    let mut segments = Vec::new();
+    let mut rest = path;
+    loop {
+        let end = rest
+            .find(['.', '['])
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        if name.is_empty() {
+            return None;
+        }
+        rest = &rest[end..];
+        let mut picked = None;
+        if let Some(inner) = rest.strip_prefix('[') {
+            let close = inner.find(']')?;
+            picked = Some(&inner[..close]).filter(|picked| !picked.is_empty());
+            picked?;
+            rest = &inner[close + 1..];
+        }
+        segments.push((name, picked));
+        if rest.is_empty() {
+            return Some(segments);
+        }
+        rest = rest.strip_prefix('.')?;
+    }
+}
+
+/// Read a flag that names one tool pattern, as
+/// `target.mcp_tool_gating.gates[<gate id>].action.patterns` or
+/// `transit.points[<id or alias>].mcp_tool_gating.gates[<gate id>].action.patterns`.
+/// The pattern is always text, and one that is not valid is refused here.
+fn parse_pattern_edit<'a>(
+    path: &'a str,
+    raw: &'a str,
+    flag: &str,
+    is_add: bool,
+) -> Result<PatternEdit<'a>> {
+    let named = "use target.mcp_tool_gating.gates[<gate id>].action.patterns, or \
+                 transit.points[<id or alias>].mcp_tool_gating.gates[<gate id>].action.patterns for a transit point";
+    let Some(segments) = split_segments(path) else {
+        bail!("{flag} path '{path}' has a bracket that is not closed or is empty: {named}");
+    };
+    let (owner, gate) = match segments.as_slice() {
+        [("target", None), ("mcp_tool_gating", None), ("gates", Some(gate)), ("action", None), ("patterns", None)] => {
+            (None, *gate)
+        }
+        [
+            ("transit", None),
+            ("points", Some(point)),
+            ("mcp_tool_gating", None),
+            ("gates", Some(gate)),
+            ("action", None),
+            ("patterns", None),
+        ] => (Some(*point), *gate),
+        _ => bail!("{flag} can only pick a tool pattern with brackets, and '{path}' is not one: {named}"),
+    };
+    let pattern = raw.trim();
+    if is_add {
+        tool_gate_preview::check_pattern(pattern).with_context(|| format!("{flag} {path}={raw}"))?;
+    } else if pattern.is_empty() {
+        bail!("{flag} {path}= needs the pattern to remove");
+    }
+    Ok(PatternEdit { owner, gate, pattern, is_add })
+}
+
+/// One edit per list that holds a gate with a pattern change: the surface's
+/// own `gates`, and `transit.points` for gates on transit points. Each holds
+/// the whole list as it is after the change, since a merge patch replaces a
+/// list whole, and only the named gates' patterns differ from `surface`.
+fn pattern_list_edits<'a>(
+    edits: &[PatternEdit<'a>],
+    surface: &Value,
+) -> Result<Vec<Edit<'a>>> {
+    let mut found = Vec::new();
+    let own: Vec<&PatternEdit<'a>> = edits
+        .iter()
+        .filter(|edit| edit.owner.is_none())
+        .collect();
+    if !own.is_empty() {
+        let keys = vec!["target", "mcp_tool_gating", "gates"];
+        let mut gates = list_at(surface, &keys)?;
+        change_gates(&mut gates, &own, "the surface")?;
+        found.push(Edit {
+            path: "target.mcp_tool_gating.gates",
+            keys,
+            value: Value::Array(gates),
+        });
+    }
+    if edits
+        .iter()
+        .any(|edit| edit.owner.is_some())
+    {
+        let keys = vec!["transit", "points"];
+        let mut points = list_at(surface, &keys)?;
+        let resolved = edits
+            .iter()
+            .filter_map(|edit| {
+                edit.owner
+                    .map(|owner| (owner, edit))
+            })
+            .map(|(owner, edit)| Ok((find_point(&points, owner)?, owner, edit)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut done: Vec<usize> = Vec::new();
+        for &(index, owner, _) in &resolved {
+            if done.contains(&index) {
+                continue;
+            }
+            done.push(index);
+            let point_edits: Vec<&PatternEdit<'a>> = resolved
+                .iter()
+                .filter(|(other, ..)| *other == index)
+                .map(|(.., edit)| *edit)
+                .collect();
+            let mut gates = list_at(&points[index], &["mcp_tool_gating", "gates"])?;
+            change_gates(&mut gates, &point_edits, &format!("transit point '{owner}'"))?;
+            let Some(point) = points[index].as_object_mut() else {
+                bail!("transit point '{owner}' is not an object");
+            };
+            let gating = point
+                .entry("mcp_tool_gating")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Some(gating) = gating.as_object_mut() else {
+                bail!("transit point '{owner}' has an mcp_tool_gating that is not an object");
+            };
+            gating.insert("gates".to_owned(), Value::Array(gates));
+        }
+        found.push(Edit {
+            path: "transit.points",
+            keys,
+            value: Value::Array(points),
+        });
+    }
+    Ok(found)
+}
+
+/// The list found by following `keys` from `value`, empty where it is absent.
+fn list_at(
+    value: &Value,
+    keys: &[&str],
+) -> Result<Vec<Value>> {
+    let found = keys
+        .iter()
+        .try_fold(value, |value, key| value.get(key));
+    match found {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => Ok(items.clone()),
+        Some(_) => bail!("'{}' is not a list", keys.join(".")),
+    }
+}
+
+/// The index of the transit point named by its `id`, else its `alias`.
+fn find_point(
+    points: &[Value],
+    named: &str,
+) -> Result<usize> {
+    for field in ["id", "alias"] {
+        let mut found = points
+            .iter()
+            .enumerate()
+            .filter(|(_, point)| {
+                point
+                    .get(field)
+                    .and_then(Value::as_str)
+                    == Some(named)
+            })
+            .map(|(index, _)| index);
+        match (found.next(), found.next()) {
+            (Some(index), None) => return Ok(index),
+            (Some(_), Some(_)) => bail!("more than one transit point has the {field} '{named}': use its id"),
+            _ => {}
+        }
+    }
+    let known: Vec<String> = points
+        .iter()
+        .filter_map(|point| {
+            point
+                .get("alias")
+                .or_else(|| point.get("id"))
+                .and_then(Value::as_str)
+                .map(sanitize_for_terminal)
+        })
+        .collect();
+    if known.is_empty() {
+        bail!("this surface has no transit point '{named}': it has no transit points yet");
+    }
+    bail!("this surface has no transit point '{named}': the transit points are {}", known.join(", "))
+}
+
+/// The index of the gate named by its `id`, else its `name`.
+fn find_gate(
+    gates: &[Value],
+    named: &str,
+    owner: &str,
+) -> Result<usize> {
+    for field in ["id", "name"] {
+        let mut found = gates
+            .iter()
+            .enumerate()
+            .filter(|(_, gate)| {
+                gate.get(field)
+                    .and_then(Value::as_str)
+                    == Some(named)
+            })
+            .map(|(index, _)| index);
+        match (found.next(), found.next()) {
+            (Some(index), None) => return Ok(index),
+            (Some(_), Some(_)) => bail!("more than one gate on {owner} has the {field} '{named}': use its id"),
+            _ => {}
+        }
+    }
+    let known: Vec<String> = gates
+        .iter()
+        .filter_map(|gate| {
+            gate.get("id")
+                .or_else(|| gate.get("name"))
+                .and_then(Value::as_str)
+                .map(sanitize_for_terminal)
+        })
+        .collect();
+    if known.is_empty() {
+        bail!("{owner} has no tool gate '{named}': it has no tool gates yet");
+    }
+    bail!("{owner} has no tool gate '{named}': the gates are {}", known.join(", "))
+}
+
+/// Apply every pattern edit in `edits` to the gate each names in `gates`.
+/// Removes run before adds, as for any list. A pattern already in the gate or
+/// missing from it is refused, and so is a change that leaves a gate with no
+/// pattern, which the gateway does not save.
+fn change_gates(
+    gates: &mut [Value],
+    edits: &[&PatternEdit<'_>],
+    owner: &str,
+) -> Result<()> {
+    let resolved = edits
+        .iter()
+        .map(|edit| Ok((find_gate(gates, edit.gate, owner)?, *edit)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut done: Vec<usize> = Vec::new();
+    for &(index, first) in &resolved {
+        if done.contains(&index) {
+            continue;
+        }
+        done.push(index);
+        let named = first.gate;
+        let Some(action) = gates[index]
+            .get_mut("action")
+            .and_then(Value::as_object_mut)
+        else {
+            bail!("gate '{named}' on {owner} has no action to hold patterns");
+        };
+        let mut patterns = match action.get("patterns") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items.clone(),
+            Some(_) => bail!("the patterns of gate '{named}' on {owner} are not a list"),
+        };
+        for is_add in [false, true] {
+            for edit in resolved
+                .iter()
+                .filter(|(other, edit)| *other == index && edit.is_add == is_add)
+                .map(|(_, edit)| edit)
+            {
+                if resolved
+                    .iter()
+                    .take_while(|(_, other)| !std::ptr::eq(*other, *edit))
+                    .any(|(other_index, other)| {
+                        *other_index == index && other.is_add == is_add && other.pattern == edit.pattern
+                    })
+                {
+                    bail!(
+                        "{} '{}' is given more than once for gate '{named}' on {owner}",
+                        if is_add {
+                            "--add"
+                        } else {
+                            "--remove"
+                        },
+                        edit.pattern
+                    );
+                }
+                let at = patterns
+                    .iter()
+                    .position(|existing| {
+                        existing
+                            .as_str()
+                            .map(str::trim)
+                            == Some(edit.pattern)
+                    });
+                match (is_add, at) {
+                    (true, Some(_)) => bail!("gate '{named}' on {owner} already has the pattern '{}'", edit.pattern),
+                    (true, None) => patterns.push(Value::String(edit.pattern.to_owned())),
+                    (false, Some(index)) => {
+                        patterns.remove(index);
+                    }
+                    (false, None) => {
+                        bail!("gate '{named}' on {owner} has no pattern '{}'{}", edit.pattern, held(&patterns))
+                    }
+                }
+            }
+        }
+        let blank = |pattern: &Value| {
+            pattern
+                .as_str()
+                .is_some_and(|text| text.trim().is_empty())
+        };
+        if patterns.iter().all(blank) {
+            bail!(
+                "this would leave gate '{named}' on {owner} with no patterns, and the gateway does not save a gate \
+                 with none: remove the whole gate instead, such as --remove <path to gates>={named}"
+            );
+        }
+        let texts: Vec<String> = patterns
+            .iter()
+            .filter_map(|pattern| {
+                pattern
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        tool_gate_preview::check_pattern_count(&texts).with_context(|| format!("gate '{named}' on {owner}"))?;
+        action.insert("patterns".to_owned(), Value::Array(patterns));
+    }
+    Ok(())
+}
+
+/// ", it has a, b" listing the text in `patterns`, or nothing when it has none.
+fn held(patterns: &[Value]) -> String {
+    let text: Vec<String> = patterns
+        .iter()
+        .filter_map(Value::as_str)
+        .map(sanitize_for_terminal)
+        .collect();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(": it has {}", text.join(", "))
+    }
 }
 
 /// The list at `change.path` on `surface` with its removes and then its adds
@@ -972,5 +1365,409 @@ mod tests {
     fn add_or_remove_without_an_item_is_refused() {
         assert!(list_error(&["tags"], &[]).contains("needs an item"));
         assert!(list_error(&[], &["tags"]).contains("needs an item"));
+    }
+
+    const OWN: &str = "target.mcp_tool_gating.gates[g-1].action.patterns";
+    const POINT: &str = "transit.points[billing].mcp_tool_gating.gates[tg-1].action.patterns";
+
+    fn gated_surface() -> Value {
+        json!({
+            "name": "Sales",
+            "target": {"endpoint": "http://x", "mcp_tool_gating": {"default_effect": "allow", "gates": [
+                {"id": "g-1", "name": "files", "action": {"effect": "deny", "patterns": ["fs_.*", "shell_.*"]}},
+                {"id": "g-2", "name": "reads", "condition_policy_definition_id": "p-1",
+                 "action": {"effect": "allow", "patterns": ["^get_"]}}
+            ]}},
+            "transit": {"points": [
+                {"id": "tp-1", "alias": "billing", "mcp_tool_gating": {"gates": [
+                    {"id": "tg-1", "action": {"effect": "deny", "patterns": ["pay_.*"]}}
+                ]}},
+                {"id": "tp-2", "alias": "github"}
+            ]}
+        })
+    }
+
+    fn pattern_patch(
+        adds: &[&str],
+        removes: &[&str],
+    ) -> Result<Value> {
+        build_patch(&[], &[], &strings(adds), &strings(removes), &gated_surface())
+    }
+
+    fn pattern_error(
+        adds: &[&str],
+        removes: &[&str],
+    ) -> String {
+        pattern_patch(adds, removes)
+            .expect_err("the flags should be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn a_pattern_is_added_to_one_surface_wide_gate_and_nothing_else_changes() {
+        let patch = pattern_patch(&[&format!("{OWN}=db_.*")], &[]).expect("patch");
+
+        assert_eq!(
+            patch,
+            json!({"target": {"mcp_tool_gating": {"gates": [
+                {"id": "g-1", "name": "files", "action": {"effect": "deny", "patterns": ["fs_.*", "shell_.*", "db_.*"]}},
+                {"id": "g-2", "name": "reads", "condition_policy_definition_id": "p-1",
+                 "action": {"effect": "allow", "patterns": ["^get_"]}}
+            ]}}})
+        );
+    }
+
+    #[test]
+    fn a_pattern_is_added_to_a_transit_point_gate_picked_by_alias_or_id() {
+        let by_alias = pattern_patch(&[&format!("{POINT}=refund_.*")], &[]).expect("patch");
+        let by_id = pattern_patch(&["transit.points[tp-1].mcp_tool_gating.gates[tg-1].action.patterns=refund_.*"], &[])
+            .expect("patch");
+
+        assert_eq!(by_alias, by_id);
+        assert_eq!(
+            by_alias,
+            json!({"transit": {"points": [
+                {"id": "tp-1", "alias": "billing", "mcp_tool_gating": {"gates": [
+                    {"id": "tg-1", "action": {"effect": "deny", "patterns": ["pay_.*", "refund_.*"]}}
+                ]}},
+                {"id": "tp-2", "alias": "github"}
+            ]}})
+        );
+    }
+
+    #[test]
+    fn a_pattern_is_removed_from_one_gate() {
+        let patch = pattern_patch(&[], &[&format!("{OWN}=shell_.*")]).expect("patch");
+
+        assert_eq!(patch["target"]["mcp_tool_gating"]["gates"][0]["action"]["patterns"], json!(["fs_.*"]));
+        assert_eq!(
+            patch["target"]["mcp_tool_gating"]["gates"][1],
+            gated_surface()["target"]["mcp_tool_gating"]["gates"][1]
+        );
+    }
+
+    #[test]
+    fn a_pattern_is_removed_from_a_transit_point_gate() {
+        let patch = pattern_patch(&[&format!("{POINT}=x_.*")], &[&format!("{POINT}=pay_.*")]).expect("patch");
+
+        assert_eq!(patch["transit"]["points"][0]["mcp_tool_gating"]["gates"][0]["action"]["patterns"], json!(["x_.*"]));
+    }
+
+    #[test]
+    fn a_gate_is_picked_by_name_when_no_id_matches() {
+        let patch = pattern_patch(&["target.mcp_tool_gating.gates[files].action.patterns=db_.*"], &[]).expect("patch");
+
+        assert_eq!(
+            patch["target"]["mcp_tool_gating"]["gates"][0]["action"]["patterns"],
+            json!(["fs_.*", "shell_.*", "db_.*"])
+        );
+    }
+
+    #[test]
+    fn a_missing_gate_lists_the_gates_that_exist() {
+        assert_eq!(
+            pattern_error(&["target.mcp_tool_gating.gates[g-9].action.patterns=db_.*"], &[]),
+            "the surface has no tool gate 'g-9': the gates are g-1, g-2"
+        );
+        assert_eq!(
+            pattern_error(&["transit.points[billing].mcp_tool_gating.gates[nope].action.patterns=a"], &[]),
+            "transit point 'billing' has no tool gate 'nope': the gates are tg-1"
+        );
+        assert_eq!(
+            pattern_error(&["transit.points[github].mcp_tool_gating.gates[g-1].action.patterns=a"], &[]),
+            "transit point 'github' has no tool gate 'g-1': it has no tool gates yet"
+        );
+    }
+
+    #[test]
+    fn a_missing_transit_point_lists_the_points_that_exist() {
+        assert_eq!(
+            pattern_error(&["transit.points[nope].mcp_tool_gating.gates[g-1].action.patterns=a"], &[]),
+            "this surface has no transit point 'nope': the transit points are billing, github"
+        );
+        let error = build_patch(
+            &[],
+            &[],
+            &strings(&["transit.points[a].mcp_tool_gating.gates[g].action.patterns=a"]),
+            &[],
+            &json!({}),
+        )
+        .expect_err("no points")
+        .to_string();
+        assert_eq!(error, "this surface has no transit point 'a': it has no transit points yet");
+    }
+
+    #[test]
+    fn a_pattern_already_in_the_gate_is_refused_not_duplicated() {
+        assert_eq!(
+            pattern_error(&[&format!("{OWN}=fs_.*")], &[]),
+            "gate 'g-1' on the surface already has the pattern 'fs_.*'"
+        );
+        assert_eq!(
+            pattern_error(&[&format!("{OWN}=  fs_.*  ")], &[]),
+            "gate 'g-1' on the surface already has the pattern 'fs_.*'"
+        );
+    }
+
+    #[test]
+    fn a_pattern_missing_from_the_gate_is_refused_with_the_ones_it_has() {
+        assert_eq!(
+            pattern_error(&[], &[&format!("{OWN}=db_.*")]),
+            "gate 'g-1' on the surface has no pattern 'db_.*': it has fs_.*, shell_.*"
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_is_not_valid_is_refused_before_anything_is_built() {
+        let error = pattern_error(&[&format!("{OWN}=fs_(")], &[]);
+
+        assert!(error.contains("--add target.mcp_tool_gating.gates[g-1].action.patterns=fs_("), "{error}");
+        let error = pattern_patch(&[&format!("{OWN}=fs_(")], &[]).expect_err("refused");
+        assert!(format!("{error:#}").contains("is not valid regex"), "{error:#}");
+        assert!(
+            format!("{:#}", pattern_patch(&[&format!("{OWN}=   ")], &[]).expect_err("blank"))
+                .contains("can't be blank")
+        );
+        let long = "a".repeat(513);
+        assert!(
+            format!("{:#}", pattern_patch(&[&format!("{OWN}={long}")], &[]).expect_err("long")).contains("513 bytes")
+        );
+    }
+
+    #[test]
+    fn the_pattern_length_limit_counts_the_trimmed_text_that_is_sent() {
+        let at_limit = "a".repeat(512);
+
+        let patch = pattern_patch(&[&format!("{OWN}={at_limit} ")], &[]).expect("512 bytes once trimmed");
+        assert_eq!(patch["target"]["mcp_tool_gating"]["gates"][0]["action"]["patterns"][2], json!(at_limit));
+        let error = pattern_patch(&[&format!("{OWN}={at_limit}a")], &[]).expect_err("513 bytes");
+        assert!(format!("{error:#}").contains("513 bytes"), "{error:#}");
+    }
+
+    #[test]
+    fn a_pattern_with_regex_characters_equals_and_brackets_is_kept_as_written() {
+        let patch = pattern_patch(&[&format!("{OWN}=^a=[b]\\.c$")], &[]).expect("patch");
+
+        assert_eq!(patch["target"]["mcp_tool_gating"]["gates"][0]["action"]["patterns"][2], json!("^a=[b]\\.c$"));
+    }
+
+    #[test]
+    fn a_number_like_pattern_is_text() {
+        let patch = pattern_patch(&[&format!("{OWN}=100")], &[]).expect("patch");
+
+        assert_eq!(patch["target"]["mcp_tool_gating"]["gates"][0]["action"]["patterns"][2], json!("100"));
+    }
+
+    #[test]
+    fn removing_the_last_pattern_is_refused_unless_another_is_added() {
+        let error = pattern_error(&[], &["transit.points[billing].mcp_tool_gating.gates[tg-1].action.patterns=pay_.*"]);
+        assert!(
+            error.starts_with("this would leave gate 'tg-1' on transit point 'billing' with no patterns"),
+            "{error}"
+        );
+
+        let patch = pattern_patch(&[&format!("{POINT}=a_.*")], &[&format!("{POINT}=pay_.*")]).expect("replaced");
+        assert_eq!(patch["transit"]["points"][0]["mcp_tool_gating"]["gates"][0]["action"]["patterns"], json!(["a_.*"]));
+    }
+
+    #[test]
+    fn one_call_edits_several_gates_and_points() {
+        let patch = pattern_patch(
+            &[
+                &format!("{OWN}=a_.*"),
+                "target.mcp_tool_gating.gates[g-2].action.patterns=b_.*",
+                &format!("{POINT}=c_.*"),
+            ],
+            &[],
+        )
+        .expect("patch");
+
+        assert_eq!(
+            patch["target"]["mcp_tool_gating"]["gates"][0]["action"]["patterns"],
+            json!(["fs_.*", "shell_.*", "a_.*"])
+        );
+        assert_eq!(patch["target"]["mcp_tool_gating"]["gates"][1]["action"]["patterns"], json!(["^get_", "b_.*"]));
+        assert_eq!(
+            patch["transit"]["points"][0]["mcp_tool_gating"]["gates"][0]["action"]["patterns"],
+            json!(["pay_.*", "c_.*"])
+        );
+    }
+
+    #[test]
+    fn a_gate_with_too_many_patterns_is_refused() {
+        let mut surface = gated_surface();
+        surface["target"]["mcp_tool_gating"]["gates"][1]["action"]["patterns"] = json!(
+            (0..64)
+                .map(|n| format!("p{n}"))
+                .collect::<Vec<_>>()
+        );
+
+        let error = build_patch(
+            &[],
+            &[],
+            &strings(&["target.mcp_tool_gating.gates[g-2].action.patterns=one_more"]),
+            &[],
+            &surface,
+        )
+        .expect_err("65 patterns");
+
+        assert!(format!("{error:#}").contains("65 patterns"), "{error:#}");
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_tool_pattern_path_is_refused() {
+        for path in [
+            "target.mcp_tool_gating.gates[g-1].name",
+            "target.mcp_tool_gating.gates[g-1].action",
+            "transit.points[billing].tags",
+            "target.mcp_tool_gating.gates[g-1.action.patterns",
+            "target.mcp_tool_gating.gates[].action.patterns",
+            "target.mcp_tool_gating.gates[g-1]action.patterns",
+            "target.mcp_tool_gating.gates[g-1].action.patterns[0]",
+        ] {
+            let error = pattern_error(&[&format!("{path}=x")], &[]);
+            assert!(error.contains("gates[<gate id>].action.patterns"), "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn brackets_are_refused_by_set_and_unset() {
+        assert!(
+            error_of(&["target.mcp_tool_gating.gates[g-1].name=x"], &[])
+                .contains("brackets only work with --add and --remove")
+        );
+        assert!(
+            error_of(&[], &["target.mcp_tool_gating.gates[g-1]"])
+                .contains("brackets only work with --add and --remove")
+        );
+    }
+
+    #[test]
+    fn the_same_pattern_given_twice_or_on_a_whole_list_path_too_is_refused() {
+        assert!(pattern_error(&[&format!("{OWN}=a"), &format!("{OWN}= a")], &[]).contains("given more than once"));
+        assert!(
+            pattern_error(
+                &[&format!("{OWN}=a"), "target.mcp_tool_gating.gates={\"id\":\"g-3\",\"action\":{\"effect\":\"deny\",\"patterns\":[\"x\"]}}"],
+                &[]
+            )
+            .contains("given more than once")
+        );
+    }
+
+    #[test]
+    fn a_gate_id_holding_an_equals_sign_is_picked() {
+        let mut surface = gated_surface();
+        surface["target"]["mcp_tool_gating"]["gates"][0]["id"] = json!("a=b");
+
+        let patch =
+            build_patch(&[], &[], &strings(&["target.mcp_tool_gating.gates[a=b].action.patterns=z"]), &[], &surface)
+                .expect("patch");
+
+        assert_eq!(patch["target"]["mcp_tool_gating"]["gates"][0]["action"]["patterns"][2], json!("z"));
+    }
+
+    #[test]
+    fn removing_the_only_real_pattern_is_refused_even_when_a_blank_one_is_left() {
+        let mut surface = gated_surface();
+        surface["target"]["mcp_tool_gating"]["gates"][1]["action"]["patterns"] = json!(["", "a_.*"]);
+
+        let error =
+            build_patch(&[], &[], &[], &strings(&["target.mcp_tool_gating.gates[g-2].action.patterns=a_.*"]), &surface)
+                .expect_err("only a blank would be left")
+                .to_string();
+
+        assert!(error.starts_with("this would leave gate 'g-2' on the surface with no patterns"), "{error}");
+    }
+
+    #[test]
+    fn a_swap_on_the_only_pattern_by_mixed_gate_names_works() {
+        let mut surface = gated_surface();
+        surface["target"]["mcp_tool_gating"]["gates"][1]["name"] = json!("reads");
+        let patch = build_patch(
+            &[],
+            &[],
+            &strings(&["target.mcp_tool_gating.gates[reads].action.patterns=^list_"]),
+            &strings(&["target.mcp_tool_gating.gates[g-2].action.patterns=^get_"]),
+            &surface,
+        )
+        .expect("patch");
+
+        assert_eq!(patch["target"]["mcp_tool_gating"]["gates"][1]["action"]["patterns"], json!(["^list_"]));
+    }
+
+    #[test]
+    fn a_swap_naming_the_transit_point_by_id_and_by_alias_is_one_edit() {
+        let patch = pattern_patch(
+            &["transit.points[billing].mcp_tool_gating.gates[tg-1].action.patterns=a_.*"],
+            &["transit.points[tp-1].mcp_tool_gating.gates[tg-1].action.patterns=pay_.*"],
+        )
+        .expect("patch");
+
+        assert_eq!(patch["transit"]["points"][0]["mcp_tool_gating"]["gates"][0]["action"]["patterns"], json!(["a_.*"]));
+    }
+
+    #[test]
+    fn names_and_patterns_from_the_surface_are_cleaned_in_errors() {
+        let mut surface = gated_surface();
+        surface["target"]["mcp_tool_gating"]["gates"][0]["name"] = json!("fi\u{1b}[2Jles");
+        surface["target"]["mcp_tool_gating"]["gates"][0]
+            .as_object_mut()
+            .expect("a gate")
+            .remove("id");
+        surface["target"]["mcp_tool_gating"]["gates"][1]["action"]["patterns"] = json!(["\u{1b}]0;pwned\u{7}^get_"]);
+        surface["transit"]["points"][0]["alias"] = json!("bil\u{1b}[2Jling");
+        let error_of = |flag: &str, path: &str| {
+            let (adds, removes) = if flag == "--add" {
+                (vec![path], vec![])
+            } else {
+                (vec![], vec![path])
+            };
+            build_patch(&[], &[], &strings(&adds), &strings(&removes), &surface)
+                .expect_err("refused")
+                .to_string()
+        };
+
+        let gates = error_of("--add", "target.mcp_tool_gating.gates[nope].action.patterns=a");
+        assert!(gates.contains("the gates are fi[2Jles, g-2"), "{gates}");
+        assert!(!gates.contains('\u{1b}'), "{gates}");
+        let held = error_of("--remove", "target.mcp_tool_gating.gates[g-2].action.patterns=nope");
+        assert!(held.contains("it has ]0;pwned^get_"), "{held}");
+        assert!(!held.contains('\u{1b}') && !held.contains('\u{7}'), "{held}");
+        let points = error_of("--add", "transit.points[nope].mcp_tool_gating.gates[tg-1].action.patterns=a");
+        assert!(points.contains("the transit points are bil[2Jling"), "{points}");
+        assert!(!points.contains('\u{1b}'), "{points}");
+    }
+
+    #[test]
+    fn the_same_pattern_added_or_removed_twice_under_two_names_of_one_gate_is_refused() {
+        let twice_add = pattern_error(
+            &[
+                "target.mcp_tool_gating.gates[g-1].action.patterns=a",
+                "target.mcp_tool_gating.gates[files].action.patterns= a",
+            ],
+            &[],
+        );
+        assert_eq!(twice_add, "--add 'a' is given more than once for gate 'g-1' on the surface");
+        let twice_remove = pattern_error(
+            &[],
+            &[
+                "target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*",
+                "target.mcp_tool_gating.gates[files].action.patterns=fs_.*",
+            ],
+        );
+        assert_eq!(twice_remove, "--remove 'fs_.*' is given more than once for gate 'g-1' on the surface");
+    }
+
+    #[test]
+    fn the_same_pattern_added_twice_under_a_transit_point_id_and_alias_is_refused() {
+        let error = pattern_error(
+            &[
+                "transit.points[tp-1].mcp_tool_gating.gates[tg-1].action.patterns=a",
+                "transit.points[billing].mcp_tool_gating.gates[tg-1].action.patterns=a",
+            ],
+            &[],
+        );
+
+        assert!(error.contains("is given more than once for gate 'tg-1' on transit point"), "{error}");
     }
 }
