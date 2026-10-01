@@ -496,7 +496,7 @@ fn cell(
     let Some(text) = column
         .keys
         .iter()
-        .find_map(|key| value_text(lookup(row, key)?))
+        .find_map(|key| value_text(lookup(row, key)?, column.max_width))
     else {
         return column.when_empty.to_owned();
     };
@@ -516,13 +516,16 @@ fn lookup<'a>(
 
 /// Turns one gateway value into cell text. Yes or no for a flag, names joined
 /// with commas for a list, and nothing for an empty or missing value.
-fn value_text(value: &Value) -> Option<String> {
+fn value_text(
+    value: &Value,
+    max_width: usize,
+) -> Option<String> {
     let text = match value {
         Value::String(text) => text.clone(),
         Value::Bool(true) => "yes".to_owned(),
         Value::Bool(false) => "no".to_owned(),
         Value::Number(number) => number.to_string(),
-        Value::Array(items) => list_text(items),
+        Value::Array(items) => list_text(items, max_width),
         Value::Null | Value::Object(_) => String::new(),
     };
     (!text.trim().is_empty()).then_some(text)
@@ -543,7 +546,13 @@ fn empty_line(
     }
 }
 
-fn list_text(items: &[Value]) -> String {
+/// The names in a list cell, comma-joined to fit `max_width`. Names that do
+/// not fit, and items with no name, are counted in a `+N more` suffix that is
+/// always kept whole.
+fn list_text(
+    items: &[Value],
+    max_width: usize,
+) -> String {
     let names: Vec<String> = items
         .iter()
         .filter_map(|item| match item {
@@ -563,10 +572,38 @@ fn list_text(items: &[Value]) -> String {
     if names.is_empty() && !items.is_empty() {
         return format!("{} items", items.len());
     }
-    if unnamed > 0 {
-        return format!("{} +{unnamed} more", names.join(","));
+    let all = names.join(",");
+    if unnamed == 0 && all.chars().count() <= max_width {
+        return all;
     }
-    names.join(",")
+    let mut shown = String::new();
+    let mut shown_count = 0;
+    for name in &names {
+        let candidate = if shown.is_empty() {
+            name.clone()
+        } else {
+            format!("{shown},{name}")
+        };
+        let hidden = names.len() - shown_count - 1 + unnamed;
+        let suffix = if hidden > 0 {
+            format!(" +{hidden} more")
+                .chars()
+                .count()
+        } else {
+            0
+        };
+        if candidate.chars().count() + suffix > max_width {
+            break;
+        }
+        shown = candidate;
+        shown_count += 1;
+    }
+    let hidden = names.len() - shown_count + unnamed;
+    match (shown.is_empty(), hidden) {
+        (_, 0) => shown,
+        (true, hidden) => format!("+{hidden} more"),
+        (false, hidden) => format!("{shown} +{hidden} more"),
+    }
 }
 
 fn shorten(
@@ -773,6 +810,21 @@ mod tests {
         assert_eq!(render_scoped(&SECRETS, &[], Scope::Filtered), ["No matching secrets."]);
         assert_eq!(render_scoped(&PAYMENTS, &[], Scope::Partial), ["No payments returned."]);
         assert_eq!(render_scoped(&AUDIT, &[], Scope::Filtered), ["No matching audit events."]);
+    }
+
+    #[test]
+    fn a_long_list_cell_keeps_its_more_suffix_whole() {
+        let aliases = ["alpha-service", "beta-service", "gamma-service-long"];
+        let points: Vec<Value> = aliases
+            .iter()
+            .map(|alias| json!({"alias": alias}))
+            .chain([json!({"x": 1})])
+            .collect();
+        let rows = [json!({"id": "s", "name": "n", "transit": {"points": points}})];
+
+        let line = render_list(&SURFACES, &rows)[1].clone();
+
+        assert!(line.ends_with("alpha-service,beta-service +2 more"), "{line}");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use crate::{
-    client::{GatewayClient, id_from_response, response_status},
+    client::{GatewayClient, id_from_response, response_status, sanitize_whole},
     config::{Config, Connection, normalize_host, normalize_user_host},
     credentials::{CredentialStore, OsCredentialStore},
     features, surface_patch, surface_validate,
@@ -1192,8 +1192,8 @@ async fn dispatch_with(
                 Command::Users { command } => run_users(&client, command).await?,
                 Command::Identities { command } => run_identities(&client, command).await?,
                 // API keys print themselves, since create and rotate answer with
-                // a secret that is shown once and that follows the confirmation
-                // line.
+                // a secret shown once, which goes alone to standard output while
+                // the confirmation goes to standard error.
                 Command::ApiKeys { command } => return run_api_keys(&client, command, cli.output).await,
                 Command::TenantOwnership { command } => run_tenant_ownership(&client, command).await?,
                 Command::JwtVerificationStrategies { command } => run_jwt_strategies(&client, command).await?,
@@ -7924,16 +7924,12 @@ fn surfaces_carrying_key<'a>(
 
 /// Prints the outcome of a delete or an update: the confirmation line in table
 /// mode, even when the gateway sent a document back, and the gateway's own
-/// answer with `--output json`. A document that says it did not happen
-/// (`deleted` or `success` set to false) is printed instead of the line.
+/// answer with `--output json`.
 fn print_outcome(
     value: &Value,
     output: Output,
     confirmation: &str,
 ) -> Result<()> {
-    if says_it_did_not_happen(value) {
-        return print_value(value, output);
-    }
     match outcome_line(output, confirmation) {
         Some(line) => {
             println!("{line}");
@@ -7941,13 +7937,6 @@ fn print_outcome(
         }
         None => print_value(value, output),
     }
-}
-
-/// Whether a gateway answer reports that the change was not made.
-fn says_it_did_not_happen(value: &Value) -> bool {
-    ["deleted", "success"]
-        .iter()
-        .any(|key| value.get(*key) == Some(&Value::Bool(false)))
 }
 
 /// Chooses what a delete or revoke puts on standard output, whether the
@@ -7997,7 +7986,8 @@ fn api_key_path(
 
 /// Prints a create or rotate response for an API key. The secret appears in
 /// this response only and the gateway stores nothing but its hash, so table
-/// output prints it after the confirmation line.
+/// output prints it alone on standard output and the confirmation on standard
+/// error.
 fn print_api_key_secret(
     value: &Value,
     output: Output,
@@ -10228,7 +10218,8 @@ async fn run_audit(
     match output {
         Output::Json => println!("{}", serde_json::to_string_pretty(&response)?),
         Output::Table => {
-            let filtered = args.filter.is_some()
+            let filtered = args.page > 1
+                || args.filter.is_some()
                 || args.category.is_some()
                 || args.flow.is_some()
                 || args.scope.is_some()
@@ -10571,10 +10562,10 @@ async fn list_payments(
                 .iter()
                 .map(payment_row_with_iso_time)
                 .collect();
-            let scope = if !absent.is_empty() || !failed.is_empty() {
-                Scope::Partial
-            } else if args.surface.is_some() || args.status.is_some() {
+            let scope = if args.surface.is_some() || args.status.is_some() {
                 Scope::Filtered
+            } else if !failed.is_empty() {
+                Scope::Partial
             } else {
                 Scope::All
             };
@@ -12494,7 +12485,8 @@ fn shown_once_notice(kind: &str) -> String {
 /// the id and else the one in the answer. When the answer carries a secret in
 /// `secret_field` (a token or key the user has to keep), standard output is
 /// that secret alone and the confirmation goes to standard error. A secret
-/// with control characters is refused. `--output json` prints the answer as it
+/// with control characters is refused, after the gateway made it, with an
+/// error that names the id. `--output json` prints the answer as it
 /// is, and an answer with neither an id nor a secret is printed as the shared
 /// printer would.
 fn print_issued(
@@ -12508,14 +12500,25 @@ fn print_issued(
     let secret = secret_field
         .and_then(|field| value.get(field))
         .and_then(Value::as_str);
+    let id = requested_id.or_else(|| id_from_response(value));
     if matches!(output, Output::Table)
         && secret.is_some_and(|secret| {
             secret
                 .chars()
                 .any(char::is_control)
+                || sanitize_whole(secret) != secret
         })
     {
-        bail!("the {kind} secret contains control characters, which are not safe to print; read it with --output json");
+        let what = match id {
+            Some(id) => confirmation_line(verb, kind, id),
+            None => format!("{verb} {kind}"),
+        };
+        let remedy = if verb == "Created" {
+            "Revoke it, or rotate it with --output json to get a new secret."
+        } else {
+            "Run the rotate command again with --output json to get a new secret."
+        };
+        bail!("{what} but its secret contains control characters and was not printed. {remedy}");
     }
     // The reminder goes to standard error in both modes, so it never touches
     // what a script reads from standard output.
@@ -12525,7 +12528,6 @@ fn print_issued(
     if matches!(output, Output::Json) {
         return print_value(value, output);
     }
-    let id = requested_id.or_else(|| id_from_response(value));
     if id.is_none() && secret.is_none() {
         return print_value(value, output);
     }

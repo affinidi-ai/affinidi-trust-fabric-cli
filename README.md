@@ -76,12 +76,12 @@ fabric agent-gateway policies list
 How lists and deletes print:
 
 - Every `list` prints one table with a header row and the columns that matter for that resource, for example `NAME  ID  PROTOCOL  ROUTE  TARGET  TRANSIT POINTS` for surfaces. `audit list` and `payments list` use the same table.
-- A list with nothing in it prints a short line such as `No surfaces yet.`, or `No matching secrets.` when a filter (`--tag`, `--status`, `--decision` and so on) was given, or `No payments returned.` when a payments store could not be read.
+- A list with nothing in it prints a short line such as `No surfaces yet.`, or `No matching secrets.` when a filter (`--tag`, `--status`, `--decision` and so on) was given, or when you ask for a page past the first, or `No payments returned.` when a payments store failed to answer (a store that is not set up does not change the line).
 - A list cell that mixes named and unnamed items shows the names and then `+N more`.
 - Long values end in `...`, except IDs, DIDs and names you can pass to another command, which always print whole.
 - A raw `api` call that returns a list prints a `NAME  ID  DESCRIPTION` table.
 - `surfaces features` and `tokens scopes` are catalogues and print plain lines.
-- Every `delete` prints one line such as `Deleted credential provider '<id>'`. Secret, certificate and grant deletes get a 204 from the gateway, and surface and identity deletes get a body back but still print one line in table mode. If that body says `deleted` or `success` is false, the body is printed instead of the line.
+- Every `delete` prints one line such as `Deleted credential provider '<id>'`. Secret, certificate and grant deletes get a 204 from the gateway, and surface and identity deletes get a body back but still print one line in table mode.
 - `metrics truncate` and `logs truncate` do not delete one item and still print the gateway's result.
 - Every `create` prints `Created <kind> '<id>'` and every `update` prints `Updated <kind> '<id>'`. A secret the gateway shows only once (a token or API key secret) is printed alone on standard output, and the confirmation line and a `note:` go to standard error.
 - Messages on standard error start with `note:`, `warning:` or `error:`. The browser sign-in instruction lines (opening the browser, the URL to visit) stay plain.

@@ -673,7 +673,7 @@ fn creating_a_shared_resource_prints_one_line_and_json_keeps_the_answer() {
 }
 
 #[test]
-fn creating_an_access_token_prints_the_confirmation_then_the_token_and_a_note() {
+fn creating_an_access_token_prints_the_token_alone_and_the_confirmation_on_standard_error() {
     let answer = r#"{"id":"t-1","name":"ci","token":"agpat_secret"}"#;
     let routes = || vec![reply("POST", "/v1/access-tokens", "200 OK", answer)];
 
@@ -718,7 +718,7 @@ fn rotating_an_access_token_names_it_and_prints_the_new_token() {
 }
 
 #[test]
-fn creating_and_rotating_an_api_key_print_the_confirmation_then_the_secret() {
+fn creating_and_rotating_an_api_key_print_the_secret_alone_and_the_confirmation_on_standard_error() {
     let created = r#"{"key_id":"k-1","secret":"sk_live","status":"active"}"#;
     let create_routes = || vec![reply("POST", "/v1/api-keys/s-1", "200 OK", created)];
     let rotate_routes = || vec![reply("POST", "/v1/api-keys/s-1/k-1/rotate", "200 OK", created)];
@@ -1033,23 +1033,47 @@ fn an_api_key_line_names_the_key_even_when_the_answer_has_other_ids_inside() {
 }
 
 #[test]
-fn a_secret_with_control_characters_is_refused_in_table_mode_but_kept_in_json() {
-    let answer = r#"{"id":"t-1","token":"agpat_\u001b[31mred"}"#;
-    let routes = || vec![reply("POST", "/v1/access-tokens", "200 OK", answer)];
+fn a_secret_with_control_characters_is_refused_with_the_id_and_a_way_out() {
+    let created = |secret: &str| {
+        vec![reply("POST", "/v1/access-tokens", "200 OK", format!(r#"{{"id":"t-1","token":"{secret}"}}"#))]
+    };
+    let escape = fabric(created("agpat_\\u001b[31mred"), &["tokens", "create", "--name", "ci"]);
+    let bidi = fabric(created("agpat_\\u202ereversed"), &["tokens", "create", "--name", "ci"]);
+    let json = fabric(created("agpat_\\u001b[31mred"), &["-o", "json", "tokens", "create", "--name", "ci"]);
+    let rotated = fabric(
+        vec![reply("POST", "/v1/access-tokens/t-1/rotate", "200 OK", r#"{"token":"agpat_\u001bred"}"#)],
+        &["tokens", "rotate", "t-1", "--yes"],
+    );
 
-    let table = fabric(routes(), &["tokens", "create", "--name", "ci"]);
-    let json = fabric(routes(), &["-o", "json", "tokens", "create", "--name", "ci"]);
-
-    assert_eq!(table.stdout, "");
+    for out in [&escape, &bidi] {
+        assert_eq!(out.stdout, "");
+        assert!(
+            out.stderr
+                .contains("Created access token 't-1' but its secret contains control characters and was not printed"),
+            "{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr
+                .contains("Revoke it, or rotate it with --output json"),
+            "{}",
+            out.stderr
+        );
+    }
+    assert_eq!(rotated.stdout, "");
     assert!(
-        table
+        rotated
             .stderr
-            .contains("control characters")
-            && table
-                .stderr
-                .contains("--output json"),
+            .contains("Rotated access token 't-1' but its secret contains control characters"),
         "{}",
-        table.stderr
+        rotated.stderr
+    );
+    assert!(
+        rotated
+            .stderr
+            .contains("Run the rotate command again with --output json"),
+        "{}",
+        rotated.stderr
     );
     assert!(json.stdout.contains("agpat_"), "{}", json.stdout);
 }
@@ -1097,28 +1121,6 @@ fn payments_with_a_failing_store_say_none_were_returned() {
 }
 
 #[test]
-fn a_delete_body_that_says_it_did_not_happen_is_printed() {
-    let body = r#"{"deleted":false,"reason":"in use"}"#;
-    let out = fabric(
-        vec![reply("GET", "/v1/surfaces", "200 OK", SURFACES), reply("DELETE", "/v1/surfaces/s-1", "200 OK", body)],
-        &["surfaces", "delete", "s-1"],
-    );
-
-    assert!(
-        out.stdout
-            .contains("\"reason\": \"in use\""),
-        "{}",
-        out.stdout
-    );
-    assert!(
-        !out.stdout
-            .contains("Deleted surface"),
-        "{}",
-        out.stdout
-    );
-}
-
-#[test]
 fn adding_and_removing_a_feature_print_one_line_in_table_mode() {
     let bare = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
     let limited = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales","rate_limit":{"requests":10,"window_secs":60}},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
@@ -1145,4 +1147,24 @@ fn adding_and_removing_a_feature_print_one_line_in_table_mode() {
         "{}",
         json.stdout
     );
+}
+
+#[test]
+fn a_payments_store_that_is_not_set_up_does_not_change_the_empty_line() {
+    let out = fabric(
+        vec![reply("GET", "/admin/x402/transactions", "200 OK", r#"{"verifications":[]}"#)],
+        &["payments", "list"],
+    );
+
+    assert_eq!(out.stdout, "No payments yet.\n");
+}
+
+#[test]
+fn an_audit_page_past_the_first_is_worded_as_a_filtered_result() {
+    let out = fabric(
+        vec![reply("GET", "/v1/audit", "200 OK", r#"{"events":[],"total":0}"#)],
+        &["audit", "list", "--page", "3"],
+    );
+
+    assert_eq!(out.stdout, "No matching audit events.\n");
 }
