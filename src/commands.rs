@@ -9,10 +9,11 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use crate::{
-    client::{GatewayClient, id_from_response, response_status},
+    client::{GatewayClient, id_from_response, response_status, sanitize_whole},
     config::{Config, Connection, normalize_host, normalize_user_host},
     credentials::{CredentialStore, OsCredentialStore},
     features, surface_patch, surface_validate,
+    tables::{self, Layout, Scope, table_cell},
     tool_gate_preview::{self, Conditions, Gating, Preview, ToolPreview, Verdict},
 };
 
@@ -633,6 +634,16 @@ enum SurfaceCommand {
     /// list with only their items changed (a change someone else makes to
     /// that list between the read and the write is overwritten), and the
     /// edited surface is checked for its required fields before it is sent.
+    ///
+    /// To change one tool pattern without retyping its gate, put the gate's
+    /// id (or name) in square brackets, and quote the flag so the shell leaves
+    /// the brackets alone. The CLI sends the surface's whole gates list, or
+    /// the whole transit.points list for a transit point, so a change someone
+    /// else makes to that list between the read and the write is overwritten:
+    ///
+    ///   --add 'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
+    ///
+    ///   --remove 'transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
     #[command(group(ArgGroup::new("change").required(true).multiple(true).args(["file", "set", "unset", "add", "remove"])))]
     Update {
         /// Surface ID or name (see `fabric agent-gateway surfaces list`).
@@ -654,14 +665,20 @@ enum SurfaceCommand {
         /// Add one item to a list, as the list's dot path and the item, read
         /// the same way as a --set value (`tags=beta`,
         /// `access_point.trust_check_list='{"id":"tc-1",...}'`). An item
-        /// already in the list is refused. Repeatable.
+        /// already in the list is refused. To add one tool pattern to a gate,
+        /// name the gate in brackets:
+        /// `'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'`.
+        /// Repeatable.
         #[arg(long, value_name = "PATH=ITEM")]
         add: Vec<String>,
         /// Remove one item from a list, named by its value for a list of text
         /// (`tags=beta`) and for a list of objects by its `id`, else its
         /// `alias` (`transit.points=billing`), else some of its fields as JSON.
         /// Removes run before adds, so removing an item and adding it back
-        /// replaces it. Repeatable.
+        /// replaces it. To remove one tool pattern from a gate, name the gate
+        /// in brackets, on a transit point too:
+        /// `'transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns=fs_.*'`.
+        /// Repeatable.
         #[arg(long, value_name = "PATH=ITEM")]
         remove: Vec<String>,
         /// Check the change with the gateway and show what it would change,
@@ -1134,8 +1151,10 @@ async fn dispatch_with(
             {
                 return preview_saved_surface(&client, surface_id, tools, conditions, cli.output).await;
             }
-            let created = is_create_command(&command);
-            let deleted = delete_confirmation(&command);
+            let created = create_kind(&command);
+            let confirmation = delete_confirmation(&command).or_else(|| update_confirmation(&command));
+            let layout = list_layout(&command);
+            let scope = list_scope(&command);
             let value = match command {
                 Command::Runtime { command } => run_runtime(&client, command).await?,
                 Command::Settings { command } => run_settings(&client, command).await?,
@@ -1162,9 +1181,10 @@ async fn dispatch_with(
                 Command::McpProxies { command } => run_crud(&client, "/v1/mcp-proxies", command).await?,
                 Command::A2aProxies { command } => run_crud(&client, "/v1/a2a-proxies", command).await?,
                 Command::StsClients { command } => run_crud(&client, "/v1/sts/clients", command).await?,
-                // These four render their own output — a bespoke audit row, a
-                // merged payments table, raw bytes written to a file — so they
-                // finish here instead of returning a value to `print_value`.
+                // These four print their own output (the audit and payments
+                // tables, the metrics commands, and log files written to disk),
+                // so they finish here instead of returning a value to the
+                // shared printer.
                 Command::Audit { command } => return run_audit(&client, command, cli.output).await,
                 Command::Payments { command } => return run_payments(&client, command, cli.output).await,
                 Command::Metrics { command } => return run_metrics(&client, command, cli.output).await,
@@ -1192,8 +1212,9 @@ async fn dispatch_with(
                 Command::Integrations { command } => run_crud(&client, "/v1/integrations", command).await?,
                 Command::Users { command } => run_users(&client, command).await?,
                 Command::Identities { command } => run_identities(&client, command).await?,
-                // API keys print themselves: create and rotate return a
-                // one-time secret the shared printer would hide.
+                // API keys print themselves, since create and rotate answer with
+                // a secret shown once, which goes alone to standard output while
+                // the confirmation goes to standard error.
                 Command::ApiKeys { command } => return run_api_keys(&client, command, cli.output).await,
                 Command::TenantOwnership { command } => run_tenant_ownership(&client, command).await?,
                 Command::JwtVerificationStrategies { command } => run_jwt_strategies(&client, command).await?,
@@ -1205,9 +1226,12 @@ async fn dispatch_with(
                 | Command::Whoami
                 | Command::Shell => unreachable!(),
             };
-            match deleted {
+            match confirmation {
                 Some(confirmation) => print_outcome(&value, cli.output, &confirmation),
-                None => print_value(&value, cli.output, created),
+                None => match layout {
+                    Some(layout) => print_list(&value, cli.output, layout, scope),
+                    None => print_created_or_value(&value, cli.output, created),
+                },
             }
         }
     }
@@ -1607,7 +1631,7 @@ fn run_config(
     match command {
         ConfigCommand::List => {
             let rows: Vec<Value> = config.connections.iter().map(|(name, connection)| json!({"name": name, "host": connection.host, "current": config.current.as_deref() == Some(name)})).collect();
-            print_value(&Value::Array(rows), output, false)
+            print_list(&Value::Array(rows), output, &tables::CONNECTION_SETTINGS, Scope::All)
         }
         ConfigCommand::Use { name } => {
             if !config
@@ -3130,6 +3154,101 @@ mod gateway_config_tests {
 
     const READ_AND_DRY_RUN: [&str; 2] =
         ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1?dry_run=true HTTP/1.1"];
+
+    const PATTERN_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000","mcp_tool_gating":{"default_effect":"allow","gates":[{"id":"g-1","name":"files","action":{"effect":"deny","patterns":["fs_.*"]}},{"id":"g-2","action":{"effect":"deny","patterns":["rm_.*"]}}]}},"transit":{"points":[{"id":"tp-1","alias":"gh","mcp_tool_gating":{"gates":[{"id":"tg-1","action":{"effect":"deny","patterns":["push_.*"]}}]}}]}}"#;
+
+    const ADD_OWN_PATTERN: &str = "target.mcp_tool_gating.gates[g-1].action.patterns=shell_.*";
+
+    /// What the patch for `ADD_OWN_PATTERN` holds: the surface's gates, with
+    /// only the first gate's patterns changed.
+    fn own_pattern_patch() -> Value {
+        json!({"target": {"mcp_tool_gating": {"gates": [
+            {"id": "g-1", "name": "files", "action": {"effect": "deny", "patterns": ["fs_.*", "shell_.*"]}},
+            {"id": "g-2", "action": {"effect": "deny", "patterns": ["rm_.*"]}}
+        ]}}})
+    }
+
+    fn body_of(request: &str) -> Value {
+        let body = request
+            .split_once("\r\n\r\n")
+            .expect("request body")
+            .1;
+        serde_json::from_str(body).expect("patch body is JSON")
+    }
+
+    #[tokio::test]
+    async fn a_pattern_swap_on_a_transit_point_gate_sends_the_transit_point_list() {
+        let requests = feature_dry_run(
+            &[
+                "update",
+                "s-1",
+                "--add",
+                "transit.points[gh].mcp_tool_gating.gates[tg-1].action.patterns=pull_.*",
+                "--remove",
+                "transit.points[gh].mcp_tool_gating.gates[tg-1].action.patterns=push_.*",
+            ],
+            PATTERN_SURFACE,
+        )
+        .await
+        .expect("the pattern should be swapped");
+
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"id": "tp-1", "alias": "gh", "mcp_tool_gating": {"gates": [
+                {"id": "tg-1", "action": {"effect": "deny", "patterns": ["pull_.*"]}}
+            ]}}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_tool_pattern_edit_sends_nothing_after_the_read() {
+        let (host, requests) = scripted_server(vec![(DRY_RUN_GATEWAY_OK, PATTERN_SURFACE)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let edit = "target.mcp_tool_gating.gates[g-9].action.patterns=a";
+        let command = surface_command(&["fabric", "agent-gateway", "surfaces", "update", "s-1", "--add", edit]);
+
+        let error = run_surfaces(&client, command, Output::Json)
+            .await
+            .expect_err("the edit should be refused");
+
+        assert!(format!("{error:#}").contains("the gates are g-1, g-2"), "{error:#}");
+        assert_eq!(request_lines(requests), [S1_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn a_tool_pattern_dry_run_sends_only_that_gates_list_as_a_dry_run() {
+        let requests = feature_dry_run(&["update", "s-1", "--add", ADD_OWN_PATTERN], PATTERN_SURFACE)
+            .await
+            .expect("the dry run should succeed");
+
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(patch_body(&requests), own_pattern_patch());
+    }
+
+    #[tokio::test]
+    async fn a_tool_pattern_is_saved_to_a_surface_picked_by_name() {
+        let (host, requests) = scripted_server(vec![
+            LIST_OK,
+            (DRY_RUN_GATEWAY_OK, PATTERN_SURFACE),
+            ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1"}"#),
+        ])
+        .await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command = resolve_surface_command(
+            &client,
+            surface_command(&["fabric", "agent-gateway", "surfaces", "update", "Sales", "--add", ADD_OWN_PATTERN]),
+        )
+        .await
+        .expect("the surface should resolve");
+
+        run_surfaces(&client, command, Output::Json)
+            .await
+            .expect("the pattern should be saved");
+
+        let requests = full_requests(requests);
+        assert_eq!(start_lines(&requests), [LIST_REQUEST, S1_REQUEST, "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]);
+        assert_eq!(body_of(&requests[2]), own_pattern_patch());
+    }
 
     #[tokio::test]
     async fn add_feature_finds_the_surface_wide_place_for_tool_gating_with_no_flags() {
@@ -5738,12 +5857,14 @@ async fn run_certificates(
         CrudCommand::Delete { id } => Some(id.clone()),
         _ => None,
     };
+    let mut updated = None;
     let mut value = match command {
         // The document is read and checked before the lookup, as for secrets,
         // so a bad file fails without a request and `--file -` is read once.
         CrudCommand::Update { id, file } => {
             let body = read_json(&file)?;
             let id = resolve_id(client, &CERTIFICATE_LOOKUP, &id).await?;
+            updated = Some(id.clone());
             client
                 .request(Method::PUT, &entity_path(CERTIFICATES_PATH, &id), Some(body))
                 .await?
@@ -5751,10 +5872,13 @@ async fn run_certificates(
         command => run_crud(client, CERTIFICATES_PATH, command).await?,
     };
     if let Some(id) = deleted {
-        return Ok(report_removal(value, "Deleted certificate", &id, output));
+        return Ok(confirm_empty(value, &confirmation_line("Deleted", "certificate", &id), output));
     }
     if !reveal {
         mask_keys(&mut value, &["private_key_pem"]);
+    }
+    if let Some(id) = updated {
+        return Ok(report_update(value, confirmation_line("Updated", "certificate", &id), output));
     }
     Ok(Some(value))
 }
@@ -5769,6 +5893,7 @@ async fn run_secrets(
     reveal: bool,
     output: Output,
 ) -> Result<Option<Value>> {
+    let mut updated = None;
     let mut value = match command {
         SecretCommand::List { tag: None } => {
             client
@@ -5801,6 +5926,7 @@ async fn run_secrets(
             let body = read_json(&file)?;
             check_secret_update(&body)?;
             let id = resolve_id(client, &SECRET_LOOKUP, &secret).await?;
+            updated = Some(id.clone());
             client
                 .request(Method::PUT, &encoded_path(SECRETS_PATH, &id), Some(body))
                 .await?
@@ -5810,11 +5936,14 @@ async fn run_secrets(
             let value = client
                 .request(Method::DELETE, &encoded_path(SECRETS_PATH, &id), None)
                 .await?;
-            return Ok(report_removal(value, "Deleted secret", &id, output));
+            return Ok(confirm_empty(value, &confirmation_line("Deleted", "secret", &id), output));
         }
     };
     if !reveal {
         mask_keys(&mut value, &["value"]);
+    }
+    if let Some(id) = updated {
+        return Ok(report_update(value, confirmation_line("Updated", "secret", &id), output));
     }
     Ok(Some(value))
 }
@@ -5841,17 +5970,38 @@ async fn run_delegation_vault(
             let value = client
                 .request(Method::DELETE, &encoded_path(DELEGATION_VAULT_PATH, &id), None)
                 .await?;
-            Ok(report_removal(value, "Revoked grant", &id, output))
+            Ok(confirm_empty(value, &confirmation_line("Revoked", "grant", &id), output))
         }
-        // A mass revoke answers with a real 200 body reporting how many
-        // grants went, so it never takes the empty-body path.
+        // A mass revoke answers with `{"revoked": N}`. Table output says how
+        // many went in one line and `--output json` keeps the answer.
         DelegationVaultCommand::RevokeUser { user_hash } => {
             let path = encoded_path(&format!("{DELEGATION_VAULT_PATH}/by-user"), &user_hash);
-            client
+            let value = client
                 .request(Method::DELETE, &path, None)
-                .await
-                .map(Some)
+                .await?;
+            if matches!(output, Output::Table) {
+                println!("{}", revoked_grants_line(&value, &user_hash));
+                return Ok(None);
+            }
+            Ok(Some(value))
         }
+    }
+}
+
+/// `Revoked 2 grants for user '<hash>'`, with the count from the gateway's
+/// answer, or `Revoked grants for user '<hash>'` when the answer carries none.
+fn revoked_grants_line(
+    answer: &Value,
+    user_hash: &str,
+) -> String {
+    let hash = tables::flatten(user_hash);
+    match answer
+        .get("revoked")
+        .and_then(Value::as_u64)
+    {
+        Some(1) => format!("Revoked 1 grant for user '{hash}'"),
+        Some(count) => format!("Revoked {count} grants for user '{hash}'"),
+        None => format!("Revoked grants for user '{hash}'"),
     }
 }
 
@@ -5983,7 +6133,7 @@ async fn resolve_id(
         names,
         view,
     } = lookup;
-    let shown = one_line(reference);
+    let shown = tables::flatten_capped(reference);
     let response = client
         .request(Method::GET, base, None)
         .await;
@@ -6062,23 +6212,18 @@ async fn resolve_id(
                 .map(|(id, entity)| {
                     let details = names
                         .iter()
-                        .map(|name| format!("{name}: {}", one_line(string_field(entity, name).unwrap_or("-"))))
+                        .map(|name| {
+                            format!("{name}: {}", tables::flatten_capped(string_field(entity, name).unwrap_or("-")))
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("  {}  ({details})", one_line(id))
+                    format!("  {}  ({details})", tables::flatten_capped(id))
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
             bail!("'{shown}' matches more than one {noun}; pass one of these ids instead:\n{candidates}")
         }
     }
-}
-
-/// `value` on one line with control characters removed, for text that goes to
-/// the terminal inside a message. A newline or tab becomes a space, where
-/// `sanitize_for_terminal` would keep it.
-fn one_line(value: &str) -> String {
-    sanitize_for_terminal(&value.replace(['\n', '\t', '\r'], " "))
 }
 
 fn string_field<'a>(
@@ -6102,21 +6247,20 @@ fn is_uuid(value: &str) -> bool {
             })
 }
 
-/// Reports the empty body a 204 carries. Table output gets a human line and
-/// nothing to print afterwards; JSON output keeps the `null` that body parses
-/// to, so it matches every other delete command. A response that does carry a
-/// document is passed through untouched.
-fn report_removal(
+/// Reports an update by the resolved id. Table output prints the confirmation
+/// line and has nothing left to print; JSON output keeps the gateway's answer.
+fn report_update(
     value: Value,
-    action: &str,
-    id: &str,
+    line: String,
     output: Output,
 ) -> Option<Value> {
-    if value.is_null() && matches!(output, Output::Table) {
-        println!("{action} {id}");
-        return None;
+    match output {
+        Output::Table => {
+            println!("{line}");
+            None
+        }
+        Output::Json => Some(value),
     }
-    Some(value)
 }
 
 /// Replaces every string stored under one of `keys` with [`MASKED_VALUE`].
@@ -7053,7 +7197,7 @@ mod secrets_certs_tests {
             DelegationVaultCommand::RevokeUser {
                 user_hash: "sha256:abc".to_owned(),
             },
-            Output::Table,
+            Output::Json,
         )
         .await
         .expect("revoke user");
@@ -7254,7 +7398,7 @@ mod secrets_certs_tests {
     }
 
     #[test]
-    fn only_the_create_subcommands_print_a_new_entity_id() {
+    fn only_the_create_subcommands_have_a_created_kind() {
         let create = Cli::try_parse_from([
             "fabric",
             "agent-gateway",
@@ -7270,16 +7414,22 @@ mod secrets_certs_tests {
         .expect("parse");
         let list = Cli::try_parse_from(["fabric", "agent-gateway", "delegation-vault", "list"]).expect("parse");
 
-        assert!(is_create_command(
-            &create
-                .into_agent_gateway()
-                .command
-        ));
-        assert!(!is_create_command(
-            &list
-                .into_agent_gateway()
-                .command
-        ));
+        assert_eq!(
+            create_kind(
+                &create
+                    .into_agent_gateway()
+                    .command
+            ),
+            Some("secret")
+        );
+        assert_eq!(
+            create_kind(
+                &list
+                    .into_agent_gateway()
+                    .command
+            ),
+            None
+        );
     }
 }
 
@@ -8089,7 +8239,9 @@ async fn run_identities(
                 .request(Method::GET, &entity_path("/v1/identities", &id), None)
                 .await?;
             if !reveal && redact_key_pair(&mut value) {
-                eprintln!("Hid 'key_pair', which carries this identity's private key. Pass --reveal to include it.");
+                eprintln!(
+                    "note: hid 'key_pair', which carries this identity's private key. Pass --reveal to include it."
+                );
             }
             Ok(value)
         }
@@ -8283,14 +8435,14 @@ async fn run_api_keys(
             let value = client
                 .request(Method::GET, &path, None)
                 .await?;
-            print_api_keys(&value, output)
+            print_api_keys(&value, output, agent_id.is_some())
         }
         ApiKeyCommand::Get { key_id, surface } => {
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
             let value = client
                 .request(Method::GET, &api_key_path(&agent_id, &key_id), None)
                 .await?;
-            print_value(&value, output, false)
+            print_value(&value, output)
         }
         ApiKeyCommand::Create(args) => {
             let path = entity_path("/v1/api-keys", &args.agent_id);
@@ -8302,7 +8454,7 @@ async fn run_api_keys(
             let value = client
                 .request(Method::POST, &path, Some(body))
                 .await?;
-            print_api_key_secret(&value, output)
+            print_api_key_secret(&value, output, "Created")
         }
         ApiKeyCommand::Revoke { key_id, surface, actor } => {
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
@@ -8310,7 +8462,7 @@ async fn run_api_keys(
             let value = client
                 .request(Method::POST, &path, Some(json!({"actor": actor})))
                 .await?;
-            print_outcome(&value, output, &format!("Revoked API key '{key_id}'"))
+            print_outcome(&value, output, &confirmation_line("Revoked", "API key", &key_id))
         }
         ApiKeyCommand::Rotate { key_id, surface, actor } => {
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
@@ -8318,14 +8470,14 @@ async fn run_api_keys(
             let value = client
                 .request(Method::POST, &path, Some(json!({"actor": actor})))
                 .await?;
-            print_api_key_secret(&value, output)
+            print_api_key_secret(&value, output, "Rotated")
         }
         ApiKeyCommand::Delete { key_id, surface } => {
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
             let value = client
                 .request(Method::DELETE, &api_key_path(&agent_id, &key_id), None)
                 .await?;
-            print_outcome(&value, output, &format!("Deleted API key '{key_id}'"))
+            print_outcome(&value, output, &confirmation_line("Deleted", "API key", &key_id))
         }
     }
 }
@@ -8388,7 +8540,9 @@ fn surfaces_carrying_key<'a>(
         .collect())
 }
 
-/// Prints the outcome of a call the gateway answers with 204 and no body.
+/// Prints the outcome of a delete or an update: the confirmation line in table
+/// mode, even when the gateway sent a document back, and the gateway's own
+/// answer with `--output json`.
 fn print_outcome(
     value: &Value,
     output: Output,
@@ -8399,14 +8553,14 @@ fn print_outcome(
             println!("{line}");
             Ok(())
         }
-        None => print_value(value, output, false),
+        None => print_value(value, output),
     }
 }
 
-/// Chooses what an empty 204 answer puts on standard output: a confirmation
-/// for a person reading a table, and the gateway's own document (`null` for
-/// an empty body) in JSON mode, where prose would make the output
-/// unparseable for whatever consumes it.
+/// Chooses what a delete or revoke puts on standard output, whether the
+/// gateway answered with nothing or with a document: a confirmation for a
+/// person reading a table, and the gateway's own document (`null` for an
+/// empty body) in JSON mode, where prose would break whatever parses it.
 fn outcome_line(
     output: Output,
     confirmation: &str,
@@ -8448,58 +8602,32 @@ fn api_key_path(
     entity_path(&entity_path("/v1/api-keys", agent_id), key_id)
 }
 
-/// Prints a create or rotate response. The secret appears in this response
-/// only and the gateway stores nothing but its hash, so table output prints
-/// the secret alone for capture in a variable.
+/// Prints a create or rotate response for an API key. The secret appears in
+/// this response only and the gateway stores nothing but its hash, so table
+/// output prints it alone on standard output and the confirmation on standard
+/// error.
 fn print_api_key_secret(
     value: &Value,
     output: Output,
+    verb: &str,
 ) -> Result<()> {
-    let Some(secret) = value
-        .get("secret")
-        .and_then(Value::as_str)
-    else {
-        return print_value(value, output, false);
-    };
     let key_id = value
         .get("key_id")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    match output {
-        Output::Json => println!("{}", serde_json::to_string_pretty(value)?),
-        Output::Table => println!("{secret}"),
-    }
-    eprintln!("Secret for API key '{key_id}'. This is the only time it is shown. Store it securely now.");
-    Ok(())
+        .and_then(Value::as_str);
+    print_issued(value, output, verb, "API key", key_id, Some("secret"))
 }
 
 fn print_api_keys(
     value: &Value,
     output: Output,
+    filtered: bool,
 ) -> Result<()> {
-    match (output, value.as_array()) {
-        (Output::Table, Some(rows)) if rows.is_empty() => println!("No results."),
-        (Output::Table, Some(rows)) => {
-            for row in rows {
-                print_api_key_row(row);
-            }
-        }
-        _ => return print_value(value, output, false),
-    }
-    Ok(())
-}
-
-fn print_api_key_row(value: &Value) {
-    let Some(key) = value.as_object() else {
-        println!("{value}");
-        return;
+    let scope = if filtered {
+        Scope::Filtered
+    } else {
+        Scope::All
     };
-    let field = |name: &str| {
-        key.get(name)
-            .and_then(Value::as_str)
-            .unwrap_or("-")
-    };
-    println!("{}\t{}\t{}\t{}", field("key_id"), field("agent_id"), field("client_id"), field("status"));
+    print_list(value, output, &tables::API_KEYS, scope)
 }
 
 async fn run_tenant_ownership(
@@ -9151,7 +9279,7 @@ mod identity_access_tests {
             "strategy.json",
         ])
         .expect("create should parse");
-        assert!(is_create_command(&cli.agent_gateway().command));
+        assert!(create_kind(&cli.agent_gateway().command).is_some());
     }
 
     #[test]
@@ -9166,7 +9294,7 @@ mod identity_access_tests {
             "billing",
         ])
         .expect("create should parse");
-        assert!(!is_create_command(&cli.agent_gateway().command));
+        assert!(create_kind(&cli.agent_gateway().command).is_none());
     }
 
     /// Writes `contents` to a JSON file inside `dir` and returns its path.
@@ -9364,27 +9492,246 @@ mod identity_access_tests {
     }
 
     #[test]
-    fn deletes_with_an_answer_of_their_own_keep_the_shared_printer() {
-        for arguments in [
-            // `run_api_keys` prints this one itself.
-            vec!["fabric", "agent-gateway", "api-keys", "delete", "atgk_1"],
-            // Deactivation answers 200 with the identity it changed.
-            vec!["fabric", "agent-gateway", "identities", "deactivate", "i-1"],
+    fn every_delete_on_the_shared_commands_confirms_with_its_kind_and_id() {
+        for (arguments, line) in [
+            (["surfaces", "delete", "x-1"], "Deleted surface 'x-1'"),
+            (["policies", "delete", "x-1"], "Deleted policy 'x-1'"),
+            (["connections", "delete", "x-1"], "Deleted connection 'x-1'"),
+            (["connection-points", "delete", "x-1"], "Deleted connection point 'x-1'"),
+            (["issuers", "delete", "x-1"], "Deleted issuer 'x-1'"),
+            (["authorities", "delete", "x-1"], "Deleted authority 'x-1'"),
+            (["trust-registries", "delete", "x-1"], "Deleted trust registry 'x-1'"),
+            (["mediators", "delete", "x-1"], "Deleted mediator 'x-1'"),
+            (["mcp-proxies", "delete", "x-1"], "Deleted MCP proxy 'x-1'"),
+            (["a2a-proxies", "delete", "x-1"], "Deleted A2A proxy 'x-1'"),
+            (["sts-clients", "delete", "x-1"], "Deleted STS client 'x-1'"),
+            (["credential-providers", "delete", "x-1"], "Deleted credential provider 'x-1'"),
+            (["integrations", "delete", "x-1"], "Deleted integration 'x-1'"),
         ] {
-            let cli = Cli::try_parse_from(&arguments).expect("the command should parse");
-            assert!(
-                delete_confirmation(&cli.agent_gateway().command).is_none(),
-                "{arguments:?} does not answer with an empty 204",
-            );
+            let mut full = vec!["fabric", "agent-gateway"];
+            full.extend(arguments);
+            let cli = Cli::try_parse_from(&full).expect("delete should parse");
+
+            assert_eq!(delete_confirmation(&cli.agent_gateway().command).as_deref(), Some(line), "{full:?}");
         }
+    }
+
+    #[test]
+    fn a_delete_confirmation_never_carries_control_characters() {
+        let cli = Cli::try_parse_from(["fabric", "agent-gateway", "issuers", "delete", "i\u{1b}[31m-1"])
+            .expect("delete should parse");
+
+        let line = delete_confirmation(&cli.agent_gateway().command).expect("a confirmation");
+
+        assert_eq!(line, "Deleted issuer 'i[31m-1'");
+    }
+
+    #[test]
+    fn a_confirmation_line_keeps_a_typed_id_on_one_line_and_whole() {
+        assert_eq!(confirmation_line("Deleted", "issuer", "a\nb\tc\rd"), "Deleted issuer 'a b c d'");
+
+        let long = "i".repeat(800);
+        assert_eq!(confirmation_line("Revoked", "grant", &long), format!("Revoked grant '{long}'"));
+    }
+
+    #[test]
+    fn each_list_command_prints_the_header_of_its_own_resource() {
+        for (arguments, header) in [
+            (vec!["surfaces", "list"], "NAME  ID  PROTOCOL  ROUTE  TARGET  TRANSIT POINTS"),
+            (vec!["policies", "list"], "NAME  ID  DESCRIPTION  ENABLED  VERSION  UPDATED"),
+            (vec!["policies", "versions", "p-1"], "VERSION  HASH  CREATED  BY  NOTE"),
+            (vec!["connections", "list"], "NAME  ID  TYPE  STATUS  UPDATED"),
+            (vec!["connection-points", "list"], "NAME  ID  CONNECTION  ENABLED  USES  EXPIRES"),
+            (vec!["issuers", "list"], "NAME  ID  DID  DESCRIPTION"),
+            (vec!["authorities", "list"], "NAME  ID  DID  DESCRIPTION"),
+            (vec!["trust-registries", "list"], "NAME  ID  DID  DESCRIPTION"),
+            (vec!["mediators", "list"], "NAME  ID  STATUS  DID  DESCRIPTION"),
+            (vec!["mcp-proxies", "list"], "NAME  ID  STATUS  BASE URL  DESCRIPTION"),
+            (vec!["a2a-proxies", "list"], "NAME  ID  STATUS  DESCRIPTION  UPDATED"),
+            (vec!["sts-clients", "list"], "NAME  ID  CLIENT ID  SCOPES"),
+            (vec!["credential-providers", "list"], "NAME  ID  PROVIDER ID  TYPE"),
+            (vec!["certificates", "list"], "NAME  ID  KIND  ACTIVE  UPDATED"),
+            (vec!["secrets", "list"], "NAME  ID  SECRET ID  TYPE  DESCRIPTION"),
+            (vec!["integrations", "list"], "NAME  ID  TYPE  STATUS  DESCRIPTION"),
+            (vec!["users", "list"], "USERNAME  ID  ROLE  STATUS  EMAIL"),
+            (vec!["identities", "list"], "DID  ID  VERSION  ACTIVE  UPDATED"),
+            (vec!["delegation-vault", "list"], "ID  AGENT DID  PROVIDER  EXPIRES  EXPIRED"),
+            (vec!["jwt-verification-strategies", "list"], "NAME  ID  ISSUER  UPDATED"),
+        ] {
+            let mut full = vec!["fabric", "agent-gateway"];
+            full.extend(&arguments);
+            let cli = Cli::try_parse_from(&full).expect("command should parse");
+            let layout = list_layout(&cli.agent_gateway().command).expect("a list has a layout");
+
+            assert_eq!(tables::render_list(layout, &[json!({})])[0], header, "{full:?}");
+        }
+    }
+
+    #[test]
+    fn lists_that_print_themselves_use_their_own_headers() {
+        for (layout, header) in [
+            (&tables::API_KEYS, "KEY ID  SURFACE  CLIENT ID  STATUS"),
+            (&tables::CONNECTION_SETTINGS, "NAME  HOST  CURRENT"),
+            (&tables::PAYMENTS, "ID  STORE  SURFACE  STATUS  AMOUNT  CURRENCY  CREATED"),
+            (&tables::AUDIT, "TIMESTAMP  EVENT  SURFACE  DECISION  DETAIL"),
+            (&tables::GENERIC, "NAME  ID  DESCRIPTION"),
+            (&tables::TOKENS, "NAME  ID  STATUS  SCOPES  CREATED  EXPIRES"),
+        ] {
+            assert_eq!(tables::render_list(layout, &[json!({})])[0], header);
+        }
+    }
+
+    #[test]
+    fn a_token_name_and_id_are_never_cut_but_the_other_cells_are_cleaned() {
+        let long = "n".repeat(700);
+        let row = access_token_row(&json!({"id": long, "name": long, "created_at": "2026-09-01\r"}));
+
+        assert_eq!(row[0].len(), 700);
+        assert_eq!(row[1].len(), 700);
+        assert_eq!(row[4], "2026-09-01 ");
+    }
+
+    #[test]
+    fn a_token_name_with_a_line_break_or_escape_code_stays_in_its_cell() {
+        let row = access_token_row(&json!({"id": "t-1", "name": "ci\nbot\u{1b}[31m", "scopes": ["a\tb"]}));
+
+        assert_eq!(row[0], "ci bot[31m");
+        assert_eq!(row[3], "a b");
+    }
+
+    #[test]
+    fn every_create_kind_has_its_exact_name() {
+        for (arguments, kind) in [
+            (vec!["surfaces", "create", "--name", "n"], "surface"),
+            (vec!["connections", "create", "-f", "x"], "connection"),
+            (vec!["connection-points", "create", "-f", "x"], "connection point"),
+            (vec!["policies", "create", "--id", "p", "--name", "n", "--policy-file", "x"], "policy"),
+            (vec!["issuers", "create", "-f", "x"], "issuer"),
+            (vec!["authorities", "create", "-f", "x"], "authority"),
+            (vec!["trust-registries", "create", "-f", "x"], "trust registry"),
+            (vec!["mediators", "create", "-f", "x"], "mediator"),
+            (vec!["mcp-proxies", "create", "-f", "x"], "MCP proxy"),
+            (vec!["a2a-proxies", "create", "-f", "x"], "A2A proxy"),
+            (vec!["sts-clients", "create", "-f", "x"], "STS client"),
+            (vec!["credential-providers", "create", "-f", "x"], "credential provider"),
+            (vec!["certificates", "create", "-f", "x"], "certificate"),
+            (vec!["secrets", "create", "-f", "x"], "secret"),
+            (vec!["integrations", "create", "-f", "x"], "integration"),
+            (vec!["identities", "create"], "identity"),
+            (vec!["jwt-verification-strategies", "create", "-f", "x"], "JWT verification strategy"),
+        ] {
+            let mut full = vec!["fabric", "agent-gateway"];
+            full.extend(&arguments);
+            let cli = Cli::try_parse_from(&full).expect("create should parse");
+
+            assert_eq!(create_kind(&cli.agent_gateway().command), Some(kind), "{full:?}");
+        }
+    }
+
+    #[test]
+    fn one_notice_wording_serves_tokens_and_api_keys() {
+        assert_eq!(
+            shown_once_notice("access token"),
+            "note: this is the only time the access token secret is shown, so store it securely now."
+        );
+        assert_eq!(
+            shown_once_notice("API key"),
+            "note: this is the only time the API key secret is shown, so store it securely now."
+        );
+    }
+
+    #[test]
+    fn unix_seconds_become_iso_utc_times() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc(1_790_000_000), "2026-09-21T14:13:20Z");
+        assert_eq!(iso_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(iso_utc(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(iso_utc(-2_208_988_800), "1900-01-01T00:00:00Z");
+        assert_eq!(iso_utc(4_107_542_400), "2100-03-01T00:00:00Z");
+        assert_eq!(iso_utc(4_107_456_000), "2100-02-28T00:00:00Z");
+        assert_eq!(iso_utc(32_503_680_000), "3000-01-01T00:00:00Z");
+        assert_eq!(iso_utc(253_402_300_799), "9999-12-31T23:59:59Z");
+        let row = payment_row_with_iso_time(&json!({"created_at": 1_790_000_000, "id": "x"}));
+        assert_eq!(row["created_at"], json!("2026-09-21T14:13:20Z"));
+        let fraction = payment_row_with_iso_time(&json!({"created_at": 1.5}));
+        assert_eq!(fraction["created_at"], json!(1.5));
+        let text = payment_row_with_iso_time(&json!({"created_at": "yesterday"}));
+        assert_eq!(text["created_at"], json!("yesterday"));
+    }
+
+    #[test]
+    fn every_shared_update_names_its_kind_and_the_id_the_user_passed() {
+        for (arguments, line) in [
+            (vec!["issuers", "update", "i-1", "-f", "x.json"], "Updated issuer 'i-1'"),
+            (vec!["connections", "update", "c-1", "-f", "x.json"], "Updated connection 'c-1'"),
+            (vec!["mcp-proxies", "update", "m-1", "-f", "x.json"], "Updated MCP proxy 'm-1'"),
+            (
+                vec!["jwt-verification-strategies", "update", "j-1", "-f", "x.json"],
+                "Updated JWT verification strategy 'j-1'",
+            ),
+            (vec!["identities", "update", "i-1", "-f", "x.json"], "Updated identity 'i-1'"),
+            (vec!["surfaces", "update", "s-1", "-f", "x.json"], "Updated surface 's-1'"),
+        ] {
+            let mut full = vec!["fabric", "agent-gateway"];
+            full.extend(&arguments);
+            let cli = Cli::try_parse_from(&full).expect("update should parse");
+
+            assert_eq!(update_confirmation(&cli.agent_gateway().command).as_deref(), Some(line), "{full:?}");
+        }
+    }
+
+    #[test]
+    fn only_list_commands_have_a_table_layout() {
+        for (arguments, listed) in [
+            (vec!["surfaces", "list"], true),
+            (vec!["policies", "list"], true),
+            (vec!["secrets", "list", "--tag", "x"], true),
+            (vec!["certificates", "list"], true),
+            (vec!["jwt-verification-strategies", "list"], true),
+            (vec!["surfaces", "get", "s-1"], false),
+            (vec!["issuers", "get", "i-1"], false),
+        ] {
+            let mut full = vec!["fabric", "agent-gateway"];
+            full.extend(&arguments);
+            let cli = Cli::try_parse_from(&full).expect("command should parse");
+
+            assert_eq!(list_layout(&cli.agent_gateway().command).is_some(), listed, "{full:?}");
+        }
+    }
+
+    #[test]
+    fn deletes_with_an_answer_of_their_own_keep_the_shared_printer() {
+        // `run_api_keys` prints this one itself.
+        let arguments = ["fabric", "agent-gateway", "api-keys", "delete", "atgk_1"];
+        let cli = Cli::try_parse_from(arguments).expect("the command should parse");
+
+        assert!(delete_confirmation(&cli.agent_gateway().command).is_none(), "{arguments:?} prints its own line");
+    }
+
+    #[test]
+    fn deactivating_an_identity_confirms_even_when_the_gateway_sends_the_identity_back() {
+        let cli = Cli::try_parse_from(["fabric", "agent-gateway", "identities", "deactivate", "i-1"])
+            .expect("deactivate should parse");
+
+        assert_eq!(delete_confirmation(&cli.agent_gateway().command).as_deref(), Some("Deactivated identity 'i-1'"));
+    }
+
+    #[test]
+    fn the_revoke_user_line_uses_the_count_from_the_answer() {
+        assert_eq!(revoked_grants_line(&json!({"revoked": 2}), "sha256:a"), "Revoked 2 grants for user 'sha256:a'");
+        assert_eq!(revoked_grants_line(&json!({"revoked": 1}), "sha256:a"), "Revoked 1 grant for user 'sha256:a'");
+        assert_eq!(revoked_grants_line(&json!({"revoked": 0}), "sha256:a"), "Revoked 0 grants for user 'sha256:a'");
+        assert_eq!(revoked_grants_line(&Value::Null, "sha256:a\nb"), "Revoked grants for user 'sha256:a b'");
+        assert_eq!(revoked_grants_line(&json!({"revoked": "x"}), "h"), "Revoked grants for user 'h'");
     }
 }
 
-/// Runs an `access-tokens` command and prints the result. `list` renders a
-/// table and `revoke` prints a confirmation for the default table output, while
-/// `get`/`create`/`rotate` reuse the shared value printer and `scopes` prints one
-/// grantable scope per line. `--output json` always emits the raw gateway
-/// response (or, for `scopes`, the filtered scope array).
+/// Runs an `access-tokens` command and prints the result. `list` renders the
+/// shared table, `revoke` prints a confirmation line, `create` and `rotate`
+/// print the new secret alone with their confirmation on standard error, `get`
+/// uses the shared value printer and `scopes` prints one grantable scope per
+/// line. `--output json` always emits the raw gateway response (or, for
+/// `scopes`, the filtered scope array).
 async fn run_access_tokens(
     client: &GatewayClient,
     command: AccessTokenCommand,
@@ -9405,7 +9752,9 @@ async fn run_access_tokens(
             let value = client
                 .request(Method::DELETE, &entity_path("/v1/access-tokens", &args.id), None)
                 .await?;
-            print_json_or_else(&value, output, || println!("Revoked access token {}", args.id))?;
+            print_json_or_else(&value, output, || {
+                println!("{}", confirmation_line("Revoked", "access token", &args.id))
+            })?;
         }
         AccessTokenCommand::Rotate(args) => {
             if !args.yes
@@ -9422,13 +9771,13 @@ async fn run_access_tokens(
             let value = client
                 .request(Method::POST, &path, None)
                 .await?;
-            print_value(&value, output, true)?;
+            print_issued(&value, output, "Rotated", "access token", Some(&args.id), Some("token"))?;
         }
         AccessTokenCommand::Get { id } => {
             let value = client
                 .request(Method::GET, &entity_path("/v1/access-tokens", &id), None)
                 .await?;
-            print_value(&value, output, false)?;
+            print_value(&value, output)?;
         }
         AccessTokenCommand::Create(args) => {
             let body = if let Some(file) = args.file {
@@ -9440,7 +9789,7 @@ async fn run_access_tokens(
                 .request(Method::POST, "/v1/access-tokens", Some(body))
                 .await
                 .map_err(add_unknown_scope_hint)?;
-            print_value(&value, output, true)?;
+            print_issued(&value, output, "Created", "access token", None, Some("token"))?;
         }
         AccessTokenCommand::Scopes => {
             let permissions = client
@@ -9563,18 +9912,25 @@ fn print_access_token_table(value: &Value) {
         print_table(value);
         return;
     };
-    if tokens.is_empty() {
-        println!("No results.");
-        return;
-    }
-    let header = ["NAME", "ID", "STATUS", "SCOPES", "CREATED", "EXPIRES"];
-    let rows: Vec<[String; 6]> = tokens
+    let entries: Vec<Value> = tokens
         .iter()
-        .map(access_token_row)
+        .map(access_token_entry)
         .collect();
-    for line in format_table(&header, &rows) {
-        println!("{line}");
-    }
+    print_rows(&tables::TOKENS, &entries, Scope::All);
+}
+
+/// A token as the cells of [`tables::TOKENS`]: the status and the scope
+/// summary are worked out here, since the gateway sends neither as one value.
+fn access_token_entry(token: &Value) -> Value {
+    let [name, id, status, scopes, created_at, expires_at] = access_token_row(token);
+    json!({
+        "name": name,
+        "id": id,
+        "status": status,
+        "scopes": scopes,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    })
 }
 
 /// Formats a single token object as one table row of cell values.
@@ -9587,8 +9943,8 @@ fn access_token_row(token: &Value) -> [String; 6] {
             .unwrap_or("-")
             .to_owned()
     };
-    let name = field("name");
-    let id = field("id");
+    let name = tables::whole_cell(&field("name"));
+    let id = tables::whole_cell(&field("id"));
     let status = access_token_status(token).to_owned();
     let scopes = token
         .get("scopes")
@@ -9600,10 +9956,13 @@ fn access_token_row(token: &Value) -> [String; 6] {
                 .collect::<Vec<_>>()
         })
         .filter(|scopes| !scopes.is_empty())
-        .map(|scopes| summarize_scopes(&scopes))
+        .map(|scopes| table_cell(&summarize_scopes(&scopes)))
         .unwrap_or_else(|| "-".to_owned());
-    let created = field("created_at");
-    let expires = field("expires_at");
+    let created = table_cell(&field("created_at"));
+    let expires = match field("expires_at").as_str() {
+        "-" => "never".to_owned(),
+        expires => table_cell(expires),
+    };
     [name, id, status, scopes, created, expires]
 }
 
@@ -9648,45 +10007,16 @@ fn summarize_scopes(scopes: &[&str]) -> String {
     summary
 }
 
-/// Lays out a header and rows as fixed-width, space-padded columns, matching
-/// the plain style used by tools like `kubectl`/`docker`/`gh`: each column is
-/// padded (left-aligned) to the widest cell in that column (including the
-/// header), with a 2-space gap between columns. The last column is left
-/// unpadded so lines don't carry trailing whitespace.
+/// Lays out a header and rows with the same padding every list uses.
 fn format_table<const N: usize>(
     header: &[&str; N],
     rows: &[[String; N]],
 ) -> Vec<String> {
-    let mut widths = header.map(str::len);
-    for row in rows {
-        for (width, cell) in widths
-            .iter_mut()
-            .zip(row.iter())
-        {
-            *width = (*width).max(cell.len());
-        }
-    }
-    let format_row = |cells: &[&str; N]| -> String {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(index, cell)| {
-                if index == N - 1 {
-                    (*cell).to_owned()
-                } else {
-                    format!("{cell:<width$}", width = widths[index])
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("  ")
-    };
-    let mut lines = Vec::with_capacity(rows.len() + 1);
-    lines.push(format_row(header));
-    for row in rows {
-        let cells: [&str; N] = std::array::from_fn(|index| row[index].as_str());
-        lines.push(format_row(&cells));
-    }
-    lines
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.to_vec())
+        .collect();
+    tables::format_rows(header, &rows)
 }
 
 /// A token is REVOKED when `revoked_at` is set or `active` is explicitly false,
@@ -9882,7 +10212,7 @@ async fn resolve_surface_id(
     }
     let surface_id = resolve_id(client, &SURFACE_LOOKUP, reference).await?;
     if let Some(note) = name_resolved_note(&surface_id, reference) {
-        eprintln!("{note}");
+        eprintln!("note: {note}");
     }
     Ok(surface_id)
 }
@@ -9902,7 +10232,7 @@ fn using_surface_note(
     surface_id: &str,
     name: &str,
 ) -> String {
-    format!("using surface {} ({})", one_line(surface_id), one_line(name))
+    format!("using surface {} ({})", tables::flatten_capped(surface_id), tables::flatten_capped(name))
 }
 
 async fn fetch_surface(
@@ -10319,7 +10649,7 @@ fn surface_features_table(surface: &Value) -> String {
                                         .to_owned()
                                 }
                             };
-                            one_line(&format!("{}: {} ({remove})", place.area, place.field))
+                            tables::flatten_capped(&format!("{}: {} ({remove})", place.area, place.field))
                         })
                         .collect::<Vec<_>>()
                         .join("; "),
@@ -10389,7 +10719,7 @@ async fn run_policies(
     }
 }
 
-use crate::client::{REDACTED, RawAuth, clean_for_terminal, gateway_error, sanitize_for_terminal};
+use crate::client::{REDACTED, RawAuth, clean_for_terminal, gateway_error};
 
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
@@ -10705,7 +11035,22 @@ async fn run_audit(
     let response = audit_document(response, args.reveal);
     match output {
         Output::Json => println!("{}", serde_json::to_string_pretty(&response)?),
-        Output::Table => print_audit_table(&response)?,
+        Output::Table => {
+            let filtered = args.page > 1
+                || args.filter.is_some()
+                || args.category.is_some()
+                || args.flow.is_some()
+                || args.scope.is_some()
+                || args.decision.is_some();
+            print_audit_table(
+                &response,
+                if filtered {
+                    Scope::Filtered
+                } else {
+                    Scope::All
+                },
+            )?
+        }
     }
     Ok(())
 }
@@ -10801,7 +11146,7 @@ async fn fetch_audit_page(
         .await
 }
 
-/// Printed to standard error beneath "No audit events.", for the operator who
+/// Printed to standard error beneath "No audit events yet.", for the operator who
 /// expected events: why the log can be empty, and what it never records.
 const EMPTY_AUDIT_NOTES: [&str; 2] = [
     "An empty result is ambiguous: the gateway answers 200 with no events when the audit log is empty, when its \
@@ -10812,90 +11157,75 @@ const EMPTY_AUDIT_NOTES: [&str; 2] = [
      except revoking delegation tokens.",
 ];
 
-fn print_audit_table(response: &Value) -> Result<()> {
-    write_audit_table(response, &mut io::stdout().lock(), &mut io::stderr().lock()).context("print the audit table")
+fn print_audit_table(
+    response: &Value,
+    scope: Scope,
+) -> Result<()> {
+    write_audit_table(response, &mut io::stdout().lock(), &mut io::stderr().lock(), scope)
+        .context("print the audit table")
 }
 
-/// Write one row per event to `rows`, or, for an empty result, "No audit
-/// events." to `rows` and [`EMPTY_AUDIT_NOTES`] to `notes`, so piped rows stay
-/// clean. `rows` is standard output and `notes` standard error.
+/// Writes the events to `rows` as the shared audit table, or, for an empty
+/// result, "No audit events yet." (or "No matching audit events." when a filter
+/// was given) to `rows` and [`EMPTY_AUDIT_NOTES`] to `notes`,
+/// so piped output stays clean. `rows` is standard output and `notes` standard
+/// error.
 fn write_audit_table(
     response: &Value,
     rows: &mut impl io::Write,
     notes: &mut impl io::Write,
+    scope: Scope,
 ) -> io::Result<()> {
-    let events = response
+    let events: Vec<Value> = response
         .get("events")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-        .unwrap_or_default();
-    if events.is_empty() {
-        writeln!(rows, "No audit events.")?;
-        for note in EMPTY_AUDIT_NOTES {
-            writeln!(notes, "{note}")?;
-        }
-        return Ok(());
+        .unwrap_or_default()
+        .iter()
+        .map(audit_row)
+        .collect();
+    for line in tables::render_scoped(&tables::AUDIT, &events, scope) {
+        writeln!(rows, "{line}")?;
     }
-    for event in events {
-        writeln!(rows, "{}", audit_row(event))?;
+    if events.is_empty() {
+        for note in EMPTY_AUDIT_NOTES {
+            writeln!(notes, "note: {note}")?;
+        }
     }
     Ok(())
 }
 
-/// Format one audit event as `timestamp  event  surface_id  decision  detail`.
-/// Audit events carry none of the `id`, `name`, or `description` keys the
-/// shared list formatter looks for, so every row would otherwise render as
-/// dashes. `detail` is the gateway's own note on the event, such as how many
-/// tokens a revocation removed. Every cell goes through [`table_cell`].
-fn audit_row(event: &Value) -> String {
-    let timestamp = event
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let action = event.get("event");
-    // Actions without fields serialise as a bare string; the rest are
-    // externally tagged, as `{"policy_decision": {…}}`.
-    let (name, details) = match action {
-        Some(Value::String(name)) => (name.as_str(), None),
+/// Flattens one audit event into the `timestamp`, `event`, `surface_id`,
+/// `decision` and `detail` fields of [`tables::AUDIT`]. Events carry none of
+/// the `id`, `name` or `description` keys the generic list looks for, and the
+/// event itself is either a bare string or a tagged object such as
+/// `{"policy_decision": {...}}`, so the table cannot read them in place. A
+/// missing field is left out and prints as `-`; `detail` is the gateway's own
+/// note on the event, such as how many tokens a revocation removed.
+fn audit_row(event: &Value) -> Value {
+    let (name, details) = match event.get("event") {
+        Some(Value::String(name)) => (Some(name.as_str()), None),
         Some(Value::Object(tagged)) => match tagged.iter().next() {
-            Some((name, value)) => (name.as_str(), value.as_object()),
-            None => ("-", None),
+            Some((name, value)) => (Some(name.as_str()), value.as_object()),
+            None => (None, None),
         },
-        _ => ("-", None),
+        _ => (None, None),
     };
-    let surface_id = event
-        .get("surface_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            details
-                .and_then(|fields| fields.get("surface_id"))
-                .and_then(Value::as_str)
-        })
-        .unwrap_or("-");
-    let decision = details
-        .and_then(|fields| fields.get("decision"))
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let detail = event
-        .get("detail")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    [timestamp, name, surface_id, decision, detail]
-        .map(table_cell)
-        .join("\t")
-}
-
-/// One cell of a tab-separated row built from gateway-supplied text: sanitised
-/// like an error message, with line breaks and tabs turned into spaces so a
-/// stored value can neither drive the terminal nor split or shift the row, and
-/// `-` when nothing printable is left.
-fn table_cell(text: &str) -> String {
-    let cell = sanitize_for_terminal(text).replace(['\n', '\t'], " ");
-    if cell.trim().is_empty() {
-        "-".to_owned()
-    } else {
-        cell
-    }
+    let field = |key: &str| {
+        details
+            .and_then(|fields| fields.get(key))
+            .and_then(Value::as_str)
+    };
+    json!({
+        "timestamp": event.get("timestamp"),
+        "event": name,
+        "surface_id": event
+            .get("surface_id")
+            .and_then(Value::as_str)
+            .or_else(|| field("surface_id")),
+        "decision": field("decision"),
+        "detail": event.get("detail"),
+    })
 }
 
 /// Replace the credential-bearing fields of every event: `vp_jwt` carries a
@@ -11039,21 +11369,27 @@ async fn list_payments(
         bail!("{}", notes.join("\n"));
     }
     for note in &notes {
-        eprintln!("{note}");
+        eprintln!("warning: {note}");
     }
 
     sort_payments_newest_first(&mut rows);
     match output {
         Output::Json => println!("{}", serde_json::to_string_pretty(&Value::Array(rows))?),
         Output::Table => {
-            if rows.is_empty() {
-                println!("No payment records.");
-            }
-            for row in &rows {
-                println!("{}", payment_table_row(row));
-            }
+            let shown: Vec<Value> = rows
+                .iter()
+                .map(payment_row_with_iso_time)
+                .collect();
+            let scope = if args.surface.is_some() || args.status.is_some() {
+                Scope::Filtered
+            } else if !failed.is_empty() {
+                Scope::Partial
+            } else {
+                Scope::All
+            };
+            print_rows(&tables::PAYMENTS, &shown, scope);
             for footer in &footers {
-                eprintln!("{footer}");
+                eprintln!("note: {footer}");
             }
         }
     }
@@ -11076,7 +11412,14 @@ async fn get_payment(
             continue;
         };
         match payments_get(client, candidate, &entity_path(base, id)).await {
-            Ok(Some(record)) => return print_value(&payment_document(record, reveal), output, false),
+            Ok(Some(record)) => {
+                let document = payment_document(record, reveal);
+                let document = match output {
+                    Output::Table => payment_row_with_iso_time(&document),
+                    Output::Json => document,
+                };
+                return print_value(&document, output);
+            }
             Ok(None) => attempts.push(format!("{}: store not configured", candidate.as_str())),
             Err(error) => attempts.push(format!("{error:#}")),
         }
@@ -11093,12 +11436,12 @@ async fn payment_stats(
         .await?
         .with_context(|| payments_disabled(&[PaymentStore::X402]))?;
     if !sync {
-        return print_value(&stats, output, false);
+        return print_value(&stats, output);
     }
     let sync_status = payments_get(client, PaymentStore::X402, "/admin/x402/sync-status")
         .await?
         .unwrap_or(Value::Null);
-    print_value(&json!({"stats": stats, "sync_status": sync_status}), output, false)
+    print_value(&json!({"stats": stats, "sync_status": sync_status}), output)
 }
 
 async fn delete_payment(
@@ -11125,12 +11468,12 @@ async fn delete_payment(
         // The gateway answers 204 with no body, which would otherwise print
         // `null` where a reader expects a result.
         Output::Table => {
-            println!("Deleted x402 payment {id}");
+            println!("{}", confirmation_line("Deleted", "x402 payment", id));
             Ok(())
         }
         // Mirror `GatewayClient::request`, which reports an empty body as a
         // null document, so a JSON consumer never has to parse prose.
-        Output::Json => print_value(&serde_json::from_slice(&body).unwrap_or(Value::Null), output, false),
+        Output::Json => print_value(&serde_json::from_slice(&body).unwrap_or(Value::Null), output),
     }
 }
 
@@ -11288,6 +11631,41 @@ fn payment_row(
     })
 }
 
+/// A payment row for table output, with `created_at`, which both stores keep
+/// as Unix seconds, shown as an ISO 8601 UTC time like the tokens and audit
+/// tables. A value that is not a whole number of seconds is left alone.
+fn payment_row_with_iso_time(row: &Value) -> Value {
+    let mut row = row.clone();
+    if let Some(seconds) = row
+        .get("created_at")
+        .and_then(Value::as_i64)
+    {
+        row["created_at"] = json!(iso_utc(seconds));
+    }
+    row
+}
+
+/// `1790000000` as `2026-09-21T14:13:20Z`.
+fn iso_utc(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let time = seconds.rem_euclid(86_400);
+    // Civil date from a day count since 1970-01-01 (proleptic Gregorian).
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", time / 3_600, time % 3_600 / 60, time % 60)
+}
+
 /// Sort merged rows by `created_at` — Unix seconds in both stores — newest
 /// first, matching the order each store returns on its own.
 fn sort_payments_newest_first(rows: &mut [Value]) {
@@ -11298,24 +11676,6 @@ fn sort_payments_newest_first(rows: &mut [Value]) {
                 .unwrap_or(i64::MIN),
         )
     });
-}
-
-fn payment_table_row(row: &Value) -> String {
-    let cell = |key: &str| match row.get(key) {
-        Some(Value::String(value)) => table_cell(value),
-        Some(Value::Null) | None => "-".to_owned(),
-        Some(other) => table_cell(&other.to_string()),
-    };
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        cell("id"),
-        cell("store"),
-        cell("surface_id"),
-        cell("status"),
-        cell("amount"),
-        cell("currency"),
-        cell("created_at")
-    )
 }
 
 async fn run_metrics(
@@ -11330,7 +11690,7 @@ async fn run_metrics(
             let value = client
                 .request(Method::GET, "/v1/metrics/config", None)
                 .await?;
-            print_value(&value, output, false)
+            print_value(&value, output)
         }
         MetricsCommand::Config {
             command: MetricsConfigCommand::Set(args),
@@ -11339,7 +11699,7 @@ async fn run_metrics(
             let value = client
                 .request(Method::GET, "/v1/metrics/otlp-status", None)
                 .await?;
-            print_value(&value, output, false)
+            print_value(&value, output)
         }
         MetricsCommand::Scrape(args) => scrape_metrics(client, args).await,
         MetricsCommand::TestEndpoint { url } => test_metrics_endpoint(client, &url, output).await,
@@ -11350,7 +11710,7 @@ async fn run_metrics(
             let value = client
                 .request(Method::POST, "/v1/metrics/truncate", None)
                 .await?;
-            print_value(&value, output, false)
+            print_value(&value, output)
         }
     }
 }
@@ -11508,7 +11868,7 @@ async fn test_metrics_endpoint(
             .unwrap_or("connection test failed");
         bail!("{url}: {}", clean_for_terminal(message, &client.secrets(RawAuth::Bearer)));
     }
-    print_value(&value, output, false)
+    print_value(&value, output)
 }
 
 async fn run_logs(
@@ -11533,7 +11893,7 @@ async fn run_logs(
             let value = client
                 .request(Method::POST, "/v1/logs/truncate", None)
                 .await?;
-            print_value(&value, output, false)
+            print_value(&value, output)
         }
     }
 }
@@ -11552,7 +11912,7 @@ fn write_response_body(
             .context("write to standard output");
     }
     std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
-    eprintln!("Wrote {} bytes to {}", body.len(), path.display());
+    eprintln!("note: wrote {} bytes to {}", body.len(), path.display());
     Ok(())
 }
 
@@ -11724,7 +12084,7 @@ mod observability_tests {
             "timestamp": "2026-09-21T10:00:00Z",
             "event": {"policy_decision": {"scope": "surface", "decision": "deny", "surface_id": "sales"}},
         });
-        assert_eq!(audit_row(&event), "2026-09-21T10:00:00Z\tpolicy_decision\tsales\tdeny\t-");
+        assert_eq!(audit_line(&event), "2026-09-21T10:00:00Z  policy_decision  sales    deny      -");
     }
 
     #[test]
@@ -11734,7 +12094,7 @@ mod observability_tests {
             "event": "consent_granted",
             "surface_id": "sales",
         });
-        assert_eq!(audit_row(&event), "2026-09-21T10:00:00Z\tconsent_granted\tsales\t-\t-");
+        assert_eq!(audit_line(&event), "2026-09-21T10:00:00Z  consent_granted  sales    -         -");
     }
 
     /// A reviewer saw nothing after creating an identity with every audit
@@ -11744,7 +12104,13 @@ mod observability_tests {
     fn an_empty_audit_result_says_admin_calls_are_not_audited() {
         let (rows, notes) = audit_table(&json!({"events": [], "total": 0}));
 
-        assert_eq!(rows, "No audit events.\n");
+        assert_eq!(rows, "No audit events yet.\n");
+        assert!(
+            notes
+                .lines()
+                .all(|line| line.starts_with("note: ")),
+            "got: {notes}"
+        );
         assert!(notes.contains("audit subsystem failed to start"), "got: {notes}");
         assert!(notes.contains("cannot read the audit file or the file is not valid UTF-8"), "got: {notes}");
         assert!(notes.contains("drops any line of the file it cannot parse"), "got: {notes}");
@@ -11760,7 +12126,10 @@ mod observability_tests {
     fn an_audit_result_with_events_prints_rows_and_no_notes() {
         let (rows, notes) = audit_table(&json!({"events": [{"timestamp": "t1", "event": "user_tokens_revoked"}]}));
 
-        assert_eq!(rows, "t1\tuser_tokens_revoked\t-\t-\t-\n");
+        assert_eq!(
+            rows,
+            "TIMESTAMP  EVENT                SURFACE  DECISION  DETAIL\nt1         user_tokens_revoked  -        -         -\n"
+        );
         assert_eq!(notes, "");
     }
 
@@ -11768,13 +12137,18 @@ mod observability_tests {
     /// standard error.
     fn audit_table(response: &Value) -> (String, String) {
         let (mut rows, mut notes) = (Vec::new(), Vec::new());
-        write_audit_table(response, &mut rows, &mut notes).expect("write to memory");
+        write_audit_table(response, &mut rows, &mut notes, Scope::All).expect("write to memory");
         (String::from_utf8(rows).expect("UTF-8 rows"), String::from_utf8(notes).expect("UTF-8 notes"))
+    }
+
+    /// The data line `audit list` prints for one event, without the header.
+    fn audit_line(event: &Value) -> String {
+        tables::render_list(&tables::AUDIT, &[audit_row(event)]).remove(1)
     }
 
     #[test]
     fn audit_row_falls_back_to_dashes() {
-        assert_eq!(audit_row(&json!({})), "-\t-\t-\t-\t-");
+        assert_eq!(audit_line(&json!({})), "-          -      -        -         -");
     }
 
     /// The event's own `detail` is the only place some events say what they
@@ -11788,7 +12162,10 @@ mod observability_tests {
             "user_identity_hash": "sha256:abc",
             "via_fabric": false,
         });
-        assert_eq!(audit_row(&event), "2026-09-21T10:00:00Z\tuser_tokens_revoked\t-\t-\t0 tokens revoked");
+        assert_eq!(
+            audit_line(&event),
+            "2026-09-21T10:00:00Z  user_tokens_revoked  -        -         0 tokens revoked"
+        );
     }
 
     /// The detail is gateway-supplied text, so it must not drive the terminal
@@ -11796,10 +12173,10 @@ mod observability_tests {
     #[test]
     fn audit_row_sanitises_the_event_detail() {
         let event = json!({"event": "trace_terminated", "detail": "a\u{1b}[2J\rb\tc\nd"});
-        assert_eq!(audit_row(&event), "-\ttrace_terminated\t-\t-\ta[2Jb c d");
+        assert_eq!(audit_line(&event), "-          trace_terminated  -        -         a[2J b c d");
 
         let blank = json!({"event": "trace_terminated", "detail": "\u{1b}"});
-        assert_eq!(audit_row(&blank), "-\ttrace_terminated\t-\t-\t-");
+        assert_eq!(audit_line(&blank), "-          trace_terminated  -        -         -");
     }
 
     /// Every cell is stored gateway text, so none can clear the screen or add
@@ -11811,7 +12188,7 @@ mod observability_tests {
             "event": {"policy\tdecision": {"decision": "deny\u{7}", "surface_id": "sales\nsupport"}},
             "detail": "\u{1b}",
         });
-        assert_eq!(audit_row(&event), "2026-09-21[2J\tpolicy decision\tsales support\tdeny\t-");
+        assert_eq!(audit_line(&event), "2026-09-21[2J  policy decision  sales support  deny      -");
     }
 
     #[test]
@@ -11820,7 +12197,10 @@ mod observability_tests {
             PaymentStore::X402,
             &json!({"id": "tx\u{1b}[2J1", "surface_id": "sales\tsupport", "status": "Verified\n", "amount": "\u{7}", "asset": "USDC", "created_at": 100}),
         );
-        assert_eq!(payment_table_row(&row), "tx[2J1\tx402\tsales support\tVerified \t-\tUSDC\t100");
+        assert_eq!(
+            tables::render_list(&tables::PAYMENTS, &[row])[1],
+            "tx[2J1  x402   sales support  Verified   -       USDC      100"
+        );
     }
 
     #[test]
@@ -11891,7 +12271,10 @@ mod observability_tests {
     #[test]
     fn payment_table_row_renders_missing_fields_as_dashes() {
         let row = payment_row(PaymentStore::Mpp, &json!({"id": "mpp-1", "created_at": 200}));
-        assert_eq!(payment_table_row(&row), "mpp-1\tmpp\t-\t-\t-\t-\t200");
+        assert_eq!(
+            tables::render_list(&tables::PAYMENTS, &[row])[1],
+            "mpp-1  mpp    -        -       -       -         200"
+        );
     }
 
     #[test]
@@ -12900,24 +13283,7 @@ fn print_json_or_else(
 fn print_value(
     value: &Value,
     output: Output,
-    created: bool,
 ) -> Result<()> {
-    if created
-        && matches!(output, Output::Table)
-        && let Some(token) = value
-            .get("token")
-            .and_then(Value::as_str)
-    {
-        println!("{token}");
-        eprintln!("This is the only time the token secret is shown. Store it securely now.");
-        return Ok(());
-    }
-    if created && matches!(output, Output::Table) {
-        if let Some(id) = id_from_response(value) {
-            println!("{id}");
-            return Ok(());
-        }
-    }
     match output {
         Output::Json => println!("{}", serde_json::to_string_pretty(value)?),
         Output::Table => print_table(value),
@@ -12925,14 +13291,96 @@ fn print_value(
     Ok(())
 }
 
+/// The line shown beneath what a create or rotate printed, when the answer
+/// carries a secret that is never shown again. `kind` is `access token` or
+/// `API key`.
+fn shown_once_notice(kind: &str) -> String {
+    format!("note: this is the only time the {kind} secret is shown, so store it securely now.")
+}
+
+/// Prints the answer to a create or a rotate. Table output is the confirmation
+/// line, `Created surface '<id>'`, using `requested_id` when the command knows
+/// the id and else the one in the answer. When the answer carries a secret in
+/// `secret_field` (a token or key the user has to keep), standard output is
+/// that secret alone and the confirmation goes to standard error. A secret
+/// with control characters is refused, after the gateway made it, with an
+/// error that names the id. `--output json` prints the answer as it
+/// is, and an answer with neither an id nor a secret is printed as the shared
+/// printer would.
+fn print_issued(
+    value: &Value,
+    output: Output,
+    verb: &str,
+    kind: &str,
+    requested_id: Option<&str>,
+    secret_field: Option<&str>,
+) -> Result<()> {
+    let secret = secret_field
+        .and_then(|field| value.get(field))
+        .and_then(Value::as_str);
+    let id = requested_id.or_else(|| id_from_response(value));
+    if matches!(output, Output::Table)
+        && secret.is_some_and(|secret| {
+            secret
+                .chars()
+                .any(char::is_control)
+                || sanitize_whole(secret) != secret
+        })
+    {
+        let what = match id {
+            Some(id) => confirmation_line(verb, kind, id),
+            None => format!("{verb} {kind}"),
+        };
+        let remedy = if verb == "Created" {
+            "Revoke it, or rotate it with --output json to get a new secret."
+        } else {
+            "Run the rotate command again with --output json to get a new secret."
+        };
+        bail!("{what} but its secret contains control characters and was not printed. {remedy}");
+    }
+    // The reminder goes to standard error in both modes, so it never touches
+    // what a script reads from standard output.
+    if secret.is_some() {
+        eprintln!("{}", shown_once_notice(kind));
+    }
+    if matches!(output, Output::Json) {
+        return print_value(value, output);
+    }
+    if id.is_none() && secret.is_none() {
+        return print_value(value, output);
+    }
+    // A secret goes alone to standard output, so `$(...)` captures just that;
+    // the confirmation then moves to standard error.
+    if let Some(id) = id {
+        let line = confirmation_line(verb, kind, id);
+        if secret.is_some() {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    if let Some(secret) = secret {
+        println!("{secret}");
+    }
+    Ok(())
+}
+
+/// Prints the answer to a shared create: [`print_issued`] for a resource kind
+/// that a create command was given, otherwise the shared printer.
+fn print_created_or_value(
+    value: &Value,
+    output: Output,
+    created: Option<&str>,
+) -> Result<()> {
+    match created {
+        Some(kind) => print_issued(value, output, "Created", kind, None, None),
+        None => print_value(value, output),
+    }
+}
+
 fn print_table(value: &Value) {
     match value {
-        Value::Array(rows) if rows.is_empty() => println!("No results."),
-        Value::Array(rows) => {
-            for row in rows {
-                print_row(row);
-            }
-        }
+        Value::Array(rows) => print_rows(&tables::GENERIC, rows, Scope::All),
         // A single entity: show the full configuration, matching the UX config view.
         Value::Object(_) => match serde_json::to_string_pretty(value) {
             Ok(text) => println!("{text}"),
@@ -12942,91 +13390,279 @@ fn print_table(value: &Value) {
     }
 }
 
-fn print_row(value: &Value) {
-    if let Some(object) = value.as_object() {
-        let id = ["surface_id", "id", "gateway_id", "connection_point_id", "user_id", "key_id"]
-            .iter()
-            .find_map(|key| {
-                object
-                    .get(*key)
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("-");
-        let name = object
-            .get("name")
-            .or_else(|| object.get("username"))
-            .or_else(|| object.get("did"))
-            .and_then(Value::as_str)
-            .unwrap_or("-");
-        let description = object
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        println!("{id}\t{name}\t{description}");
-    } else {
-        println!("{value}");
+fn print_rows(
+    layout: &Layout,
+    rows: &[Value],
+    scope: Scope,
+) {
+    for line in tables::render_scoped(layout, rows, scope) {
+        println!("{line}");
     }
 }
 
-/// The confirmation a delete prints in table mode when the gateway answers
-/// 204 with no body, the counterpart of `is_create_command`. Without one the
-/// shared printer puts the literal `null` of that empty body on standard
-/// output. API keys are absent because `run_api_keys` prints its own.
-fn delete_confirmation(command: &Command) -> Option<String> {
+/// Prints a list in the layout of its resource. `--output json` and anything
+/// that is not a plain list go through the shared printer unchanged.
+fn print_list(
+    value: &Value,
+    output: Output,
+    layout: &Layout,
+    scope: Scope,
+) -> Result<()> {
+    match (output, value) {
+        (Output::Table, Value::Array(rows)) => {
+            print_rows(layout, rows, scope);
+            Ok(())
+        }
+        _ => print_value(value, output),
+    }
+}
+
+/// Why an empty list from this command is empty: nothing exists yet, or
+/// nothing matched the filter the command was given.
+fn list_scope(command: &Command) -> Scope {
     match command {
+        Command::Secrets {
+            command: SecretCommand::List { tag: Some(_) },
+            ..
+        } => Scope::Filtered,
+        _ => Scope::All,
+    }
+}
+
+/// The columns a command that prints a list of records uses, or `None` for
+/// any other command.
+fn list_layout(command: &Command) -> Option<&'static Layout> {
+    Some(match command {
+        Command::Surfaces { command: SurfaceCommand::List } => &tables::SURFACES,
+        Command::Connections { command: CrudCommand::List } => &tables::CONNECTIONS,
+        Command::ConnectionPoints { command: CrudCommand::List } => &tables::CONNECTION_POINTS,
+        Command::Policies { command: PolicyCommand::List } => &tables::POLICIES,
+        Command::Policies {
+            command: PolicyCommand::Versions { .. },
+        } => &tables::POLICY_VERSIONS,
+        Command::Issuers { command: CrudCommand::List } => &tables::ISSUERS,
+        Command::Authorities { command: CrudCommand::List } => &tables::AUTHORITIES,
+        Command::TrustRegistries { command: CrudCommand::List } => &tables::TRUST_REGISTRIES,
+        Command::Mediators { command: CrudCommand::List } => &tables::MEDIATORS,
+        Command::McpProxies { command: CrudCommand::List } => &tables::MCP_PROXIES,
+        Command::A2aProxies { command: CrudCommand::List } => &tables::A2A_PROXIES,
+        Command::StsClients { command: CrudCommand::List } => &tables::STS_CLIENTS,
+        Command::CredentialProviders { command: CrudCommand::List } => &tables::CREDENTIAL_PROVIDERS,
+        Command::Certificates { command: CrudCommand::List, .. } => &tables::CERTIFICATES,
+        Command::Secrets {
+            command: SecretCommand::List { .. },
+            ..
+        } => &tables::SECRETS,
+        Command::Integrations { command: CrudCommand::List } => &tables::INTEGRATIONS,
+        Command::Users { command: UserCommand::List } => &tables::USERS,
+        Command::Identities { command: IdentityCommand::List } => &tables::IDENTITIES,
+        Command::DelegationVault {
+            command: DelegationVaultCommand::List,
+        } => &tables::GRANTS,
+        Command::JwtVerificationStrategies {
+            command: JwtStrategyCommand::Crud(CrudCommand::List),
+        } => &tables::JWT_STRATEGIES,
+        _ => return None,
+    })
+}
+
+/// The line a delete prints in table mode, such as `Deleted issuer 'i-1'`.
+/// Most deletes answer with an empty body, which the shared printer would show
+/// as the word `null`, and a surface answers with a document nobody asked to
+/// read. `--output json` still prints whatever the gateway returned. Deletes
+/// that print their own line (certificates, secrets, grant revoke, token
+/// revoke, API keys, payments) are absent.
+fn delete_confirmation(command: &Command) -> Option<String> {
+    let (kind, id) = match command {
         Command::Users {
             command: UserCommand::Delete { user_id },
-        } => Some(format!("Deleted user '{user_id}'")),
+        } => ("user", user_id),
+        Command::Identities {
+            command: IdentityCommand::Deactivate { id },
+        } => return Some(confirmation_line("Deactivated", "identity", id)),
+        Command::Surfaces {
+            command: SurfaceCommand::Delete { surface_id },
+        } => ("surface", surface_id),
+        Command::Policies {
+            command: PolicyCommand::Delete { policy_id },
+        } => ("policy", policy_id),
+        Command::Connections {
+            command: CrudCommand::Delete { id },
+        } => ("connection", id),
+        Command::ConnectionPoints {
+            command: CrudCommand::Delete { id },
+        } => ("connection point", id),
+        Command::Issuers {
+            command: CrudCommand::Delete { id },
+        } => ("issuer", id),
+        Command::Authorities {
+            command: CrudCommand::Delete { id },
+        } => ("authority", id),
+        Command::TrustRegistries {
+            command: CrudCommand::Delete { id },
+        } => ("trust registry", id),
+        Command::Mediators {
+            command: CrudCommand::Delete { id },
+        } => ("mediator", id),
+        Command::McpProxies {
+            command: CrudCommand::Delete { id },
+        } => ("MCP proxy", id),
+        Command::A2aProxies {
+            command: CrudCommand::Delete { id },
+        } => ("A2A proxy", id),
+        Command::StsClients {
+            command: CrudCommand::Delete { id },
+        } => ("STS client", id),
+        Command::CredentialProviders {
+            command: CrudCommand::Delete { id },
+        } => ("credential provider", id),
+        Command::Integrations {
+            command: CrudCommand::Delete { id },
+        } => ("integration", id),
         Command::JwtVerificationStrategies {
             command: JwtStrategyCommand::Crud(CrudCommand::Delete { id }),
-        } => Some(format!("Deleted JWT verification strategy '{id}'")),
-        _ => None,
-    }
+        } => ("JWT verification strategy", id),
+        _ => return None,
+    };
+    Some(confirmation_line("Deleted", kind, id))
 }
 
-fn is_create_command(command: &Command) -> bool {
-    matches!(
-        command,
+/// The one line every delete, revoke, create or update prints in table mode,
+/// such as `Deleted issuer 'i-1'`. The id may be what the user typed, so it is
+/// cleaned with [`tables::flatten`] and never cut.
+fn confirmation_line(
+    verb: &str,
+    kind: &str,
+    id: &str,
+) -> String {
+    format!("{verb} {kind} '{}'", tables::flatten(id))
+}
+
+/// The kind a shared create command makes, named as the delete lines name it.
+/// Access token and API key creates print themselves.
+fn create_kind(command: &Command) -> Option<&'static str> {
+    Some(match command {
         Command::Surfaces {
-            command: SurfaceCommand::Create(_)
-        } | Command::Connections {
-            command: CrudCommand::Create(_)
-        } | Command::ConnectionPoints {
-            command: CrudCommand::Create(_)
-        } | Command::Policies {
-            command: PolicyCommand::Create { .. }
-        } | Command::Issuers {
-            command: CrudCommand::Create(_)
-        } | Command::Authorities {
-            command: CrudCommand::Create(_)
-        } | Command::TrustRegistries {
-            command: CrudCommand::Create(_)
-        } | Command::Mediators {
-            command: CrudCommand::Create(_)
-        } | Command::McpProxies {
-            command: CrudCommand::Create(_)
-        } | Command::A2aProxies {
-            command: CrudCommand::Create(_)
-        } | Command::StsClients {
-            command: CrudCommand::Create(_)
-        } | Command::CredentialProviders {
-            command: CrudCommand::Create(_)
-        } | Command::Certificates {
+            command: SurfaceCommand::Create(_),
+        } => "surface",
+        Command::Connections {
+            command: CrudCommand::Create(_),
+        } => "connection",
+        Command::ConnectionPoints {
+            command: CrudCommand::Create(_),
+        } => "connection point",
+        Command::Policies {
+            command: PolicyCommand::Create { .. },
+        } => "policy",
+        Command::Issuers {
+            command: CrudCommand::Create(_),
+        } => "issuer",
+        Command::Authorities {
+            command: CrudCommand::Create(_),
+        } => "authority",
+        Command::TrustRegistries {
+            command: CrudCommand::Create(_),
+        } => "trust registry",
+        Command::Mediators {
+            command: CrudCommand::Create(_),
+        } => "mediator",
+        Command::McpProxies {
+            command: CrudCommand::Create(_),
+        } => "MCP proxy",
+        Command::A2aProxies {
+            command: CrudCommand::Create(_),
+        } => "A2A proxy",
+        Command::StsClients {
+            command: CrudCommand::Create(_),
+        } => "STS client",
+        Command::CredentialProviders {
+            command: CrudCommand::Create(_),
+        } => "credential provider",
+        Command::Certificates {
             command: CrudCommand::Create(_),
             ..
-        } | Command::Secrets {
+        } => "certificate",
+        Command::Secrets {
             command: SecretCommand::Create(_),
             ..
-        } | Command::Integrations {
-            command: CrudCommand::Create(_)
-        } | Command::Identities {
-            command: IdentityCommand::Create { .. }
-        } | Command::JwtVerificationStrategies {
-            command: JwtStrategyCommand::Crud(CrudCommand::Create(_))
-        } | Command::AccessTokens {
-            command: AccessTokenCommand::Create(_)
+        } => "secret",
+        Command::Integrations {
+            command: CrudCommand::Create(_),
+        } => "integration",
+        Command::Identities {
+            command: IdentityCommand::Create { .. },
+        } => "identity",
+        Command::JwtVerificationStrategies {
+            command: JwtStrategyCommand::Crud(CrudCommand::Create(_)),
+        } => "JWT verification strategy",
+        _ => return None,
+    })
+}
+
+/// The line an update prints in table mode, such as `Updated issuer 'i-1'`,
+/// with the id the user passed, which for a surface is already the resolved id.
+/// Certificate and secret updates print their own line from the resolved id.
+/// `--output json` still prints what the gateway returned. A surface dry run
+/// never gets here, since it prints its own result.
+fn update_confirmation(command: &Command) -> Option<String> {
+    let (kind, id) = match command {
+        Command::Users {
+            command: UserCommand::Update { user_id, .. },
+        } => ("user", user_id),
+        Command::Surfaces {
+            command: SurfaceCommand::Update { surface_id, .. },
+        } => ("surface", surface_id),
+        Command::Policies {
+            command: PolicyCommand::Update { policy_id, .. },
+        } => ("policy", policy_id),
+        Command::Connections {
+            command: CrudCommand::Update { id, .. },
+        } => ("connection", id),
+        Command::ConnectionPoints {
+            command: CrudCommand::Update { id, .. },
+        } => ("connection point", id),
+        Command::Issuers {
+            command: CrudCommand::Update { id, .. },
+        } => ("issuer", id),
+        Command::Authorities {
+            command: CrudCommand::Update { id, .. },
+        } => ("authority", id),
+        Command::TrustRegistries {
+            command: CrudCommand::Update { id, .. },
+        } => ("trust registry", id),
+        Command::Mediators {
+            command: CrudCommand::Update { id, .. },
+        } => ("mediator", id),
+        Command::McpProxies {
+            command: CrudCommand::Update { id, .. },
+        } => ("MCP proxy", id),
+        Command::A2aProxies {
+            command: CrudCommand::Update { id, .. },
+        } => ("A2A proxy", id),
+        Command::StsClients {
+            command: CrudCommand::Update { id, .. },
+        } => ("STS client", id),
+        Command::CredentialProviders {
+            command: CrudCommand::Update { id, .. },
+        } => ("credential provider", id),
+        Command::Integrations {
+            command: CrudCommand::Update { id, .. },
+        } => ("integration", id),
+        Command::JwtVerificationStrategies {
+            command: JwtStrategyCommand::Crud(CrudCommand::Update { id, .. }),
+        } => ("JWT verification strategy", id),
+        Command::Identities {
+            command: IdentityCommand::Update { id, .. },
+        } => ("identity", id),
+        Command::Surfaces {
+            command: SurfaceCommand::AddFeature(AddFeatureArgs { surface_id, .. }),
         }
-    )
+        | Command::Surfaces {
+            command: SurfaceCommand::RemoveFeature(FeaturePlacementArgs { surface_id, .. }),
+        } => ("surface", surface_id),
+        _ => return None,
+    };
+    Some(confirmation_line("Updated", kind, id))
 }
 
 #[cfg(test)]
@@ -13917,7 +14553,7 @@ mod tests {
         });
         let row = access_token_row(&token);
         assert_eq!(row[4], "2027-01-01T00:00:00Z");
-        assert_eq!(row[5], "-");
+        assert_eq!(row[5], "never");
     }
 
     #[test]

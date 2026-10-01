@@ -1,5 +1,16 @@
 [graph]
 all-features = true
+# Only the platforms the CLI ships for. `webpki-root-certs` (CDLA-Permissive-2.0,
+# not on the approved list) is only pulled in for wasm32 builds, which the CLI
+# never targets. There is no release pipeline yet, so whoever adds one or a new
+# build target (for example Windows ARM or musl Linux) must update this list.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
 
 [advisories]
 version = 2
@@ -12,47 +23,47 @@ wildcards = "deny"
 [licenses]
 version = 2
 confidence-threshold = 0.93
+# Exactly the approved list in "Affinidi Software License Policies (Closed,
+# Open-Source Licenses)", last synced 2026-10-01:
+# https://lemmatree.atlassian.net/wiki/spaces/ISMS/pages/2735348416591
+# Anything else needs Legal first, so it is added here only after they clear it,
+# not as a per-crate exception. Unicode-3.0 was cleared by Legal on 2026-10-01.
+unused-allowed-license = "allow"
 allow = [
+    # Permissive
+    "0BSD",
+    "AFL-2.1",
+    "Apache-1.1",
     "Apache-2.0",
-    "BSL-1.0",
     "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "0BSD",
+    "BSL-1.0",
     "CC0-1.0",
+    "Fair",
     "ISC",
-    "MIT-0",
+    "Intel",
     "MIT",
+    "MIT-0",
+    "MIT-Modern-Variant",
+    "MirOS",
+    "MulanPSL-2.0",
+    "Multics",
+    "NCSA",
+    "Naumen",
+    "OFL-1.1",
+    "PHP-3.01",
+    "PostgreSQL",
+    "Python-2.0",
+    "UPL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
     "Unlicense",
+    "WTFPL",
     "Zlib",
-]
-
-exceptions = [
-    # MPL-2.0 (file-level copyleft), transitive via dirs -> dirs-sys. Same
-    # treatment as the other MPL-2.0 crates allowed in the gateway repo.
-    { allow = ["MPL-2.0"], crate = "option-ext" },
-    # CDLA-Permissive-2.0, Mozilla's root certificate list (via reqwest -> rustls-platform-verifier)
-    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
-    # Unicode-3.0, ICU / yoke / zerovec family (via url -> idna) and unicode-ident
-    { allow = ["Unicode-3.0"], crate = "icu_collections" },
-    { allow = ["Unicode-3.0"], crate = "icu_locale_core" },
-    { allow = ["Unicode-3.0"], crate = "icu_normalizer" },
-    { allow = ["Unicode-3.0"], crate = "icu_normalizer_data" },
-    { allow = ["Unicode-3.0"], crate = "icu_properties" },
-    { allow = ["Unicode-3.0"], crate = "icu_properties_data" },
-    { allow = ["Unicode-3.0"], crate = "icu_provider" },
-    { allow = ["Unicode-3.0"], crate = "litemap" },
-    { allow = ["Unicode-3.0"], crate = "potential_utf" },
-    { allow = ["Unicode-3.0"], crate = "tinystr" },
-    { allow = ["Unicode-3.0"], crate = "unicode-ident" },
-    { allow = ["Unicode-3.0"], crate = "writeable" },
-    { allow = ["Unicode-3.0"], crate = "yoke" },
-    { allow = ["Unicode-3.0"], crate = "yoke-derive" },
-    { allow = ["Unicode-3.0"], crate = "zerofrom" },
-    { allow = ["Unicode-3.0"], crate = "zerofrom-derive" },
-    { allow = ["Unicode-3.0"], crate = "zerotrie" },
-    { allow = ["Unicode-3.0"], crate = "zerovec" },
-    { allow = ["Unicode-3.0"], crate = "zerovec-derive" },
+    # Weak copyleft, approved as long as we don't modify the dependency. Check
+    # new MPL-2.0 crates and any `[patch]` entry in review, as cargo-deny can't.
+    "MPL-2.0",
 ]
 
 [sources]
