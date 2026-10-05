@@ -1531,11 +1531,16 @@ async fn whoami_info(
     Ok(info)
 }
 
-/// Add the held token's own `scopes` to `fields` by calling `/v1/token-info`.
-/// A session/passkey login reports `null` scopes there (it holds its full
-/// role), so nothing is inserted; a personal access token's own granted
-/// scopes are copied in as-is. If the call fails, a warning goes to stderr
-/// and `fields` is left unchanged so `whoami` still reports the rest.
+/// Add the held token's `scopes` to `fields` by calling `/v1/token-info`, and
+/// its `token_id` and `token_name`. A session/passkey login reports `null`
+/// scopes and no `token_id` there (it holds its full role), so none are
+/// inserted; a personal access token's own granted scopes are copied in
+/// as-is. The name comes from the token's own record, and only its `name` is
+/// copied; when that record can't be read because the token lacks
+/// `access_tokens.view` (or the record is gone) the name is left out without
+/// a warning, and any other failure warns on stderr without the body. If the
+/// token-info call fails, a warning goes to stderr and `fields` is left
+/// unchanged so `whoami` still reports the rest.
 async fn insert_token_scopes(
     fields: &mut serde_json::Map<String, Value>,
     client: &GatewayClient,
@@ -1551,6 +1556,31 @@ async fn insert_token_scopes(
             {
                 fields.insert("scopes".to_owned(), scopes.clone());
             }
+            if let Some(token_id) = token_info
+                .get("token_id")
+                .and_then(Value::as_str)
+            {
+                // `print_info_table` prints values as they are, so they are cleaned here.
+                fields.insert("token_id".to_owned(), json!(tables::flatten(token_id)));
+                match client
+                    .request(Method::GET, &entity_path("/v1/access-tokens", token_id), None)
+                    .await
+                {
+                    Ok(record) => {
+                        if let Some(name) = record
+                            .get("name")
+                            .and_then(Value::as_str)
+                        {
+                            fields.insert("token_name".to_owned(), json!(tables::flatten_capped(name)));
+                        }
+                    }
+                    Err(error) => match response_status(&error) {
+                        Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) => {}
+                        Some(status) => eprintln!("warning: could not load token name: gateway answered {status}"),
+                        None => eprintln!("warning: could not load token name: the request failed"),
+                    },
+                }
+            }
         }
         Err(error) => {
             eprintln!("warning: could not load token scopes: {error:#}");
@@ -1559,6 +1589,12 @@ async fn insert_token_scopes(
 }
 
 fn print_info_table(value: &Value) {
+    for line in info_table_lines(value) {
+        println!("{line}");
+    }
+}
+
+fn info_table_lines(value: &Value) -> Vec<String> {
     const ORDER: &[&str] = &[
         "connection",
         "host",
@@ -1568,15 +1604,17 @@ fn print_info_table(value: &Value) {
         "role",
         "email",
         "user_id",
+        "token_id",
+        "token_name",
         "first_name",
         "last_name",
         "scopes",
         "error",
     ];
     let Some(object) = value.as_object() else {
-        println!("{value}");
-        return;
+        return vec![value.to_string()];
     };
+    let mut lines = Vec::new();
     for key in ORDER {
         if let Some(field) = object.get(*key) {
             let rendered = match field {
@@ -1588,9 +1626,10 @@ fn print_info_table(value: &Value) {
                     .join(", "),
                 other => other.to_string(),
             };
-            println!("{key}: {rendered}");
+            lines.push(format!("{key}: {rendered}"));
         }
     }
+    lines
 }
 
 fn logout(
@@ -3086,6 +3125,282 @@ mod gateway_config_tests {
             panic!("expected a surfaces command");
         };
         command
+    }
+
+    const CREATED_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"route":"/sales","protocol":"mcp"},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
+
+    #[test]
+    fn a_created_surface_is_shown_with_its_name_route_protocol_and_target() {
+        let surface: Value = serde_json::from_str(CREATED_SURFACE).expect("surface");
+
+        assert_eq!(
+            created_surface_lines(&surface),
+            [
+                "Created surface 'Sales'",
+                "  id: s-1",
+                "  name: Sales",
+                "  route: /sales",
+                "  protocol: mcp",
+                "  target: http://127.0.0.1:3000"
+            ]
+        );
+        assert_eq!(created_surface_lines(&json!({"surface_id": "s-1"})), ["Created surface 's-1'", "  id: s-1"]);
+        assert_eq!(created_surface_lines(&json!({})), ["Created surface"]);
+    }
+
+    #[test]
+    fn a_created_surface_with_an_empty_or_blank_name_is_confirmed_by_its_id_without_a_name_row() {
+        for name in ["", "   ", "\t\n"] {
+            assert_eq!(
+                created_surface_lines(&json!({"surface_id": "s-1", "name": name})),
+                ["Created surface 's-1'", "  id: s-1"],
+                "name {name:?}"
+            );
+            assert_eq!(created_surface_lines(&json!({"name": name})), ["Created surface"], "name {name:?}");
+        }
+    }
+
+    #[test]
+    fn a_created_surface_with_an_empty_blank_or_control_only_id_has_no_id_row() {
+        for id in ["", "   ", "\t\n", "\u{1b}\u{7}"] {
+            assert_eq!(
+                created_surface_lines(&json!({"surface_id": id, "name": "Sales"})),
+                ["Created surface 'Sales'", "  name: Sales"],
+                "id {id:?}"
+            );
+            assert_eq!(created_surface_lines(&json!({"surface_id": id})), ["Created surface"], "id {id:?}");
+        }
+    }
+
+    #[test]
+    fn a_created_surface_with_a_control_only_name_is_confirmed_by_its_id_without_a_name_row() {
+        let name = "\u{1b}\u{7}";
+
+        assert_eq!(
+            created_surface_lines(&json!({"surface_id": "s-1", "name": name})),
+            ["Created surface 's-1'", "  id: s-1"]
+        );
+        assert_eq!(created_surface_lines(&json!({"name": name})), ["Created surface"]);
+        assert_eq!(created_surface_lines(&json!({"surface_id": "\t", "name": name})), ["Created surface"]);
+    }
+
+    #[test]
+    fn a_created_surface_is_cleaned_of_control_characters() {
+        let surface = json!({"surface_id": "s\u{1b}[2J-1", "name": "Sa\nles", "access_point": {"route": "/a\tb"}});
+
+        let lines = created_surface_lines(&surface);
+
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains(['\u{1b}', '\n', '\t'])),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "  id: s[2J-1");
+    }
+
+    #[test]
+    fn a_created_surface_caps_a_very_long_name_in_its_first_line_like_the_name_row() {
+        let long = "n".repeat(600);
+
+        let lines = created_surface_lines(&json!({"surface_id": "s-1", "name": long}));
+
+        assert_eq!(lines[0], format!("Created surface '{}'", tables::flatten_capped(&long)));
+        assert_eq!(lines[2], format!("  name: {}", tables::flatten_capped(&long)));
+        assert!(lines[0].len() < 600, "{}", lines[0].len());
+    }
+
+    #[tokio::test]
+    async fn surface_create_prints_a_table_itself_and_hands_json_back_unchanged() {
+        let command = || surface_command(&["fabric", "agent-gateway", "surfaces", "create", "--name", "Sales"]);
+        let (host, _) = scripted_server(vec![("HTTP/1.1 201 Created", CREATED_SURFACE)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let table = run_surfaces(&client, command(), Output::Table)
+            .await
+            .expect("create");
+        let (host, _) = scripted_server(vec![("HTTP/1.1 201 Created", CREATED_SURFACE)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let json = run_surfaces(&client, command(), Output::Json)
+            .await
+            .expect("create");
+
+        assert_eq!(table, None, "the table is printed by the create itself");
+        assert_eq!(json, serde_json::from_str::<Value>(CREATED_SURFACE).ok());
+    }
+
+    const TOKEN_INFO: &str = r#"{"user_id":"u-1","token_id":"tok-1","scopes":["tokens.read"]}"#;
+
+    async fn token_fields(
+        responses: Vec<(&'static str, &'static str)>
+    ) -> (serde_json::Map<String, Value>, Vec<String>) {
+        let (host, requests) = scripted_server(responses).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let mut fields = serde_json::Map::new();
+        insert_token_scopes(&mut fields, &client).await;
+        (fields, request_lines(requests))
+    }
+
+    #[tokio::test]
+    async fn insert_token_scopes_copies_pat_token_id_and_name() {
+        let (fields, requests) = token_fields(vec![
+            ("HTTP/1.1 200 OK", TOKEN_INFO),
+            ("HTTP/1.1 200 OK", r#"{"id":"tok-1","name":"ci","secret_hint":"abc"}"#),
+        ])
+        .await;
+
+        assert_eq!(fields.get("token_id"), Some(&json!("tok-1")));
+        assert_eq!(fields.get("token_name"), Some(&json!("ci")));
+        assert_eq!(fields.get("scopes"), Some(&json!(["tokens.read"])));
+        assert_eq!(fields.len(), 3, "only the name is taken from the token record");
+        assert_eq!(requests, ["GET /api/v1/token-info HTTP/1.1", "GET /api/v1/access-tokens/tok-1 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn insert_token_scopes_keeps_the_token_id_when_the_name_lookup_is_refused() {
+        let (fields, _) = token_fields(vec![
+            ("HTTP/1.1 200 OK", TOKEN_INFO),
+            ("HTTP/1.1 403 Forbidden", r#"{"error":"Forbidden","details":"needs access_tokens.view"}"#),
+        ])
+        .await;
+
+        assert_eq!(fields.get("token_id"), Some(&json!("tok-1")));
+        assert!(!fields.contains_key("token_name"));
+    }
+
+    #[tokio::test]
+    async fn insert_token_scopes_skips_the_token_for_a_login_without_a_token_id() {
+        let (fields, requests) =
+            token_fields(vec![("HTTP/1.1 200 OK", r#"{"user_id":"u-1","token_id":null,"scopes":null}"#)]).await;
+
+        assert!(fields.is_empty());
+        assert_eq!(requests, ["GET /api/v1/token-info HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn insert_token_scopes_cleans_the_token_id_and_name() {
+        let (fields, _) = token_fields(vec![
+            ("HTTP/1.1 200 OK", r#"{"token_id":"t\u001b[2Jk\nx","scopes":null}"#),
+            ("HTTP/1.1 200 OK", r#"{"name":"ci\u001b[2J\nnext"}"#),
+        ])
+        .await;
+
+        assert_eq!(fields.get("token_id"), Some(&json!("t[2Jk x")));
+        assert_eq!(fields.get("token_name"), Some(&json!("ci[2J next")));
+    }
+
+    #[test]
+    fn the_whoami_table_lists_the_token_rows_after_the_user_id() {
+        let info = json!({
+            "user_id": "u-1",
+            "token_id": "tok-1",
+            "token_name": "ci",
+            "first_name": "Ada",
+        });
+
+        assert_eq!(info_table_lines(&info), ["user_id: u-1", "token_id: tok-1", "token_name: ci", "first_name: Ada"]);
+    }
+
+    #[tokio::test]
+    async fn insert_token_scopes_leaves_out_a_token_id_that_is_not_text() {
+        let (fields, requests) = token_fields(vec![("HTTP/1.1 200 OK", r#"{"token_id":7,"scopes":["a"]}"#)]).await;
+
+        assert!(!fields.contains_key("token_id"));
+        assert!(!fields.contains_key("token_name"));
+        assert_eq!(requests, ["GET /api/v1/token-info HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn insert_token_scopes_leaves_out_a_token_name_that_is_not_text() {
+        let (fields, _) =
+            token_fields(vec![("HTTP/1.1 200 OK", TOKEN_INFO), ("HTTP/1.1 200 OK", r#"{"name":5}"#)]).await;
+
+        assert_eq!(fields.get("token_id"), Some(&json!("tok-1")));
+        assert!(!fields.contains_key("token_name"));
+    }
+
+    #[tokio::test]
+    async fn insert_token_scopes_keeps_the_rest_when_the_name_lookup_fails_with_a_server_error() {
+        let (fields, _) = token_fields(vec![
+            ("HTTP/1.1 200 OK", TOKEN_INFO),
+            ("HTTP/1.1 500 Internal Server Error", r#"{"error":"secret-body-text"}"#),
+        ])
+        .await;
+
+        assert_eq!(fields.get("token_id"), Some(&json!("tok-1")));
+        assert_eq!(fields.get("scopes"), Some(&json!(["tokens.read"])));
+        assert!(!fields.contains_key("token_name"));
+        assert!(!format!("{fields:?}").contains("secret-body-text"), "the response body must not reach the output");
+    }
+
+    #[tokio::test]
+    async fn insert_token_scopes_path_encodes_the_token_id_in_the_name_lookup() {
+        let (_, requests) = token_fields(vec![
+            ("HTTP/1.1 200 OK", r#"{"token_id":"a/b","scopes":null}"#),
+            ("HTTP/1.1 404 Not Found", "{}"),
+        ])
+        .await;
+
+        assert_eq!(requests[1], "GET /api/v1/access-tokens/a%2Fb HTTP/1.1");
+    }
+
+    fn api_patch(
+        data: Option<&str>,
+        file: Option<PathBuf>,
+    ) -> ApiArgs {
+        ApiArgs {
+            method: ApiMethod::Patch,
+            path: "/v1/surfaces/s-1".to_owned(),
+            data: data.map(str::to_owned),
+            file,
+        }
+    }
+
+    #[tokio::test]
+    async fn api_patch_sends_the_merge_patch_content_type_and_the_data() {
+        let (host, requests) = scripted_server(vec![("HTTP/1.1 200 OK", r#"{"id":"s-1"}"#)]).await;
+        let client = GatewayClient::new(host, "agpat_test").expect("client");
+
+        let answer = run_api(&client, api_patch(Some(r#"{"description":null}"#), None))
+            .await
+            .expect("patch");
+
+        let sent = full_requests(requests)
+            .remove(0)
+            .to_lowercase();
+        assert_eq!(answer, json!({"id": "s-1"}));
+        assert!(sent.starts_with("patch /api/v1/surfaces/s-1 http/1.1"), "{sent}");
+        assert!(sent.contains("content-type: application/merge-patch+json"), "{sent}");
+        assert!(sent.ends_with(r#"{"description":null}"#), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn api_patch_reads_its_body_from_a_file() {
+        let (host, requests) = scripted_server(vec![("HTTP/1.1 200 OK", "{}")]).await;
+        let client = GatewayClient::new(host, "agpat_test").expect("client");
+        let file = json_file(r#"{"tags":["a"]}"#);
+
+        run_api(&client, api_patch(None, Some(file.path().to_path_buf())))
+            .await
+            .expect("patch");
+
+        let sent = full_requests(requests)
+            .remove(0)
+            .to_lowercase();
+        assert!(sent.contains("content-type: application/merge-patch+json"), "{sent}");
+        assert!(sent.ends_with(r#"{"tags":["a"]}"#), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn api_patch_without_a_body_is_refused_before_anything_is_sent() {
+        let (host, requests) = scripted_server(vec![]).await;
+        let client = GatewayClient::new(host, "agpat_test").expect("client");
+
+        let error = run_api(&client, api_patch(None, None))
+            .await
+            .expect_err("a patch needs a body");
+
+        assert_eq!(error.to_string(), "api patch needs a body: give --data or --file");
+        assert!(request_lines(requests).is_empty());
     }
 
     #[tokio::test]
@@ -7586,10 +7901,16 @@ async fn run_surfaces(
             } else {
                 surface_body(args)?
             };
-            client
+            let created = client
                 .request(Method::POST, "/v1/surfaces", Some(body))
-                .await
-                .map(Some)
+                .await?;
+            if matches!(output, Output::Table) {
+                for line in created_surface_lines(&created) {
+                    println!("{line}");
+                }
+                return Ok(None);
+            }
+            Ok(Some(created))
         }
         SurfaceCommand::Update {
             surface_id,
@@ -7661,6 +7982,45 @@ async fn run_surfaces(
             unreachable!("the tool gate preview is handled before the surfaces commands run")
         }
     }
+}
+
+/// The lines printed for a created surface: the confirmation, then its id,
+/// name, route, protocol and target as the gateway answered them. A field the
+/// answer lacks is left out, and an answer with no name, or a blank one, is
+/// confirmed by its id. A name or id that is empty, only whitespace or only
+/// control characters counts as missing.
+fn created_surface_lines(surface: &Value) -> Vec<String> {
+    let text_at = |path: &[&str]| {
+        path.iter()
+            .try_fold(surface, |value, key| value.get(*key))
+            .and_then(Value::as_str)
+    };
+    let printable = |text: &&str| {
+        !tables::flatten(text)
+            .trim()
+            .is_empty()
+    };
+    let name = text_at(&["name"]).filter(printable);
+    let id = id_from_response(surface).filter(printable);
+    let confirmed_as = name.or(id);
+    let mut lines = vec![match confirmed_as {
+        Some(name) => format!("Created surface '{}'", tables::flatten_capped(name)),
+        None => "Created surface".to_owned(),
+    }];
+    if let Some(id) = id {
+        lines.push(format!("  id: {}", tables::flatten(id)));
+    }
+    for (label, text) in [
+        ("name", name),
+        ("route", text_at(&["access_point", "route"])),
+        ("protocol", text_at(&["access_point", "protocol"])),
+        ("target", text_at(&["target", "endpoint"])),
+    ] {
+        if let Some(text) = text {
+            lines.push(format!("  {label}: {}", tables::flatten_capped(text)));
+        }
+    }
+    lines
 }
 
 /// Where a surface keeps its MCP tool gating.
@@ -9755,7 +10115,6 @@ mod identity_access_tests {
     #[test]
     fn every_create_kind_has_its_exact_name() {
         for (arguments, kind) in [
-            (vec!["surfaces", "create", "--name", "n"], "surface"),
             (vec!["connections", "create", "-f", "x"], "connection"),
             (vec!["connection-points", "create", "-f", "x"], "connection point"),
             (vec!["policies", "create", "--id", "p", "--name", "n", "--policy-file", "x"], "policy"),
@@ -13369,6 +13728,13 @@ async fn run_api(
         (None, None) => None,
         (Some(_), Some(_)) => unreachable!(),
     };
+    // The gateway takes a PATCH only as a JSON Merge Patch, which needs its own content type.
+    if matches!(args.method, ApiMethod::Patch) {
+        let patch = body.context("api patch needs a body: give --data or --file")?;
+        return client
+            .merge_patch(&args.path, patch)
+            .await;
+    }
     client
         .request(args.method.method(), &args.path, body)
         .await
@@ -13698,12 +14064,9 @@ fn confirmation_line(
 }
 
 /// The kind a shared create command makes, named as the delete lines name it.
-/// Access token and API key creates print themselves.
+/// Surface, access token and API key creates print themselves.
 fn create_kind(command: &Command) -> Option<&'static str> {
     Some(match command {
-        Command::Surfaces {
-            command: SurfaceCommand::Create(_),
-        } => "surface",
         Command::Connections {
             command: CrudCommand::Create(_),
         } => "connection",

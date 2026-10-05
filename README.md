@@ -103,7 +103,7 @@ fabric agent-gateway whoami
 fabric agent-gateway whoami --output json
 ```
 
-`whoami` shows the current connection and host, whether a token is stored, and, checked live against the gateway, whether that token is still accepted plus the signed-in username, role, email, user ID and name. For a personal access token it also lists the scopes the token was granted; a session login holds its whole role and shows no scopes.
+`whoami` shows the current connection and host, whether a token is stored, and, checked live against the gateway, whether that token is still accepted plus the signed-in username, role, email, user ID and name. For a personal access token it also shows the token's ID and name and the scopes the token was granted; the name is left out when the token lacks `access_tokens.view`. A session login holds its whole role and shows no token or scopes.
 
 ### Session lifetime
 
@@ -297,11 +297,11 @@ The `surfaces` commands that take a `<surface-id>` (`get`, `update`, `delete`, `
 
 `tool-gate-preview` shows whether each tool would be allowed or denied (RESULT) and which gate, or the default, decided it (DECIDED BY).
 
-Create commands print `Created <kind> '<id>'` in table mode. Use `--output json` to receive the complete response, which is also how a script reads the new ID. Full JSON documents preserve access to the complete Gateway model without duplicating every nested setting as a CLI flag.
+Create commands print `Created <kind> '<id>'` in table mode, and `surfaces create` adds indented lines with the surface's id, name, route, protocol and target. Use `--output json` to receive the complete response, which is also how a script reads the new ID. Full JSON documents preserve access to the complete Gateway model without duplicating every nested setting as a CLI flag.
 
 `surfaces update --file` replaces the whole surface. `--set <path>=<value>` and `--unset <path>` instead change single fields, and `--add <path>=<item>` and `--remove <path>=<item>` add or remove one list item; all four can be repeated and none can be combined with `--file`. They go to the gateway as one JSON Merge Patch, so fields they do not name keep their current values. A path is dot-separated field names (`--add` and `--remove` can also pick one gate in square brackets, shown below), and a value or item is read as JSON when it parses (`100`, `true`, `'"100"'`, `'{"requests":100}'`) and as plain text otherwise. Wrap a value in quotes (`'"1.0"'`) to send something that looks like a number, boolean or JSON as text. Setting an object merges it into the existing object rather than replacing it, and setting a list replaces the whole list.
 
-Because a list is replaced whole, `--add` and `--remove` read the surface first and send its list with only their items changed. `--remove` names a text item by its value (`tags=beta`) and an object by its `id`, else its `alias` (`transit.points=billing`), or, when it has neither, by some of its fields as JSON (`outbound_credentials='{"credential_provider_id":"cp-1"}'`), since the gateway fills in defaults you never typed. Removes run before adds, so `--remove access_point.trust_check_list=tc-1 --add access_point.trust_check_list='{"id":"tc-1",...}'` replaces one trust check in place, and an added object with no `id` keeps the `id` of the item it replaces. A change someone else makes to the same list between that read and the write is overwritten.
+Because a list is replaced whole, `--add` and `--remove` read the surface first and send its list with only their items changed. `--remove` names a text item by its value (`tags=beta`) and an object by its `id`, else its `alias` (`transit.points=billing`), or, when it has neither, by some of its fields as JSON (`outbound_credentials='{"credential_provider_id":"cp-1"}'`), since the gateway fills in defaults you never typed. Removes run before adds, so `--remove access_point.trust_check_list=tc-1 --add access_point.trust_check_list='{"id":"tc-1",...}'` replaces one trust check in place, and an added object with no `id` keeps the `id` of the item it replaces. A transit point added with `--add transit.points` and no `protocol` takes the protocol of the surface's `access_point`, including one changed by a `--set` in the same command. A change someone else makes to the same list between that read and the write is overwritten.
 
 To add or remove one tool pattern, put the gate in square brackets: `gates[g-1]` picks a gate by `id`, else name, and `transit.points[billing]` picks a transit point by `id`, else alias. Quote the flag so the shell leaves the brackets alone. The pattern is always sent as text with surrounding spaces trimmed, and a pattern the gateway would refuse, a missing gate, a pattern already there or not there, and removing a gate's last pattern are refused before anything is sent. The CLI sends the whole gates list (or the whole `transit.points` list), so a change someone else makes to that list between the read and the write is overwritten. `--set` and `--unset` do not accept brackets.
 
@@ -554,7 +554,7 @@ A failed request prints the reason from the response body, stripped of control c
 
 A permission refusal that names the permission it needed keeps the gateway's own wording, which tells a role that lacks the permission apart from a personal access token whose scopes leave it out, for example `access token scope does not include 'access_tokens.view'`. When the gateway names only the permission, the CLI reports `missing required scope '<permission>'`. A `401` is reported as `gateway rejected the bearer token:` followed by the gateway's reason.
 
-A `get` (single entity) prints the **entire configuration**, the same document shown in the dashboard's config view, as formatted JSON. A `list` prints a table with a header row, one row per entity. `--output json` returns full JSON for both. `create` prints `Created <kind> '<id>'` in table mode, and `update` prints `Updated <kind> '<id>'`. To capture the new ID in a script use `--output json` (`ID=$(fabric agent-gateway -o json surfaces create ... | jq -r .surface_id)`).
+A `get` (single entity) prints the **entire configuration**, the same document shown in the dashboard's config view, as formatted JSON. A `list` prints a table with a header row, one row per entity. `--output json` returns full JSON for both. `create` prints `Created <kind> '<id>'` in table mode (`surfaces create` follows it with the surface's id, name, route, protocol and target), and `update` prints `Updated <kind> '<id>'`. To capture the new ID in a script use `--output json` (`ID=$(fabric agent-gateway -o json surfaces create ... | jq -r .surface_id)`).
 
 The reusable CRUD commands also cover Issuers, Authorities, Trust Registries, Mediators, MCP and A2A Proxies, STS clients, credential providers, certificates, and integrations. The authenticated API command covers every remaining endpoint:
 
@@ -563,6 +563,8 @@ fabric agent-gateway api get /v1/limits --output json
 fabric agent-gateway api patch /v1/surfaces/<surface-id> --data '{"description":"Updated"}'
 fabric agent-gateway api post /v1/policy-definitions/<policy-id>/simulate --file input.json
 ```
+
+`api patch` sends its body as `application/merge-patch+json`, and it needs `--data` or `--file`.
 
 ## Gateway configuration
 
