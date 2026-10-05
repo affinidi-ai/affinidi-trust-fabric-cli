@@ -3471,6 +3471,36 @@ mod gateway_config_tests {
     }
 
     #[tokio::test]
+    async fn remove_transit_point_ignores_spaces_around_the_name() {
+        let requests = feature_dry_run(&["remove-transit-point", "s-1", " billing "], TWO_POINT_SURFACE)
+            .await
+            .expect("the name should be trimmed");
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"id": "tp-2", "alias": "gh", "target_endpoint": "http://gh:3000"}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_refuses_a_blank_name_before_any_request() {
+        for blank in ["", "  "] {
+            let (host, requests) = scripted_server(vec![]).await;
+            let client = GatewayClient::new(host, "agpat_valid").expect("client");
+            let argv = ["fabric", "agent-gateway", "surfaces", "remove-transit-point", "Sales", blank];
+            let error = resolve_surface_command(&client, surface_command(&argv))
+                .await
+                .expect_err("a blank name should be refused before the surface is looked up")
+                .to_string();
+            assert_eq!(error, "give the alias or id of the transit point to remove");
+            let argv = ["fabric", "agent-gateway", "surfaces", "remove-transit-point", "s-1", blank];
+            run_surfaces(&client, surface_command(&argv), Output::Json)
+                .await
+                .expect_err("a blank name should be refused before the surface is read");
+            assert!(full_requests(requests).is_empty(), "{blank:?} sent a request");
+        }
+    }
+
+    #[tokio::test]
     async fn remove_transit_point_unknown_name_lists_the_points_that_exist() {
         let error = feature_dry_run(&["remove-transit-point", "s-1", "nope"], TWO_POINT_SURFACE)
             .await
@@ -10116,6 +10146,11 @@ mod identity_access_tests {
             ),
             (vec!["identities", "update", "i-1", "-f", "x.json"], "Updated identity 'i-1'"),
             (vec!["surfaces", "update", "s-1", "-f", "x.json"], "Updated surface 's-1'"),
+            (
+                vec!["surfaces", "add-transit-point", "s-1", "--alias", "billing", "--endpoint", "http://b:1"],
+                "Updated surface 's-1'",
+            ),
+            (vec!["surfaces", "remove-transit-point", "s-1", "billing"], "Updated surface 's-1'"),
         ] {
             let mut full = vec!["fabric", "agent-gateway"];
             full.extend(&arguments);
@@ -10544,8 +10579,20 @@ async fn remove_feature(
     send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
 }
 
-/// Longest transit point alias the gateway accepts.
+/// Longest transit point alias the gateway accepts. This and the character
+/// rule in [`new_transit_point`] mirror `TransitPoint::validate_alias` in the
+/// gateway's `src/config/agent_surface.rs`, so change them together.
 const MAX_TRANSIT_ALIAS_LEN: usize = 63;
+
+/// The alias or id `remove-transit-point` looks up, without surrounding
+/// spaces, refusing a blank one.
+fn transit_point_to_remove(args: &RemoveTransitPointArgs) -> Result<&str> {
+    let named = args.transit_point.trim();
+    if named.is_empty() {
+        bail!("give the alias or id of the transit point to remove");
+    }
+    Ok(named)
+}
 
 /// The transit point `add-transit-point` sends, after refusing a blank alias,
 /// a blank endpoint, or an alias the gateway would not accept.
@@ -10591,11 +10638,11 @@ async fn remove_transit_point(
     args: RemoveTransitPointArgs,
     output: Output,
 ) -> Result<Option<Value>> {
+    let named = transit_point_to_remove(&args)?;
     let path = entity_path("/v1/surfaces", &args.surface_id);
     let surface = fetch_surface(client, &path).await?;
-    surface_patch::require_transit_point(&surface.value, &args.transit_point)?;
-    let patch =
-        surface_patch::build_patch(&[], &[], &[], &[format!("transit.points={}", args.transit_point)], &surface.value)?;
+    surface_patch::require_transit_point(&surface.value, named)?;
+    let patch = surface_patch::build_patch(&[], &[], &[], &[format!("transit.points={named}")], &surface.value)?;
     send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
 }
 
@@ -10691,6 +10738,7 @@ async fn resolve_surface_command(
             SurfaceCommand::AddTransitPoint(args)
         }
         SurfaceCommand::RemoveTransitPoint(mut args) => {
+            transit_point_to_remove(&args)?;
             args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
             SurfaceCommand::RemoveTransitPoint(args)
         }
@@ -14174,6 +14222,12 @@ fn update_confirmation(command: &Command) -> Option<String> {
         }
         | Command::Surfaces {
             command: SurfaceCommand::RemoveFeature(FeaturePlacementArgs { surface_id, .. }),
+        }
+        | Command::Surfaces {
+            command: SurfaceCommand::AddTransitPoint(AddTransitPointArgs { surface_id, .. }),
+        }
+        | Command::Surfaces {
+            command: SurfaceCommand::RemoveTransitPoint(RemoveTransitPointArgs { surface_id, .. }),
         } => ("surface", surface_id),
         _ => return None,
     };
@@ -15312,6 +15366,29 @@ mod tests {
             parsed(&["fabric", "agent-gateway", "surfaces", "remove-feature", "s-1", "policy", "--dry-run"]),
             Command::Surfaces {
                 command: SurfaceCommand::RemoveFeature(FeaturePlacementArgs { dry_run: true, .. })
+            }
+        ));
+        assert!(matches!(
+            parsed(&[
+                "fabric",
+                "agent-gateway",
+                "surfaces",
+                "add-transit-point",
+                "s-1",
+                "--alias",
+                "billing",
+                "--endpoint",
+                "http://b:1",
+                "--dry-run"
+            ]),
+            Command::Surfaces {
+                command: SurfaceCommand::AddTransitPoint(AddTransitPointArgs { dry_run: true, .. })
+            }
+        ));
+        assert!(matches!(
+            parsed(&["fabric", "agent-gateway", "surfaces", "remove-transit-point", "s-1", "billing", "--dry-run"]),
+            Command::Surfaces {
+                command: SurfaceCommand::RemoveTransitPoint(RemoveTransitPointArgs { dry_run: true, .. })
             }
         ));
         assert!(matches!(
