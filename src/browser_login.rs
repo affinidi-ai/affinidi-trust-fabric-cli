@@ -17,7 +17,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::client::sanitize_for_terminal;
+use crate::client::{TOTAL_TIMEOUT, build_http_client, sanitize_for_terminal};
 
 /// How long to wait for the browser to complete authentication and redirect
 /// back to the loopback listener.
@@ -164,8 +164,20 @@ async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<String> {
-    let response = reqwest::Client::new()
+    exchange_code_within(host, code, verifier, TOTAL_TIMEOUT).await
+}
+
+/// [`exchange_code`] with the limit on the whole exchange passed in, so a test
+/// can use a short one.
+async fn exchange_code_within(
+    host: &str,
+    code: &str,
+    verifier: &str,
+    total_timeout: Duration,
+) -> Result<String> {
+    let response = build_http_client()?
         .post(format!("{host}/api/auth/cli/exchange"))
+        .timeout(total_timeout)
         .json(&serde_json::json!({ "code": code, "verifier": verifier }))
         .send()
         .await
@@ -305,6 +317,96 @@ mod tests {
         );
         assert!(detail.starts_with("bad code[31mFAKE OK"), "got: {detail}");
         assert_eq!(detail.chars().count(), 500);
+    }
+
+    /// The exchange sends the PKCE verifier, so a gateway that answers with a
+    /// redirect to another host must not be followed there.
+    #[tokio::test]
+    async fn the_code_exchange_does_not_follow_a_redirect_to_another_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let elsewhere_port = elsewhere
+            .local_addr()
+            .expect("local addr")
+            .port();
+        let gateway = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gateway
+            .local_addr()
+            .expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = gateway.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://localhost:{elsewhere_port}/steal\r\ncontent-length: \
+                     0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = socket
+                    .write_all(response.as_bytes())
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let error = exchange_code(&format!("http://{addr}"), "code", "verifier")
+            .await
+            .expect_err("a redirect is not a successful exchange");
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("code exchange failed (307 Temporary Redirect)"),
+            "{error}"
+        );
+        let reached = tokio::time::timeout(Duration::from_millis(300), elsewhere.accept()).await;
+        assert!(reached.is_err(), "the other host must not be contacted");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_drips_the_exchange_answer_is_cut_off_by_the_total_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let gateway = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gateway
+            .local_addr()
+            .expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = gateway.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n";
+                if socket
+                    .write_all(head.as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                for _ in 0..1000 {
+                    if socket
+                        .write_all(b" ")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let result =
+            exchange_code_within(&format!("http://{addr}"), "code", "verifier", Duration::from_millis(400)).await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
     }
 
     /// `error=` arrives before the state check, from whatever reached the

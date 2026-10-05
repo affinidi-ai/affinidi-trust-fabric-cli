@@ -1,6 +1,6 @@
 # Contributing
 
-When contributing to this repository, please first discuss the change you wish to make by creating a new [GitHub issue](https://github.com/affinidi/affinidi-tdk/issues/new).
+When contributing to this repository, please first discuss the change you wish to make by creating a new [GitHub issue](https://github.com/affinidi-ai/affinidi-fabric-cli/issues/new).
 
 ## Developement Requirements
 

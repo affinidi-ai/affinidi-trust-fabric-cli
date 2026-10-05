@@ -50,7 +50,7 @@ The `https://` scheme may be omitted; bare gateway hostnames default to HTTPS. T
 3. The gateway redirects back to `http://127.0.0.1:<port>/callback` with a single-use code.
 4. The CLI exchanges the code plus a PKCE verifier for the session token over a direct back channel (the token never appears in a browser URL or history).
 
-The captured token is validated with `/api/auth/check` and stored in the operating system credential store: macOS Keychain, Windows Credential Manager, or Linux Secret Service. Bearer tokens are never written to the CLI configuration file. Credentials use the `affinidi-fabric-cli` service name and the connection profile name as their account key.
+The captured token is validated with `/api/auth/check` and stored in the operating system credential store: macOS Keychain, Windows Credential Manager, or Linux Secret Service. Bearer tokens are never written to the CLI configuration file. Credentials use the `affinidi-fabric-cli` service name and the connection profile name as their account key; the host a token was issued for is kept beside it under `<name>#bound-host`, so connection names cannot contain `#`. A configuration that already has such a name prints a warning once per run of the CLI (once per interactive shell session), and if the host cannot be saved on first use the CLI warns, also once per connection, that the token keeps following `config.toml`.
 
 Non-secret connection metadata such as profile names, hosts, and the current profile remains in the user configuration directory. On macOS the file is `~/Library/Application Support/fabric/config.toml`; on Linux it is normally `~/.config/fabric/config.toml`. Existing plaintext-token configurations are migrated to the OS credential store and scrubbed automatically on the next CLI invocation.
 
@@ -92,9 +92,11 @@ How lists and deletes print:
 
 Columns are padded with spaces, not tabs, so a script that split these on tabs should use `--output json`.
 
-Global `--host` and `--token` options are temporary overrides for a single command. Use `fabric agent-gateway login` when the settings should be remembered.
+Global `--host` and `--token` options are temporary overrides for a single command. Use `fabric agent-gateway login` when the settings should be remembered. A saved token is only sent to the host it was saved for: `--host` with a different host is refused unless you pass `--allow-host-override` (a flag only, no environment variable turns it on, so a project file cannot), while a token you pass yourself with `--token` goes where you point it. A token saved by an older version has no recorded host, so it is bound to the host in the configuration the first time it is used. Prefer `FABRIC_TOKEN`, `--token-stdin` (on `login`) or a prompt over typing a secret on the command line, where shell history keeps it; the CLI warns when you do. When both `FABRIC_TOKEN` and `FABRIC_HOST` come from the environment, the CLI prints one note on standard error naming the host, since a `FABRIC_HOST` set by a project file would otherwise receive a `FABRIC_TOKEN` from your shell profile without a word. A typed `--token` or `--host`, or a host from the saved connection, prints no note.
 
-`fabric agent-gateway logout` and `fabric agent-gateway config remove <name>` remove both the local profile and its OS credential-store entry.
+Every request waits at most 10 seconds to connect and gives up when no data arrives for 120 seconds. Every call except `logs download` also ends after 5 minutes in total, so a gateway that sends one byte at a time cannot hold the CLI; the log archive is only held to the 120 second limit, so a large download that keeps arriving is not cut off. Redirects are followed only within the same scheme, host and port, so the token never goes to another host, and the browser login's code exchange follows the same rules. A saved connection that uses plain `http` to a remote host prints a warning once per host in a run.
+
+`fabric agent-gateway logout` removes the local profile and its OS credential-store entry, and also ends the session on the gateway when it can be reached. A browser login is the browser's own gateway session, so `logout` signs you out of the browser as well. For a personal access token, `logout` asks whether to revoke it, naming its token ID, while it still holds the token; pass `--revoke-token` to revoke it without asking (for scripts). Without a terminal and without the flag the token stays valid on the gateway and `logout` prints how to revoke it later with `fabric agent-gateway tokens revoke`. `fabric agent-gateway config remove <name>` only removes the local profile and credential-store entry and does not contact the gateway.
 
 Inspect the active session at any time:
 
@@ -135,7 +137,7 @@ printf '%s' "$PAT" | fabric agent-gateway login --host https://gateway.example.c
 FABRIC_PAT="$PAT" fabric agent-gateway login --host https://gateway.example.com --pat
 ```
 
-`FABRIC_PAT` is only read once `--pat` is given; on its own it does not select PAT login, and a plain `fabric agent-gateway login` still opens the browser. `--pat` cannot be combined with `--token` or `--paste`, and a `FABRIC_TOKEN` set in the environment counts as `--token`, so unset it first. A value without the `agpat_` prefix is refused before anything is sent. The CLI then checks the token against the gateway before storing it: a token the gateway does not accept, such as a revoked one, saves nothing, while a token that is accepted but lacks the permission the check reads still counts as valid. A token that passes is saved to the OS credential store under the connection, the same way a session login is.
+`FABRIC_PAT` is only read once `--pat` is given; on its own it does not select PAT login, and a plain `fabric agent-gateway login` still opens the browser. `--pat` cannot be combined with `--token` or `--paste`, and a `FABRIC_TOKEN` set in the environment counts as `--token`, so unset it first. A value without the `agpat_` prefix is refused before anything is sent. The CLI then checks the token against `/v1/token-info` before storing it: only a `200` passes, so a token the gateway does not accept, such as a revoked one, or any other answer saves nothing. A token that passes is saved to the OS credential store under the connection, the same way a session login is.
 
 `fabric agent-gateway tokens` manages the tokens themselves:
 
@@ -153,7 +155,7 @@ fabric agent-gateway tokens revoke <token-id> --yes
 
 `scopes` lists the scopes you can grant a new token, one per line. It is based on your own role and, when you are logged in with a scoped personal access token, narrowed to that token's scopes.
 
-`create` takes `--name` (required unless `--file` is given), `--description`, `--scope` (repeat it for each scope) and `--expires-at`, an RFC 3339 timestamp such as `2027-01-01T00:00:00Z`; omit `--expires-at` for a token that never expires. A token created without any `--scope` carries your whole role. `--file` takes a complete creation document instead, with `-` reading standard input; the other creation flags are ignored when it is given. The gateway keeps only a hash of the secret, so this is the one time it is shown: in table mode `create` prints the secret alone on standard output, so `PAT=$(fabric agent-gateway tokens create ...)` captures just that, and sends `Created access token '<id>'` and a `note:` about the secret to standard error. `--output json` prints the whole response, secret included. A secret with control characters is refused in table mode; read it with `--output json`.
+`create` takes `--name` (required unless `--file` is given), `--description`, `--scope` (repeat it for each scope) and `--expires-at`, an RFC 3339 timestamp such as `2027-01-01T00:00:00Z`; omit `--expires-at` (or leave `expires_at` empty or null in a `--file` body) and the token expires 90 days from now; there is no way to ask for no expiry, so give a far-future date for a long-lived token. A token needs at least one `--scope`, or `--full-role` to carry your whole role, which `list` shows as `full role`. `--file` takes a complete creation document instead, with `-` reading standard input; the other creation flags are ignored when it is given. The gateway keeps only a hash of the secret, so this is the one time it is shown: in table mode `create` prints the secret alone on standard output, so `PAT=$(fabric agent-gateway tokens create ...)` captures just that, and sends `Created access token '<id>'` and a `note:` about the secret to standard error. `--output json` prints the whole response, secret included. A secret with control characters is refused in table mode; read it with `--output json`.
 
 Two more flags narrow where a token works. `--required-header name=pattern` names a header the caller must send and a regex its whole value must match, and can be repeated; a value that is not `name=pattern` with both parts non-empty is refused before anything is sent. `--resource-pattern` limits the token to the resources it matches; omit it for an appliance-wide token. It has to take the form `TENANT:${header}:<resource-kind>:<resource-id-pattern>`, where `${header}` names one of the token's required headers and the resource kind is a path family such as `surfaces`, `gateways` or `secrets`. Anything else is refused with a 400. The caller picks that header's value on each request, so it decides the tenant, and the gateway therefore refuses a header pattern that could match more than one value unless the deployment sets `tenancy.trusted_tenant_header` for a proxy that overwrites the header:
 
@@ -164,7 +166,7 @@ fabric agent-gateway tokens create --name acme-surfaces --scope surfaces.view \
 
 The gateway refuses a scope your own role does not hold with a 403, which the CLI shows as `access-token scopes must not exceed the caller's own role`, and creates nothing; `fabric agent-gateway tokens scopes` shows what you can grant. When you create a token while logged in with a scoped personal access token, the new token must also ask for at least one scope, all of them held by the token you are using, and a token carrying a resource pattern or required headers cannot create tokens at all. A scope name the gateway does not recognise is refused as `unknown scope: <name>`, and the CLI adds a pointer to `fabric agent-gateway tokens scopes`.
 
-`revoke` asks `Revoke access token <id>? [y/N]` and revokes only on `y` or `yes`; any other answer leaves the token alone and exits successfully. Pass `--yes` or `-y` to skip the prompt. When standard input is not a terminal the prompt could never be answered, so `revoke` without `--yes` fails there and sends nothing.
+`revoke` asks `Revoke access token '<name>' (<id>) on <host>? [y/N]` on standard error and revokes only on `y` or `yes`; any other answer leaves the token alone and exits successfully. Pass `--yes` or `-y` to skip the prompt. When standard input is not a terminal the prompt could never be answered, so `revoke` without `--yes` fails there and sends nothing.
 
 ## Observability
 
@@ -348,10 +350,12 @@ fabric agent-gateway api-keys list --agent-id <surface-id>
 fabric agent-gateway api-keys get <key-id>
 fabric agent-gateway api-keys create <surface-id> --client-id billing --label team=payments
 fabric agent-gateway api-keys create <surface-id> --file api-key.json
-fabric agent-gateway api-keys rotate <key-id>
-fabric agent-gateway api-keys revoke <key-id> --actor ops-team
-fabric agent-gateway api-keys delete <key-id> --agent-id <surface-id>
+fabric agent-gateway api-keys rotate <key-id> --yes
+fabric agent-gateway api-keys revoke <key-id> --actor ops-team --yes
+fabric agent-gateway api-keys delete <key-id> --agent-id <surface-id> --yes
 ```
+
+`revoke`, `rotate` and `delete` ask `Revoke API key '<name>' (<id>) on <host> of Agent Surface <surface>? [y/N]` (with their own verb) on standard error and act only on `y` or `yes`. Pass `--yes` or `-y` to skip the prompt; when standard input is not a terminal the prompt could never be answered, so the command without `--yes` fails before the key lookup and sends nothing.
 
 `get`, `revoke`, `rotate` and `delete` take the key's own ID. The gateway addresses a key by its Agent Surface and then its ID, so the CLI reads `GET /v1/api-keys` first and takes the surface from the key's own record. `--agent-id` names the surface and skips that lookup — needed when the token carries `api_keys.edit` or `api_keys.delete` but not `api_keys.view`, since the key's own route is open to it and the collection is not. A key id no visible surface carries is reported as not found, and a key id on two surfaces is refused by name rather than guessed at: the gateway generates key ids at random and does not enforce their uniqueness. `create` still takes its surface as a positional, because a new key has no ID to look up.
 

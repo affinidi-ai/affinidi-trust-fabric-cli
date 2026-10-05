@@ -7,6 +7,7 @@ use std::{
     net::TcpListener,
     path::Path,
     process::Command,
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -36,6 +37,9 @@ fn reply(
 struct Output {
     stdout: String,
     stderr: String,
+    /// The request line of every request the gateway received.
+    requests: Vec<String>,
+    success: bool,
 }
 
 /// Starts a gateway that answers each request from `replies` and runs
@@ -49,6 +53,8 @@ fn fabric(
         .local_addr()
         .expect("address")
         .port();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let recorder = Arc::clone(&seen);
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let mut request = Vec::new();
@@ -100,6 +106,10 @@ fn fabric(
                 line.next()
                     .unwrap_or_default(),
             );
+            recorder
+                .lock()
+                .expect("recorder")
+                .push(format!("{method} {path}"));
             let answer = replies.iter().find(|reply| {
                 reply.method == method
                     && format!("/api{}", reply.path)
@@ -139,6 +149,11 @@ fn fabric(
     Output {
         stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+        requests: seen
+            .lock()
+            .expect("recorder")
+            .clone(),
+        success: result.status.success(),
     }
 }
 
@@ -517,7 +532,7 @@ fn tokens_list_uses_the_shared_table_with_status_and_a_scope_summary() {
         out.stdout,
         "NAME     ID   STATUS   SCOPES                       CREATED               EXPIRES\n\
          ci       t-1  ACTIVE   surfaces.view,policies.view  2026-09-01T00:00:00Z  2026-12-01T00:00:00Z\n\
-         old bot  t-2  REVOKED  -                            2026-08-01T00:00:00Z  never\n"
+         old bot  t-2  REVOKED  full role                    2026-08-01T00:00:00Z  never\n"
     );
 }
 
@@ -677,8 +692,8 @@ fn creating_an_access_token_prints_the_token_alone_and_the_confirmation_on_stand
     let answer = r#"{"id":"t-1","name":"ci","token":"agpat_secret"}"#;
     let routes = || vec![reply("POST", "/v1/access-tokens", "200 OK", answer)];
 
-    let table = fabric(routes(), &["tokens", "create", "--name", "ci"]);
-    let json = fabric(routes(), &["-o", "json", "tokens", "create", "--name", "ci"]);
+    let table = fabric(routes(), &["tokens", "create", "--name", "ci", "--scope", "surfaces.view"]);
+    let json = fabric(routes(), &["-o", "json", "tokens", "create", "--name", "ci", "--scope", "surfaces.view"]);
 
     assert_eq!(table.stdout, "agpat_secret\n");
     assert!(
@@ -724,7 +739,7 @@ fn creating_and_rotating_an_api_key_print_the_secret_alone_and_the_confirmation_
     let rotate_routes = || vec![reply("POST", "/v1/api-keys/s-1/k-1/rotate", "200 OK", created)];
 
     let create = fabric(create_routes(), &["api-keys", "create", "s-1", "--client-id", "billing"]);
-    let rotate = fabric(rotate_routes(), &["api-keys", "rotate", "k-1", "--agent-id", "s-1"]);
+    let rotate = fabric(rotate_routes(), &["api-keys", "rotate", "k-1", "--agent-id", "s-1", "--yes"]);
     let json = fabric(create_routes(), &["-o", "json", "api-keys", "create", "s-1", "--client-id", "billing"]);
 
     assert_eq!(create.stdout, "sk_live\n");
@@ -919,7 +934,7 @@ fn a_token_note_is_printed_in_json_mode_too_without_changing_standard_output() {
     let answer = r#"{"id":"t-1","token":"agpat_secret"}"#;
     let out = fabric(
         vec![reply("POST", "/v1/access-tokens", "200 OK", answer)],
-        &["-o", "json", "tokens", "create", "--name", "ci"],
+        &["-o", "json", "tokens", "create", "--name", "ci", "--scope", "surfaces.view"],
     );
 
     assert!(
@@ -997,7 +1012,7 @@ fn an_api_key_line_names_the_key_even_when_the_answer_has_other_ids_inside() {
     );
     let rotate = fabric(
         vec![reply("POST", "/v1/api-keys/s-1/k-1/rotate", "200 OK", created)],
-        &["api-keys", "rotate", "k-1", "--agent-id", "s-1"],
+        &["api-keys", "rotate", "k-1", "--agent-id", "s-1", "--yes"],
     );
     let token = fabric(
         vec![reply(
@@ -1037,9 +1052,14 @@ fn a_secret_with_control_characters_is_refused_with_the_id_and_a_way_out() {
     let created = |secret: &str| {
         vec![reply("POST", "/v1/access-tokens", "200 OK", format!(r#"{{"id":"t-1","token":"{secret}"}}"#))]
     };
-    let escape = fabric(created("agpat_\\u001b[31mred"), &["tokens", "create", "--name", "ci"]);
-    let bidi = fabric(created("agpat_\\u202ereversed"), &["tokens", "create", "--name", "ci"]);
-    let json = fabric(created("agpat_\\u001b[31mred"), &["-o", "json", "tokens", "create", "--name", "ci"]);
+    let escape =
+        fabric(created("agpat_\\u001b[31mred"), &["tokens", "create", "--name", "ci", "--scope", "surfaces.view"]);
+    let bidi =
+        fabric(created("agpat_\\u202ereversed"), &["tokens", "create", "--name", "ci", "--scope", "surfaces.view"]);
+    let json = fabric(
+        created("agpat_\\u001b[31mred"),
+        &["-o", "json", "tokens", "create", "--name", "ci", "--scope", "surfaces.view"],
+    );
     let rotated = fabric(
         vec![reply("POST", "/v1/access-tokens/t-1/rotate", "200 OK", r#"{"token":"agpat_\u001bred"}"#)],
         &["tokens", "rotate", "t-1", "--yes"],
@@ -1167,4 +1187,129 @@ fn an_audit_page_past_the_first_is_worded_as_a_filtered_result() {
     );
 
     assert_eq!(out.stdout, "No matching audit events.\n");
+}
+
+/// Standard input is not a terminal here, so a destructive command without
+/// `--yes` can never be answered and must refuse instead of acting.
+#[test]
+fn deleting_an_api_key_without_yes_refuses_and_sends_nothing_when_stdin_is_not_a_terminal() {
+    let out = fabric(
+        vec![reply("DELETE", "/v1/api-keys/s-1/k-1", "204 No Content", "")],
+        &["api-keys", "delete", "k-1", "--agent-id", "s-1"],
+    );
+
+    assert!(!out.success);
+    assert!(
+        out.stderr
+            .contains("refusing to delete 'k-1' without confirmation in a non-interactive session; pass --yes"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(
+        out.requests
+            .iter()
+            .all(|request| !request.starts_with("DELETE")),
+        "{:?}",
+        out.requests
+    );
+}
+
+#[test]
+fn revoking_or_rotating_an_access_token_without_yes_refuses_and_sends_nothing_when_stdin_is_not_a_terminal() {
+    for verb in ["revoke", "rotate"] {
+        let out = fabric(
+            vec![
+                reply("DELETE", "/v1/access-tokens/t-1", "204 No Content", ""),
+                reply("POST", "/v1/access-tokens/t-1/rotate", "200 OK", r#"{"token":"agpat_new"}"#),
+            ],
+            &["tokens", verb, "t-1"],
+        );
+
+        assert!(!out.success, "{verb}");
+        assert!(
+            out.stderr
+                .contains(&format!("refusing to {verb} 't-1' without confirmation in a non-interactive session")),
+            "{verb}: {}",
+            out.stderr
+        );
+        assert!(
+            !out.stdout
+                .contains("agpat_new"),
+            "{verb}: {}",
+            out.stdout
+        );
+        assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
+    }
+}
+
+#[test]
+fn a_raw_api_call_with_a_control_character_in_a_dot_segment_is_refused_before_it_is_sent() {
+    for path in ["/v1/.\t./admin", "/v1/.\n./admin"] {
+        let out = fabric(vec![reply("GET", "/admin", "200 OK", "{}")], &["api", "get", path]);
+
+        assert!(!out.success, "{path:?}");
+        assert!(
+            out.stderr
+                .contains("API path must start with '/'"),
+            "{path:?}: {}",
+            out.stderr
+        );
+        assert!(out.requests.is_empty(), "{path:?}: {:?}", out.requests);
+    }
+}
+
+#[test]
+fn revoking_or_rotating_an_api_key_without_yes_refuses_and_sends_nothing_when_stdin_is_not_a_terminal() {
+    for verb in ["revoke", "rotate"] {
+        let out = fabric(
+            vec![
+                reply("POST", "/v1/api-keys/s-1/k-1/revoke", "204 No Content", ""),
+                reply("POST", "/v1/api-keys/s-1/k-1/rotate", "200 OK", r#"{"key_id":"k-1","secret":"sk_new"}"#),
+            ],
+            &["api-keys", verb, "k-1", "--agent-id", "s-1"],
+        );
+
+        assert!(!out.success, "{verb}");
+        assert!(
+            out.stderr
+                .contains(&format!("refusing to {verb} 'k-1' without confirmation in a non-interactive session")),
+            "{verb}: {}",
+            out.stderr
+        );
+        assert!(!out.stdout.contains("sk_new"), "{verb}: {}", out.stdout);
+        assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
+    }
+}
+
+/// Without `--agent-id` the CLI would look the key up first, so the refusal
+/// has to come before that lookup for nothing to be sent.
+#[test]
+fn an_api_key_command_without_yes_or_agent_id_refuses_before_any_lookup() {
+    for verb in ["revoke", "rotate", "delete"] {
+        let out = fabric(
+            vec![reply("GET", "/v1/api-keys", "200 OK", r#"[{"key_id":"k-1","agent_id":"s-1"}]"#)],
+            &["api-keys", verb, "k-1"],
+        );
+
+        assert!(!out.success, "{verb}");
+        assert!(
+            out.stderr
+                .contains(&format!("refusing to {verb} 'k-1' without confirmation in a non-interactive session")),
+            "{verb}: {}",
+            out.stderr
+        );
+        assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
+    }
+}
+
+#[test]
+fn revoking_an_api_key_with_yes_skips_the_prompt() {
+    let out = fabric(
+        vec![reply("POST", "/v1/api-keys/s-1/k-1/revoke", "204 No Content", "")],
+        &["api-keys", "revoke", "k-1", "--agent-id", "s-1", "-y"],
+    );
+
+    assert!(out.success, "{}", out.stderr);
+    assert_eq!(out.stdout, "Revoked API key 'k-1'\n");
 }
