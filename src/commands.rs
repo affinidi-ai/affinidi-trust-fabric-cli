@@ -1715,10 +1715,37 @@ async fn whoami(
 ) -> Result<()> {
     let info = whoami_info(config, credentials, connection, host_override, flags, token_override).await?;
     match output {
-        Output::Json => println!("{}", serde_json::to_string_pretty(&info)?),
+        Output::Json => println!("{}", whoami_json(&info)?),
         Output::Table => print_info_table(&info),
     }
     Ok(())
+}
+
+/// The whoami answer as pretty JSON with every character a terminal can act on
+/// written as a `\uXXXX` escape: bidi controls, C1 controls, and U+2028 and
+/// U+2029 (serde_json already escapes the C0 controls). The text parses back
+/// to the same values.
+fn whoami_json(info: &Value) -> Result<String> {
+    let pretty = serde_json::to_string_pretty(info)?;
+    let mut escaped = String::with_capacity(pretty.len());
+    for c in pretty.chars() {
+        if matches!(
+            c,
+            '\u{80}'..='\u{9f}'
+                | '\u{61c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        ) {
+            escaped.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            escaped.push(c);
+        }
+    }
+    Ok(escaped)
 }
 
 /// Resolve the active connection, its host, and the identity behind the
@@ -3607,6 +3634,30 @@ mod gateway_config_tests {
     }
 
     #[test]
+    fn a_created_surface_target_row_drops_credentials_query_and_fragment() {
+        let target =
+            |endpoint: &str| surface_lines(&json!({"surface_id": "s-1", "target": {"endpoint": endpoint}}))[2].clone();
+
+        assert_eq!(target("https://user:pass@host:8443/mcp?key=abc#frag"), "  target: https://host:8443/mcp");
+        assert_eq!(target("https://token@host/mcp#frag"), "  target: https://host/mcp");
+        assert_eq!(target("http://127.0.0.1:3000"), "  target: http://127.0.0.1:3000");
+        assert_eq!(target("http://host/"), "  target: http://host/");
+        assert_eq!(target("user:pass@host:8443/mcp?key=abc"), "  target: host:8443/mcp");
+        assert_eq!(target("not a url?key=abc"), "  target: not a url");
+    }
+
+    #[test]
+    fn a_created_surface_with_a_control_only_route_protocol_or_target_has_no_row_for_it() {
+        let surface = json!({
+            "surface_id": "s-1",
+            "access_point": {"route": "\u{1b}\u{7}", "protocol": " \t"},
+            "target": {"endpoint": "\n\u{1b}"}
+        });
+
+        assert_eq!(surface_lines(&surface), ["Created surface 's-1'", "  id: s-1"]);
+    }
+
+    #[test]
     fn a_created_surface_with_an_empty_blank_or_control_only_name_has_no_name_row() {
         for name in ["", "   ", "\t\n", "\u{1b}\u{7}"] {
             assert_eq!(
@@ -3735,6 +3786,31 @@ mod gateway_config_tests {
 
         assert_eq!(fields.get("token_id"), Some(&json!("t\u{1b}[2Jk\nx")));
         assert_eq!(fields.get("token_name"), Some(&json!("ci\u{1b}[2J\nnext")));
+    }
+
+    #[test]
+    fn the_whoami_json_escapes_terminal_unsafe_text_and_parses_back_to_the_same_values() {
+        let info = json!({
+            "username": "a\u{202e}b",
+            "token_id": "t\u{9b}1\u{2028}x\u{2029}\u{61c}\u{200f}\u{2066}",
+            "token_name": "ci \u{1b}[2J",
+            "scopes": ["s"],
+        });
+
+        let printed = whoami_json(&info).expect("json");
+
+        for unsafe_char in ['\u{202e}', '\u{9b}', '\u{2028}', '\u{2029}', '\u{61c}', '\u{200f}', '\u{2066}', '\u{1b}'] {
+            assert!(!printed.contains(unsafe_char), "{unsafe_char:?} in {printed}");
+        }
+        assert!(printed.contains(r"a\u202eb"), "{printed}");
+        assert_eq!(serde_json::from_str::<Value>(&printed).expect("parses"), info);
+    }
+
+    #[test]
+    fn the_whoami_json_leaves_a_normal_answer_as_serde_prints_it() {
+        let info = json!({"username": "admin", "token_name": "ci \u{e9}\u{4e2d}", "scopes": ["a", "b"]});
+
+        assert_eq!(whoami_json(&info).expect("json"), serde_json::to_string_pretty(&info).expect("json"));
     }
 
     #[test]
@@ -3893,6 +3969,22 @@ mod gateway_config_tests {
 
         assert_eq!(error.to_string(), "api patch needs a body: give --data or --file");
         assert!(request_lines(requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_patch_refuses_a_hostile_path_before_anything_is_sent() {
+        for path in ["/v1/%2e%2e/x", "/v1/../x", "v1/surfaces/s-1"] {
+            let (host, requests) = scripted_server(vec![]).await;
+            let client = GatewayClient::new(host, "agpat_test").expect("client");
+            let mut args = api_patch(Some(r#"{"description":null}"#), None);
+            args.path = path.to_owned();
+
+            run_api(&client, args)
+                .await
+                .expect_err(path);
+
+            assert!(request_lines(requests).is_empty(), "{path}");
+        }
     }
 
     #[tokio::test]
@@ -8769,33 +8861,82 @@ async fn run_surfaces(
 /// its id, name, route, protocol and target as the gateway answered them. A
 /// field the answer lacks is left out. An answer with no usable id has nothing
 /// to confirm, so this returns `None` and the caller prints the whole answer.
-/// A name or id that is empty, only whitespace or only control characters
-/// counts as missing.
+/// A value that is empty, only whitespace or only control characters counts as
+/// missing. The target row shows the endpoint's scheme, host, port and path
+/// only, so credentials and query strings never reach a terminal or CI log.
 fn created_surface_lines(surface: &Value) -> Option<Vec<String>> {
     let text_at = |path: &[&str]| {
         path.iter()
             .try_fold(surface, |value, key| value.get(*key))
             .and_then(Value::as_str)
     };
-    let printable = |text: &&str| {
-        !tables::flatten(text)
+    let cleaned = |text: Option<&str>| {
+        text.map(tables::flatten_capped)
+            .filter(|shown| !shown.trim().is_empty())
+    };
+    let id = id_from_response(surface).filter(|id| {
+        !tables::flatten(id)
             .trim()
             .is_empty()
-    };
-    let name = text_at(&["name"]).filter(printable);
-    let id = id_from_response(surface).filter(printable)?;
-    let mut lines = vec![confirmation_line("Created", "surface", id), format!("  id: {}", tables::flatten(id))];
+    })?;
+    let mut lines = vec![confirmation_line("Created", "surface", id), format!("  id: {}", tables::flatten_capped(id))];
     for (label, text) in [
-        ("name", name),
-        ("route", text_at(&["access_point", "route"])),
-        ("protocol", text_at(&["access_point", "protocol"])),
-        ("target", text_at(&["target", "endpoint"])),
+        ("name", cleaned(text_at(&["name"]))),
+        ("route", cleaned(text_at(&["access_point", "route"]))),
+        ("protocol", cleaned(text_at(&["access_point", "protocol"]))),
+        (
+            "target",
+            cleaned(
+                text_at(&["target", "endpoint"])
+                    .map(target_without_secrets)
+                    .as_deref(),
+            ),
+        ),
     ] {
         if let Some(text) = text {
-            lines.push(format!("  {label}: {}", tables::flatten_capped(text)));
+            lines.push(format!("  {label}: {text}"));
         }
     }
     Some(lines)
+}
+
+/// An endpoint reduced to scheme, host, port and path. Text that is not a URL
+/// keeps its own text with any `user:pass@` part and anything after the first
+/// `?` or `#` removed.
+fn target_without_secrets(endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    if let Ok(url) = url::Url::parse(endpoint)
+        && let Some(host) = url.host_str()
+    {
+        let port = url
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        let before_query = endpoint
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default();
+        let path = if url.path() == "/" && !before_query.ends_with('/') {
+            ""
+        } else {
+            url.path()
+        };
+        return format!("{}://{host}{port}{path}", url.scheme());
+    }
+    let without_query = endpoint
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let authority_start = without_query
+        .find("://")
+        .map_or(0, |at| at + 3);
+    let authority_end = without_query[authority_start..]
+        .find('/')
+        .map_or(without_query.len(), |at| authority_start + at);
+    match without_query[authority_start..authority_end].rfind('@') {
+        Some(at) => format!("{}{}", &without_query[..authority_start], &without_query[authority_start + at + 1..]),
+        None => without_query.to_owned(),
+    }
 }
 
 /// Where a surface keeps its MCP tool gating.
