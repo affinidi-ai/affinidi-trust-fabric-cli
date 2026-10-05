@@ -1849,6 +1849,7 @@ async fn insert_token_details(
             if let Some(token_id) = token_info
                 .get("token_id")
                 .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
             {
                 fields.insert("token_id".to_owned(), json!(token_id));
                 match client
@@ -3776,6 +3777,17 @@ mod gateway_config_tests {
     }
 
     #[tokio::test]
+    async fn insert_token_details_leaves_out_a_blank_token_id() {
+        for body in [r#"{"token_id":"","scopes":null}"#, r#"{"token_id":"   ","scopes":null}"#] {
+            let (fields, requests) = token_fields(vec![("HTTP/1.1 200 OK", body)]).await;
+
+            assert!(!fields.contains_key("token_id"), "{body}");
+            assert!(!fields.contains_key("token_name"), "{body}");
+            assert_eq!(requests, ["GET /api/v1/token-info HTTP/1.1"], "{body}");
+        }
+    }
+
+    #[tokio::test]
     async fn insert_token_details_leaves_out_a_token_name_that_is_not_text() {
         let (fields, _) =
             token_fields(vec![("HTTP/1.1 200 OK", TOKEN_INFO), ("HTTP/1.1 200 OK", r#"{"name":5}"#)]).await;
@@ -3799,14 +3811,28 @@ mod gateway_config_tests {
     }
 
     #[tokio::test]
-    async fn insert_token_details_path_encodes_the_token_id_in_the_name_lookup() {
+    async fn insert_token_details_path_encodes_a_plain_token_id_in_the_name_lookup() {
         let (_, requests) = token_fields(vec![
-            ("HTTP/1.1 200 OK", r#"{"token_id":"a/b","scopes":null}"#),
+            ("HTTP/1.1 200 OK", r#"{"token_id":"tok:1","scopes":null}"#),
             ("HTTP/1.1 404 Not Found", "{}"),
         ])
         .await;
 
-        assert_eq!(requests[1], "GET /api/v1/access-tokens/a%2Fb HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/v1/access-tokens/tok%3A1 HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn insert_token_details_does_not_look_up_a_token_id_the_client_refuses() {
+        let (fields, requests) = token_fields(vec![
+            ("HTTP/1.1 200 OK", r#"{"token_id":"a/b","scopes":null}"#),
+            ("HTTP/1.1 200 OK", r#"{"name":"must-not-be-read"}"#),
+        ])
+        .await;
+
+        assert_eq!(requests, ["GET /api/v1/token-info HTTP/1.1"]);
+        assert_eq!(fields.get("token_id"), Some(&json!("a/b")));
+        assert!(!fields.contains_key("token_name"));
+        assert!(!format!("{fields:?}").contains("must-not-be-read"));
     }
 
     fn api_patch(
@@ -16291,13 +16317,19 @@ mod tests {
         });
         let lines = info_table_lines(&info);
         assert!(lines.contains(&"username: eve[2Jmallory".to_owned()), "{lines:?}");
-        assert!(lines.contains(&"email: a@b.cevil".to_owned()), "{lines:?}");
+        assert!(lines.contains(&"email: a@b.c evil".to_owned()), "{lines:?}");
         assert!(lines.contains(&"scopes: ok, xy".to_owned()), "{lines:?}");
         assert!(lines.contains(&"error: bad]0;title".to_owned()), "{lines:?}");
         assert!(
             lines.iter().all(|line| !line
                 .chars()
                 .any(|c| c.is_control())),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line
+                .chars()
+                .any(|c| matches!(c, '\r' | '\u{202e}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))),
             "{lines:?}"
         );
     }
