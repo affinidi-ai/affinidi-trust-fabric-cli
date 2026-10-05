@@ -24,6 +24,10 @@ async fn main() {
 }
 
 async fn execute() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    for warning in commands::inline_secret_warnings(&args) {
+        eprintln!("{warning}");
+    }
     let cli = Cli::parse();
     if cli.is_interactive() {
         interactive::run(cli).await

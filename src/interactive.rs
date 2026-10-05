@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use rustyline::{DefaultEditor, error::ReadlineError};
 
-use crate::commands::{Cli, run as run_command};
+use crate::commands::{Cli, inline_secret_warnings, run as run_command};
 
 pub async fn run(initial: Cli) -> Result<()> {
     let prefix = initial.interactive_prefix();
@@ -19,14 +19,23 @@ pub async fn run(initial: Cli) -> Result<()> {
                 if matches!(line, "exit" | "quit") {
                     break;
                 }
-                editor.add_history_entry(line)?;
+                let warnings = shell_words::split(line)
+                    .map(|words| inline_secret_warnings(&words))
+                    .unwrap_or_default();
+                for warning in &warnings {
+                    eprintln!("{warning}");
+                }
+                // A line that carries a secret is not kept in the shell's history.
+                if warnings.is_empty() {
+                    editor.add_history_entry(line)?;
+                }
                 match parse_line(&prefix, line) {
                     Ok(cli) if cli.is_interactive() => {
                         eprintln!("note: already in the interactive shell; type a command such as `surfaces list`");
                     }
                     Ok(mut cli) => {
                         if cli.login_wants_paste_prompt() {
-                            match editor.readline("Gateway bearer token: ") {
+                            match rpassword::prompt_password("Gateway bearer token: ") {
                                 Ok(entry) => {
                                     let token = entry.trim().to_owned();
                                     if token.is_empty() {
@@ -35,12 +44,12 @@ pub async fn run(initial: Cli) -> Result<()> {
                                     }
                                     cli.set_login_token(token);
                                 }
-                                Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                                     eprintln!("note: login cancelled");
                                     continue;
                                 }
                                 Err(error) => {
-                                    eprintln!("error: {error}");
+                                    eprintln!("error: could not read the bearer token without echo: {error}");
                                     continue;
                                 }
                             }

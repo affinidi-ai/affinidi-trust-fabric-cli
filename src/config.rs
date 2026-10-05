@@ -58,6 +58,23 @@ impl Config {
         Ok((stored_name, connection))
     }
 
+    /// A warning for each saved connection whose name contains `#`, which login
+    /// refuses: the host a token is bound to is kept under `<name>#bound-host`,
+    /// so such a name can share a credential key with another connection.
+    pub fn hash_name_warnings(&self) -> Vec<String> {
+        self.connections
+            .keys()
+            .filter(|name| name.contains('#'))
+            .map(|name| {
+                format!(
+                    "warning: connection '{}' has a '#' in its name, which can share a saved token with another \
+                     connection; remove it and log in again under a name without '#'",
+                    crate::client::sanitize_whole(name)
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn load_from(path: &std::path::Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -101,6 +118,11 @@ impl Config {
             credentials
                 .set_token(name, token)
                 .with_context(|| format!("migrate connection '{name}' token to OS keyring"))?;
+            if let Some(connection) = self.connections.get(name) {
+                credentials
+                    .set_bound_host(name, &normalize_host(&connection.host).unwrap_or_else(|_| connection.host.clone()))
+                    .with_context(|| format!("record the host of connection '{name}' in OS keyring"))?;
+            }
         }
         for connection in self.connections.values_mut() {
             connection.legacy_token = None;
@@ -158,6 +180,14 @@ pub fn normalize_user_host(
         eprintln!("{warning}");
     }
     Ok(normalized)
+}
+
+/// Warning to print when a saved connection points at plain `http://` on a
+/// host other than this machine, since its token crosses the network
+/// unencrypted on every command.
+pub fn saved_host_http_warning(host: &str) -> Option<String> {
+    let url = url::Url::parse(host).ok()?;
+    plain_http_warning(&url, true).map(|warning| format!("{warning}; log in again with an https host to fix this"))
 }
 
 fn plain_http_warning(
@@ -274,6 +304,26 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_name_with_a_hash_gets_a_warning() {
+        let mut config = Config::default();
+        config
+            .connections
+            .insert("prod".into(), Connection::new("https://gateway.example".into()));
+        assert!(
+            config
+                .hash_name_warnings()
+                .is_empty()
+        );
+
+        config
+            .connections
+            .insert("prod#bound-host".into(), Connection::new("https://other.example".into()));
+        let warnings = config.hash_name_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("prod#bound-host"), "{warnings:?}");
+    }
+
+    #[test]
     fn config_round_trip_and_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -330,6 +380,13 @@ token = "legacy-secret"
             !std::fs::read_to_string(path)
                 .unwrap()
                 .contains("legacy-secret")
+        );
+        assert_eq!(
+            credentials
+                .get_bound_host("local")
+                .unwrap()
+                .as_deref(),
+            Some("https://gateway.example")
         );
     }
 
@@ -407,6 +464,16 @@ token = "only-copy"
             let url = url::Url::parse(host).unwrap();
             assert_eq!(plain_http_warning(&url, true), None, "{host}");
             assert_eq!(plain_http_warning(&url, false), None, "{host}");
+        }
+    }
+
+    #[test]
+    fn a_saved_plain_http_host_gets_a_warning_unless_it_is_local_or_https() {
+        let warning = saved_host_http_warning("http://gateway.example.com").unwrap();
+        assert!(warning.contains("gateway.example.com"), "{warning}");
+        assert!(warning.contains("log in again with an https host"), "{warning}");
+        for host in ["http://localhost:8080", "http://127.0.0.1:8080", "https://gateway.example.com", "not a url"] {
+            assert_eq!(saved_host_http_warning(host), None, "{host}");
         }
     }
 

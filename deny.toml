@@ -23,9 +23,7 @@ wildcards = "deny"
 [licenses]
 version = 2
 confidence-threshold = 0.93
-# Exactly the approved list in "Affinidi Software License Policies (Closed,
-# Open-Source Licenses)", last synced 2026-10-01:
-# https://lemmatree.atlassian.net/wiki/spaces/ISMS/pages/2735348416591
+# Exactly the licenses Affinidi has approved, last synced 2026-10-01.
 # Anything else needs Legal first, so it is added here only after they clear it,
 # not as a per-crate exception. Unicode-3.0 was cleared by Legal on 2026-10-01.
 unused-allowed-license = "allow"
