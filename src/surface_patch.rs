@@ -469,6 +469,33 @@ fn list_at(
     }
 }
 
+/// Checks that `surface` has one transit point named by `named`, its `id` or
+/// `alias`, and says which transit points exist when it has none.
+pub fn require_transit_point(
+    surface: &Value,
+    named: &str,
+) -> Result<()> {
+    let points = list_at(surface, &["transit", "points"])?;
+    find_point(&points, named).map(|_| ())
+}
+
+/// Checks that `surface` has no transit point with this `alias` yet.
+pub fn require_new_transit_alias(
+    surface: &Value,
+    alias: &str,
+) -> Result<()> {
+    let points = list_at(surface, &["transit", "points"])?;
+    if points.iter().any(|point| {
+        point
+            .get("alias")
+            .and_then(Value::as_str)
+            == Some(alias)
+    }) {
+        bail!("this surface already has a transit point with alias '{alias}': run remove-transit-point on it first");
+    }
+    Ok(())
+}
+
 /// The index of the transit point named by its `id`, else its `alias`.
 fn find_point(
     points: &[Value],

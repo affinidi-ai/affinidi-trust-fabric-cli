@@ -1,16 +1,19 @@
 use std::{
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, ArgMatches, Args, Parser, Subcommand, ValueEnum, parser::ValueSource};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use crate::{
-    client::{GatewayClient, id_from_response, response_status, sanitize_whole},
-    config::{Config, Connection, normalize_host, normalize_user_host},
+    client::{
+        GatewayClient, id_from_response, response_status, sanitize_for_terminal, sanitize_multiline, sanitize_whole,
+    },
+    config::{Config, Connection, normalize_host, normalize_user_host, saved_host_http_warning},
     credentials::{CredentialStore, OsCredentialStore},
     features, surface_patch, surface_validate,
     tables::{self, Layout, Scope, table_cell},
@@ -51,7 +54,9 @@ struct AgentGatewayArgs {
     #[arg(long, global = true, env = "FABRIC_HOST")]
     host: Option<String>,
 
-    /// Override the configured bearer token for this command.
+    /// Override the configured bearer token for this command. Prefer the
+    /// FABRIC_TOKEN environment variable, since a value typed here stays in
+    /// shell history and shows in the process list.
     #[arg(long, global = true, env = "FABRIC_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
@@ -59,6 +64,13 @@ struct AgentGatewayArgs {
     /// sent unencrypted, so only use this on a network you trust.
     #[arg(long, global = true)]
     allow_http: bool,
+
+    /// Send the saved token to a --host other than the one it was saved for.
+    /// Without this the CLI refuses, so a mistyped or swapped host cannot
+    /// receive your token. Only the typed flag counts, never an environment
+    /// variable, so a project file cannot turn it on.
+    #[arg(long, global = true)]
+    allow_host_override: bool,
 
     /// Output format for commands that return data.
     #[arg(short, long, global = true, value_enum, default_value_t = Output::Table)]
@@ -104,6 +116,9 @@ impl Cli {
         }
         if gateway.allow_http {
             args.push("--allow-http".to_owned());
+        }
+        if gateway.allow_host_override {
+            args.push("--allow-host-override".to_owned());
         }
         args.extend([
             "--output".to_owned(),
@@ -156,7 +171,12 @@ enum Command {
     /// FABRIC_TOKEN to supply a token manually instead.
     Login(LoginArgs),
     /// Remove locally saved authentication.
-    Logout,
+    ///
+    /// For a browser login this also ends the session on the gateway, if it
+    /// can be reached, which signs you out of the browser as well. A personal
+    /// access token stays valid on the gateway unless you revoke it: you are
+    /// asked in a terminal, or pass --revoke-token.
+    Logout(LogoutArgs),
     /// Manage local gateway profiles.
     Config {
         #[command(subcommand)]
@@ -369,22 +389,33 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
+struct LogoutArgs {
+    /// Also revoke the saved personal access token on the gateway, without
+    /// asking. Has no effect on a browser login, whose session always ends.
+    #[arg(long)]
+    revoke_token: bool,
+}
+
+#[derive(Debug, Args)]
 struct LoginArgs {
     /// Gateway origin, for example https://gateway.example.com.
     #[arg(long, env = "FABRIC_HOST")]
     host: Option<String>,
-    /// Read the bearer token from standard input.
+    /// Read the bearer token from standard input. Safer than --token, which
+    /// stays in shell history.
     #[arg(long, conflicts_with = "token")]
     token_stdin: bool,
     /// Paste a bearer token manually instead of using the browser login.
     #[arg(long, conflicts_with_all = ["token", "token_stdin"])]
     paste: bool,
-    /// Bearer token produced by the existing passkey or SSO login.
+    /// Bearer token produced by the existing passkey or SSO login. Prefer
+    /// FABRIC_TOKEN or --token-stdin over typing it here.
     #[arg(long, env = "FABRIC_TOKEN", hide_env_values = true)]
     token: Option<String>,
     /// Authenticate with a personal access token (agpat_...) instead of the
-    /// browser login. Combine with --token-stdin to supply it
-    /// non-interactively, or set FABRIC_PAT once --pat is passed.
+    /// browser login. Leave the value off and the CLI prompts for it, or
+    /// supply it with --token-stdin or FABRIC_PAT (set once --pat is passed).
+    /// A value typed after the flag stays in shell history.
     #[arg(
         long,
         num_args = 0..=1,
@@ -717,6 +748,15 @@ enum SurfaceCommand {
     /// Where the feature is found is worked out from its name, the same as
     /// for add-feature.
     RemoveFeature(FeaturePlacementArgs),
+    /// Add a transit point to an Agent Surface from its alias and endpoint.
+    ///
+    /// For example:
+    /// `surfaces add-transit-point $ID --alias billing --endpoint http://billing:3000`.
+    /// The point is appended to the surface's transit points, and an alias
+    /// the surface already uses is refused.
+    AddTransitPoint(AddTransitPointArgs),
+    /// Remove a transit point from an Agent Surface by its alias or id.
+    RemoveTransitPoint(RemoveTransitPointArgs),
     /// Show which tools a set of MCP tool gates would allow or deny, and which
     /// gate decided, before anything is saved.
     ///
@@ -876,6 +916,35 @@ struct AddFeatureArgs {
 }
 
 #[derive(Debug, Args)]
+struct AddTransitPointArgs {
+    /// Surface ID or name (see `fabric agent-gateway surfaces list`).
+    surface_id: String,
+    /// Alias the new transit point is known by: a lowercase letter, then
+    /// lowercase letters, digits or `-`, at most 63 characters long.
+    #[arg(long)]
+    alias: String,
+    /// Endpoint the transit point sends requests to.
+    #[arg(long)]
+    endpoint: String,
+    /// Check the change with the gateway and show what it would change,
+    /// without saving anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct RemoveTransitPointArgs {
+    /// Surface ID or name (see `fabric agent-gateway surfaces list`).
+    surface_id: String,
+    /// Alias or id of the transit point to remove.
+    transit_point: String,
+    /// Check the change with the gateway and show what it would change,
+    /// without saving anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
 struct FeaturePlacementArgs {
     /// Surface ID or name (see `fabric agent-gateway surfaces list`).
     surface_id: String,
@@ -929,11 +998,17 @@ struct AccessTokenCreateArgs {
     name: Option<String>,
     #[arg(long, default_value = "")]
     description: String,
-    /// Scope to grant the token. Repeat for multiple scopes.
+    /// Scope to grant the token. Repeat for multiple scopes. Required unless
+    /// --full-role is given; run `fabric agent-gateway tokens scopes` to see
+    /// what you can grant.
     #[arg(long = "scope")]
     scopes: Vec<String>,
-    /// RFC 3339 expiry timestamp, for example 2027-01-01T00:00:00Z. Omit for
-    /// a non-expiring token.
+    /// Give the token everything your own role can do, instead of listing
+    /// scopes. Use it only when a limited token will not do.
+    #[arg(long, conflicts_with = "scopes")]
+    full_role: bool,
+    /// RFC 3339 expiry timestamp, for example 2027-01-01T00:00:00Z. Omit it
+    /// and the token expires 90 days from now.
     #[arg(long)]
     expires_at: Option<String>,
     /// Resource the token is limited to, as
@@ -945,11 +1020,15 @@ struct AccessTokenCreateArgs {
     /// header value must match). Repeat for multiple required headers.
     #[arg(long = "required-header", value_parser = parse_required_header)]
     required_headers: Vec<(String, String)>,
-    /// Complete CreateAccessTokenRequest JSON. Other creation flags are
-    /// ignored when set.
+    /// Complete CreateAccessTokenRequest JSON. Other creation flags except
+    /// --full-role are ignored when set. It still needs scopes (or
+    /// --full-role) and gets the 90 day expiry when it has none.
     #[arg(short, long)]
     file: Option<PathBuf>,
 }
+
+/// How long a token lives when `tokens create` is not told.
+const DEFAULT_TOKEN_LIFETIME_DAYS: u64 = 90;
 
 /// Parses a `--required-header` occurrence of the form `name=pattern` into
 /// its two non-empty parts, rejecting malformed input before it ever reaches
@@ -1041,6 +1120,76 @@ impl ApiMethod {
     }
 }
 
+/// Warnings for secrets typed straight into the arguments, where shell history
+/// and the process list keep them. `args` are the words of one command line.
+/// Reading from the environment, standard input or a prompt is not flagged.
+/// `--token-stdin` is only suggested on `login`, the one command that has it.
+/// Words after `--` are not read as flags.
+pub fn inline_secret_warnings(args: &[String]) -> Vec<String> {
+    let on_login = args
+        .iter()
+        .any(|arg| arg == "login");
+    let token_source = if on_login {
+        "the FABRIC_TOKEN environment variable or --token-stdin"
+    } else {
+        "the FABRIC_TOKEN environment variable"
+    };
+    let secret_flags: [(&str, &str); 4] = [
+        ("--token", token_source),
+        ("--pat", "the prompt, FABRIC_PAT or --token-stdin"),
+        ("--value", "--value-stdin"),
+        ("--password", "the FABRIC_METRICS_PASSWORD environment variable"),
+    ];
+    let mut warnings = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            break;
+        }
+        for (flag, instead) in secret_flags {
+            let typed_value = arg.starts_with(&format!("{flag}="))
+                || (arg == flag
+                    && args
+                        .get(index + 1)
+                        .is_some_and(|next| !next.starts_with('-') && (flag != "--pat" || !next.is_empty())));
+            if typed_value {
+                warnings.push(format!(
+                    "warning: {flag} on the command line stays in your shell history and shows in the process list; \
+                     use {instead} instead"
+                ));
+            }
+        }
+        index += 1;
+    }
+    warnings
+}
+
+/// A note for standard error when both the token and the host of this run came
+/// from environment variables, so a token set in a shell profile and a host set
+/// by a project's `.envrc` do not meet without a word. A token or host typed on
+/// the command line, or a host that comes from the saved connection, is the
+/// user's own choice and gets no note. `matches` is the parsed command line.
+pub fn env_token_and_host_note(matches: &ArgMatches) -> Option<String> {
+    let gateway = matches.subcommand_matches("agent-gateway")?;
+    let login = gateway.subcommand_matches("login");
+    let source = |id: &str| {
+        login
+            .and_then(|login| login.value_source(id))
+            .or_else(|| gateway.value_source(id))
+    };
+    if source("token") != Some(ValueSource::EnvVariable) || source("host") != Some(ValueSource::EnvVariable) {
+        return None;
+    }
+    let host = login
+        .and_then(|login| login.get_one::<String>("host"))
+        .or_else(|| gateway.get_one::<String>("host"))?;
+    Some(format!(
+        "note: sending the token from FABRIC_TOKEN to the host from FABRIC_HOST ({})",
+        sanitize_for_terminal(host)
+    ))
+}
+
 /// Runs a command that needs no saved connection, token or gateway, before
 /// any of those is looked up. Returns `None` for every other command.
 fn run_offline(cli: &AgentGatewayArgs) -> Option<Result<()>> {
@@ -1074,6 +1223,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
     }
     let credentials = OsCredentialStore::new();
     let mut config = Config::load()?;
+    for warning in new_hash_name_warnings(&config) {
+        eprintln!("{warning}");
+    }
     config.migrate_legacy_tokens(&credentials)?;
     dispatch_with(cli, config, &credentials).await
 }
@@ -1098,7 +1250,7 @@ async fn dispatch_with(
                 .unwrap_or(DEFAULT_CONNECTION);
             login(&mut config, credentials, connection, args, cli.allow_http).await
         }
-        Command::Logout => logout(&mut config, credentials, cli.connection.as_deref()),
+        Command::Logout(args) => logout(&mut config, credentials, cli.connection.as_deref(), args.revoke_token).await,
         Command::Config { command } => run_config(&mut config, credentials, command, cli.output),
         Command::Whoami => {
             whoami(
@@ -1106,7 +1258,10 @@ async fn dispatch_with(
                 credentials,
                 cli.connection.as_deref(),
                 cli.host.as_deref(),
-                cli.allow_http,
+                HostFlags {
+                    allow_http: cli.allow_http,
+                    allow_host_override: cli.allow_host_override,
+                },
                 cli.token.as_deref(),
                 cli.output,
             )
@@ -1117,17 +1272,15 @@ async fn dispatch_with(
         } => write_features(cli.output, &mut io::stdout()).context("print the features"),
         command => {
             let (connection_name, saved) = config.resolve(cli.connection.as_deref())?;
-            let host = cli
-                .host
-                .as_deref()
-                .map(|host| normalize_user_host(host, cli.allow_http))
-                .transpose()?
-                .unwrap_or_else(|| saved.host.clone());
+            let host = command_host(saved, cli.host.as_deref(), cli.allow_http)?;
             let token = match cli.token {
                 Some(token) => token,
-                None => credentials
-                    .get_token(connection_name)?
-                    .with_context(|| format!("no token stored for connection '{connection_name}'; run `fabric agent-gateway login --connection {connection_name} --host {host}`"))?,
+                None => {
+                    check_token_host(credentials, connection_name, saved, &host, cli.allow_host_override)?;
+                    credentials
+                        .get_token(connection_name)?
+                        .with_context(|| format!("no token stored for connection '{connection_name}'; run `fabric agent-gateway login --connection {connection_name} --host {host}`"))?
+                }
             };
             let client = GatewayClient::new(host, token)?;
             if let Command::AccessTokens { command } = command {
@@ -1221,7 +1374,7 @@ async fn dispatch_with(
                 Command::Api(args) => run_api(&client, args).await?,
                 Command::AccessTokens { .. }
                 | Command::Login(_)
-                | Command::Logout
+                | Command::Logout(_)
                 | Command::Config { .. }
                 | Command::Whoami
                 | Command::Shell => unreachable!(),
@@ -1235,6 +1388,128 @@ async fn dispatch_with(
             }
         }
     }
+}
+
+/// What a command may do about the host it sends a token to.
+#[derive(Clone, Copy, Default)]
+struct HostFlags {
+    allow_http: bool,
+    allow_host_override: bool,
+}
+
+/// The warnings already shown in this process, so the interactive shell, which
+/// runs every line as a command, says each one once instead of before every
+/// line. Keys name the kind of warning and what it is about.
+static WARNED_ONCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether `key` has not been warned about yet, and marks it as warned.
+fn first_warning_for(key: String) -> bool {
+    let mut warned = WARNED_ONCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.contains(&key) {
+        return false;
+    }
+    warned.push(key);
+    true
+}
+
+/// The `#` name warnings of `config` not shown yet in this process.
+fn new_hash_name_warnings(config: &Config) -> Vec<String> {
+    config
+        .hash_name_warnings()
+        .into_iter()
+        .filter(|warning| first_warning_for(format!("hash-name:{warning}")))
+        .collect()
+}
+
+/// [`first_warning_for`] the http warning of `host`, compared as the host is
+/// normalized to `scheme://host[:port]`, so a different case, a default port, a
+/// trailing slash, a login name or a path is the same host.
+fn first_http_warning_for(host: &str) -> bool {
+    let key = normalize_host(host)
+        .ok()
+        .and_then(|normalized| url::Url::parse(&normalized).ok())
+        .and_then(|url| {
+            let name = url.host_str()?;
+            Some(match url.port() {
+                Some(port) => format!("{}://{name}:{port}", url.scheme()),
+                None => format!("{}://{name}", url.scheme()),
+            })
+        })
+        .unwrap_or_else(|| host.to_lowercase());
+    first_warning_for(format!("http:{key}"))
+}
+
+/// The host a command talks to: the typed `--host` when there is one, else the
+/// saved connection's host, which gets a warning on stderr (once per host in a run) when
+/// it is plain http to a remote machine.
+fn command_host(
+    saved: &Connection,
+    host_override: Option<&str>,
+    allow_http: bool,
+) -> Result<String> {
+    match host_override {
+        Some(host) => normalize_user_host(host, allow_http),
+        None => {
+            if let Some(warning) = saved_host_http_warning(&saved.host)
+                && first_http_warning_for(&saved.host)
+            {
+                eprintln!("{warning}");
+            }
+            Ok(saved.host.clone())
+        }
+    }
+}
+
+/// Refuses to send a saved token to a host it was not saved for. Login records
+/// the host beside the token; a connection saved before that falls back to the
+/// host in the configuration, and that host is recorded on its first use so a
+/// later edit of the configuration cannot move the token. `allow_host_override`
+/// lets the token go anyway, with a warning.
+fn check_token_host(
+    credentials: &impl CredentialStore,
+    name: &str,
+    saved: &Connection,
+    host: &str,
+    allow_host_override: bool,
+) -> Result<()> {
+    let recorded = credentials.get_bound_host(name)?;
+    let bound = recorded
+        .clone()
+        .unwrap_or_else(|| saved.host.clone());
+    let bound = normalize_host(&bound).unwrap_or(bound);
+    let requested = normalize_host(host).unwrap_or_else(|_| host.to_owned());
+    if requested == bound {
+        if recorded.is_none()
+            && credentials
+                .get_token(name)?
+                .is_some()
+        {
+            // A store that cannot be written leaves the token following the
+            // configuration, as it did before, so say so and carry on.
+            if let Err(error) = credentials.set_bound_host(name, &bound)
+                && first_warning_for(format!("bound-host:{name}"))
+            {
+                eprintln!(
+                    "warning: could not save the host for connection '{}' ({}); its token keeps following the \
+                     host in config.toml",
+                    sanitize_whole(name),
+                    sanitize_for_terminal(&error.to_string())
+                );
+            }
+        }
+        return Ok(());
+    }
+    if allow_host_override {
+        eprintln!("warning: sending the token saved for {bound} to {requested}");
+        return Ok(());
+    }
+    bail!(
+        "the token saved for connection '{name}' belongs to {bound}, so it was not sent to {requested}; to log in \
+         there run `fabric agent-gateway login --connection {name} --host {requested}`, or pass \
+         --allow-host-override to send the saved token anyway"
+    )
 }
 
 async fn login(
@@ -1270,6 +1545,9 @@ async fn login_and_save(
     if connection.is_empty() {
         bail!("--connection must not be empty or only whitespace");
     }
+    if connection.contains('#') {
+        bail!("--connection must not contain '#'");
+    }
     let host = normalize_user_host(
         &args
             .host
@@ -1291,20 +1569,39 @@ async fn login_and_save(
             .context("validate login")?;
     }
     let previous_token = credentials.get_token(connection)?;
+    let previous_host = credentials.get_bound_host(connection)?;
     credentials.set_token(connection, &token)?;
+    if let Err(error) = credentials.set_bound_host(connection, &host) {
+        restore_credentials(credentials, connection, previous_token, previous_host)?;
+        return Err(error);
+    }
     let previous = config
         .connections
         .insert(connection.to_owned(), Connection::new(host.clone()));
     config.current = Some(connection.to_owned());
     if let Err(error) = config.save_to(config_path) {
-        if let Some(previous_token) = previous_token {
-            credentials.set_token(connection, &previous_token)?;
-        } else {
-            credentials.delete_token(connection)?;
-        }
+        restore_credentials(credentials, connection, previous_token, previous_host)?;
         return Err(error);
     }
     Ok(previous.map(|previous| replaced_connection_note(connection, &previous.host, &host)))
+}
+
+/// Puts back the token and bound host a failed login replaced, or removes
+/// them when there were none.
+fn restore_credentials(
+    credentials: &impl CredentialStore,
+    connection: &str,
+    token: Option<String>,
+    host: Option<String>,
+) -> Result<()> {
+    match token {
+        Some(token) => credentials.set_token(connection, &token)?,
+        None => credentials.delete_token(connection)?,
+    }
+    match host {
+        Some(host) => credentials.set_bound_host(connection, &host),
+        None => credentials.delete_bound_host(connection),
+    }
 }
 
 fn replaced_connection_note(
@@ -1412,11 +1709,11 @@ async fn whoami(
     credentials: &impl CredentialStore,
     connection: Option<&str>,
     host_override: Option<&str>,
-    allow_http: bool,
+    flags: HostFlags,
     token_override: Option<&str>,
     output: Output,
 ) -> Result<()> {
-    let info = whoami_info(config, credentials, connection, host_override, allow_http, token_override).await?;
+    let info = whoami_info(config, credentials, connection, host_override, flags, token_override).await?;
     match output {
         Output::Json => println!("{}", serde_json::to_string_pretty(&info)?),
         Output::Table => print_info_table(&info),
@@ -1431,21 +1728,19 @@ async fn whoami_info(
     credentials: &impl CredentialStore,
     connection: Option<&str>,
     host_override: Option<&str>,
-    allow_http: bool,
+    flags: HostFlags,
     token_override: Option<&str>,
 ) -> Result<Value> {
-    let (name, saved_host) = {
-        let (name, saved) = config.resolve(connection)?;
-        (name.to_owned(), saved.host.clone())
-    };
-    let host = match host_override {
-        Some(host) => normalize_user_host(host, allow_http)?,
-        None => saved_host,
-    };
+    let (name, saved) = config.resolve(connection)?;
+    let host = command_host(saved, host_override, flags.allow_http)?;
     let token = match token_override {
         Some(token) => Some(token.to_owned()),
-        None => credentials.get_token(&name)?,
+        None => {
+            check_token_host(credentials, name, saved, &host, flags.allow_host_override)?;
+            credentials.get_token(name)?
+        }
     };
+    let name = name.to_owned();
 
     let mut info = json!({
         "connection": name,
@@ -1588,6 +1883,8 @@ fn print_info_table(value: &Value) {
     }
 }
 
+/// The `whoami` table as lines. Every value came from the gateway or from what
+/// the user typed, so each is stripped of control characters first.
 fn info_table_lines(value: &Value) -> Vec<String> {
     const ORDER: &[&str] = &[
         "connection",
@@ -1621,37 +1918,199 @@ fn info_table_lines(value: &Value) -> Vec<String> {
                     .join(", "),
                 other => other.to_string(),
             };
-            lines.push(format!("{key}: {rendered}"));
+            lines.push(format!("{key}: {}", sanitize_for_terminal(&rendered)));
         }
     }
     lines
 }
 
-fn logout(
+/// Signs out of a connection: ends the session on the gateway when the saved
+/// token is a session token, tells the user how to revoke it when it is a
+/// personal access token, then removes the local copy. The gateway part is best
+/// effort, so an unreachable gateway never stops the local removal.
+async fn logout(
     config: &mut Config,
     credentials: &impl CredentialStore,
     requested: Option<&str>,
+    revoke_token: bool,
 ) -> Result<()> {
     let name = requested
         .or(config.current.as_deref())
         .context("no gateway connection selected")?
         .to_owned();
-    credentials.delete_token(&name)?;
+    let remote_note = match config.connections.get(&name) {
+        Some(connection) => {
+            let pat_choice = if revoke_token {
+                PatChoice::Revoke
+            } else if io::stdin().is_terminal() {
+                PatChoice::Ask
+            } else {
+                PatChoice::Keep
+            };
+            end_remote_credential(credentials, &name, connection, pat_choice).await
+        }
+        None => None,
+    };
+    remove_connection(config, credentials, &name, &crate::config::config_path()?)?;
+    if let Some(note) = remote_note {
+        eprintln!("{note}");
+    }
+    Ok(())
+}
+
+/// What logout does about a saved personal access token, which a session
+/// logout cannot cancel by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PatChoice {
+    /// Revoke it on the gateway without asking (`--revoke-token`).
+    Revoke,
+    /// Ask in the terminal whether to revoke it.
+    Ask,
+    /// Leave it valid and say how to revoke it later.
+    Keep,
+}
+
+/// Does what can be done on the gateway about the token saved for `name`, and
+/// returns the line to show about it. The token is only ever sent to the host
+/// it was saved for. A personal access token is revoked while it is still in
+/// hand when `pat_choice` says so; a browser session is always ended.
+async fn end_remote_credential(
+    credentials: &impl CredentialStore,
+    name: &str,
+    connection: &Connection,
+    pat_choice: PatChoice,
+) -> Option<String> {
+    let token = credentials
+        .get_token(name)
+        .ok()
+        .flatten()?;
+    let host = credentials
+        .get_bound_host(name)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| connection.host.clone());
+    if let Some(warning) = saved_host_http_warning(&host) {
+        eprintln!("{warning}");
+    }
+    let client = GatewayClient::new(&host, &token).ok()?;
+    if token.starts_with(PAT_TOKEN_PREFIX) {
+        let id = client
+            .request(Method::GET, "/v1/token-info", None)
+            .await
+            .ok()
+            .and_then(|info| {
+                info.get("token_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned)
+            });
+        let shown_id = id
+            .as_deref()
+            .map(sanitize_whole);
+        let revoke = match (pat_choice, &id) {
+            (PatChoice::Revoke, Some(_)) => true,
+            (PatChoice::Ask, Some(_)) => ask_to_revoke_pat(
+                &host,
+                shown_id
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
+            _ => false,
+        };
+        let Some(id) = id.filter(|_| revoke) else {
+            return Some(pat_still_valid_note(&host, shown_id.as_deref()));
+        };
+        return Some(
+            match client
+                .request(Method::DELETE, &entity_path("/v1/access-tokens", &id), None)
+                .await
+            {
+                Ok(_) => format!("note: revoked this personal access token on {host}"),
+                Err(error) => format!(
+                    "warning: could not revoke this personal access token on {host} ({}). {}",
+                    sanitize_for_terminal(&error.to_string()),
+                    pat_still_valid_note(&host, shown_id.as_deref())
+                ),
+            },
+        );
+    }
+    Some(match client.end_session().await {
+        Ok(()) => format!("note: ended the session on {host}"),
+        Err(error) if response_status(&error).is_none() => {
+            format!("warning: could not reach {host} to end the session, so it stays valid there until it expires")
+        }
+        Err(error) => format!(
+            "warning: {host} would not end the session ({}), so it stays valid there until it expires",
+            sanitize_for_terminal(&error.to_string())
+        ),
+    })
+}
+
+/// Asks on the terminal whether logout should also revoke the personal access
+/// token `id` (already sanitized) on `host`. An unreadable answer counts as no.
+fn ask_to_revoke_pat(
+    host: &str,
+    id: &str,
+) -> bool {
+    eprint!("{} [y/N] ", revoke_pat_prompt(host, id));
+    let _ = io::Write::flush(&mut io::stderr());
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .is_ok()
+        && answer_is_yes(&answer)
+}
+
+fn revoke_pat_prompt(
+    host: &str,
+    id: &str,
+) -> String {
+    format!("Also revoke personal access token {id} on {host}?")
+}
+
+/// What to tell a user who logged out of a personal access token, which logging
+/// out cannot cancel: it is still valid on the gateway until revoked.
+fn pat_still_valid_note(
+    host: &str,
+    id: Option<&str>,
+) -> String {
+    match id {
+        Some(id) => format!(
+            "note: this personal access token is still valid on {host}; logging out only removed the local copy. To \
+             revoke it, log in again and run: fabric agent-gateway tokens revoke {id}"
+        ),
+        None => format!(
+            "note: this personal access token is still valid on {host}; logging out only removed the local copy. To \
+             revoke it, log in again, find its ID with `fabric agent-gateway tokens list`, and run: fabric \
+             agent-gateway tokens revoke <token-id>"
+        ),
+    }
+}
+
+/// Removes a connection and its token from this machine only.
+fn remove_connection(
+    config: &mut Config,
+    credentials: &impl CredentialStore,
+    name: &str,
+    config_path: &Path,
+) -> Result<()> {
+    credentials.delete_token(name)?;
+    credentials.delete_bound_host(name)?;
     if config
         .connections
-        .remove(&name)
+        .remove(name)
         .is_none()
     {
         bail!("gateway connection '{name}' does not exist");
     }
-    if config.current.as_deref() == Some(&name) {
+    if config.current.as_deref() == Some(name) {
         config.current = config
             .connections
             .keys()
             .next()
             .cloned();
     }
-    config.save()?;
+    config.save_to(config_path)?;
     println!("Removed local credentials for '{name}'");
     Ok(())
 }
@@ -1679,7 +2138,7 @@ fn run_config(
             println!("Using '{name}'");
             Ok(())
         }
-        ConfigCommand::Remove { name } => logout(config, credentials, Some(&name)),
+        ConfigCommand::Remove { name } => remove_connection(config, credentials, &name, &crate::config::config_path()?),
     }
 }
 
@@ -3570,6 +4029,288 @@ mod gateway_config_tests {
         let requests = full_requests(requests);
         assert_eq!(start_lines(&requests), [LIST_REQUEST, S1_REQUEST, "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]);
         assert_eq!(body_of(&requests[2]), own_pattern_patch());
+    }
+
+    const ADD_BILLING: [&str; 6] =
+        ["add-transit-point", "s-1", "--alias", "billing", "--endpoint", "http://billing:3000"];
+
+    #[tokio::test]
+    async fn add_transit_point_sends_the_whole_list_with_the_new_point_appended() {
+        let requests = feature_dry_run(&ADD_BILLING, TRANSIT_SURFACE)
+            .await
+            .expect("a new alias should be added");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [
+                {"alias": "gh"},
+                {"alias": "billing", "target_endpoint": "http://billing:3000"}
+            ]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_to_a_surface_without_a_transit_block_sends_a_one_point_list() {
+        let requests = feature_dry_run(&ADD_BILLING, STORED_SURFACE)
+            .await
+            .expect("the first point should be added");
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"alias": "billing", "target_endpoint": "http://billing:3000"}]}})
+        );
+    }
+
+    /// Runs a surface command that saves, against a gateway that answers the
+    /// read of the surface and then the patch, and returns the requests made.
+    async fn saving_command(
+        args: &[&str],
+        stored: &'static str,
+    ) -> Result<Vec<String>> {
+        let (host, requests) =
+            scripted_server(vec![(DRY_RUN_GATEWAY_OK, stored), ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1"}"#)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let mut argv = vec!["fabric", "agent-gateway", "surfaces"];
+        argv.extend_from_slice(args);
+        run_surfaces(&client, surface_command(&argv), Output::Json).await?;
+        Ok(full_requests(requests))
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_without_dry_run_saves_the_patch() {
+        let requests = saving_command(&ADD_BILLING, TRANSIT_SURFACE)
+            .await
+            .expect("a new alias should be saved");
+        assert_eq!(
+            start_lines(&requests),
+            ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]
+        );
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [
+                {"alias": "gh"},
+                {"alias": "billing", "target_endpoint": "http://billing:3000"}
+            ]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_refuses_an_alias_the_surface_already_has_before_sending() {
+        let (host, requests) = scripted_server(vec![(DRY_RUN_GATEWAY_OK, TRANSIT_SURFACE)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command = surface_command(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "add-transit-point",
+            "s-1",
+            "--alias",
+            "gh",
+            "--endpoint",
+            "http://gh:3000",
+        ]);
+        let error = run_surfaces(&client, command, Output::Json)
+            .await
+            .expect_err("a duplicate alias should be refused");
+        assert_eq!(
+            error.to_string(),
+            "this surface already has a transit point with alias 'gh': run remove-transit-point on it first"
+        );
+        assert_eq!(request_lines(requests), ["GET /api/v1/surfaces/s-1 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_refuses_a_blank_or_badly_formed_alias_or_endpoint_before_any_request() {
+        let too_long = "a".repeat(MAX_TRANSIT_ALIAS_LEN + 1);
+        let too_long_flags = ["--alias", too_long.as_str(), "--endpoint", "http://a:1"];
+        let too_long_message = format!("the alias '{too_long}' is too long: use at most 63 characters");
+        let cases: [(&[&str], &str); 10] = [
+            (&["--alias", " ", "--endpoint", "http://a:1"], "give a transit point alias with --alias"),
+            (&["--alias", "a", "--endpoint", "  "], "give the transit point's endpoint with --endpoint"),
+            (&["--alias", "Billing", "--endpoint", "http://a:1"], "the alias 'Billing' is not allowed"),
+            (&["--alias", "1abc", "--endpoint", "http://a:1"], "the alias '1abc' is not allowed"),
+            (&["--alias", "a_b", "--endpoint", "http://a:1"], "the alias 'a_b' is not allowed"),
+            (&["--alias=-a", "--endpoint", "http://a:1"], "the alias '-a' is not allowed"),
+            (&["--alias", "caf\u{e9}", "--endpoint", "http://a:1"], "the alias 'caf\u{e9}' is not allowed"),
+            (&["--alias", "a.b", "--endpoint", "http://a:1"], "the alias 'a.b' is not allowed"),
+            (&["--alias", "a[0]", "--endpoint", "http://a:1"], "the alias 'a[0]' is not allowed"),
+            (&too_long_flags, too_long_message.as_str()),
+        ];
+        for (flags, expected) in cases {
+            let (host, requests) = scripted_server(vec![]).await;
+            let client = GatewayClient::new(host, "agpat_valid").expect("client");
+            let mut argv = vec!["fabric", "agent-gateway", "surfaces", "add-transit-point", "Sales"];
+            argv.extend_from_slice(flags);
+            let error = resolve_surface_command(&client, surface_command(&argv))
+                .await
+                .expect_err("the arguments should be refused before the surface is looked up")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            argv[4] = "s-1";
+            let error = run_surfaces(&client, surface_command(&argv), Output::Json)
+                .await
+                .expect_err("the arguments should be refused before the surface is read")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(full_requests(requests).is_empty(), "{flags:?} sent a request");
+        }
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_accepts_digits_and_dashes_after_the_first_letter() {
+        let requests = feature_dry_run(
+            &["add-transit-point", "s-1", "--alias", "bill-2", "--endpoint", " http://b:1 "],
+            TRANSIT_SURFACE,
+        )
+        .await
+        .expect("the alias is well formed");
+        assert_eq!(
+            patch_body(&requests)["transit"]["points"][1],
+            json!({"alias": "bill-2", "target_endpoint": "http://b:1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_accepts_an_alias_of_63_characters() {
+        let alias = "a".repeat(MAX_TRANSIT_ALIAS_LEN);
+        let requests = feature_dry_run(
+            &["add-transit-point", "s-1", "--alias", alias.as_str(), "--endpoint", "http://b:1"],
+            TRANSIT_SURFACE,
+        )
+        .await
+        .expect("an alias at the limit is accepted");
+        assert_eq!(patch_body(&requests)["transit"]["points"][1]["alias"], json!(alias));
+    }
+
+    const TWO_POINT_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[{"id":"tp-1","alias":"billing","target_endpoint":"http://billing:3000"},{"id":"tp-2","alias":"gh","target_endpoint":"http://gh:3000"}]}}"#;
+
+    #[tokio::test]
+    async fn remove_transit_point_matches_by_alias_or_by_id() {
+        for name in ["billing", "tp-1"] {
+            let requests = feature_dry_run(&["remove-transit-point", "s-1", name], TWO_POINT_SURFACE)
+                .await
+                .expect("an existing point should be removed");
+            assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+            assert_eq!(
+                patch_body(&requests),
+                json!({"transit": {"points": [{"id": "tp-2", "alias": "gh", "target_endpoint": "http://gh:3000"}]}}),
+                "removing by {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_without_dry_run_saves_the_patch() {
+        let requests = saving_command(&["remove-transit-point", "s-1", "billing"], TWO_POINT_SURFACE)
+            .await
+            .expect("an existing point should be removed");
+        assert_eq!(
+            start_lines(&requests),
+            ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]
+        );
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"id": "tp-2", "alias": "gh", "target_endpoint": "http://gh:3000"}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_ignores_spaces_around_the_name() {
+        let requests = feature_dry_run(&["remove-transit-point", "s-1", " billing "], TWO_POINT_SURFACE)
+            .await
+            .expect("the name should be trimmed");
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"id": "tp-2", "alias": "gh", "target_endpoint": "http://gh:3000"}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_refuses_a_blank_name_before_any_request() {
+        for blank in ["", "  "] {
+            let (host, requests) = scripted_server(vec![]).await;
+            let client = GatewayClient::new(host, "agpat_valid").expect("client");
+            let argv = ["fabric", "agent-gateway", "surfaces", "remove-transit-point", "Sales", blank];
+            let error = resolve_surface_command(&client, surface_command(&argv))
+                .await
+                .expect_err("a blank name should be refused before the surface is looked up")
+                .to_string();
+            assert_eq!(error, "give the alias or id of the transit point to remove");
+            let argv = ["fabric", "agent-gateway", "surfaces", "remove-transit-point", "s-1", blank];
+            run_surfaces(&client, surface_command(&argv), Output::Json)
+                .await
+                .expect_err("a blank name should be refused before the surface is read");
+            assert!(full_requests(requests).is_empty(), "{blank:?} sent a request");
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_unknown_name_lists_the_points_that_exist() {
+        let error = feature_dry_run(&["remove-transit-point", "s-1", "nope"], TWO_POINT_SURFACE)
+            .await
+            .expect_err("an unknown point should be refused")
+            .to_string();
+        assert!(error.contains("no transit point 'nope'"), "{error}");
+        assert!(error.contains("billing, gh"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_on_a_surface_without_points_says_it_has_none() {
+        for stored in [
+            STORED_SURFACE,
+            r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[]}}"#,
+        ] {
+            let error = feature_dry_run(&["remove-transit-point", "s-1", "gh"], stored)
+                .await
+                .expect_err("there is nothing to remove")
+                .to_string();
+            assert!(error.contains("no transit point 'gh': it has no transit points yet"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_with_an_alias_shared_by_two_points_asks_for_the_id() {
+        const SHARED_ALIAS: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[{"id":"tp-1","alias":"gh"},{"id":"tp-2","alias":"gh"}]}}"#;
+        let error = feature_dry_run(&["remove-transit-point", "s-1", "gh"], SHARED_ALIAS)
+            .await
+            .expect_err("two points have this alias")
+            .to_string();
+        assert!(error.contains("more than one transit point has the alias 'gh': use its id"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_transit_point_commands_find_the_surface_by_name() {
+        let runs: [(&[&str], &'static str, &str); 2] = [
+            (
+                &["add-transit-point", "Sales", "--alias", "billing", "--endpoint", "http://billing:3000"],
+                TRANSIT_SURFACE,
+                "billing",
+            ),
+            (&["remove-transit-point", "Sales", "billing"], TWO_POINT_SURFACE, "tp-2"),
+        ];
+        for (args, stored, in_patch) in runs {
+            let (host, requests) = scripted_server(vec![
+                LIST_OK,
+                (DRY_RUN_GATEWAY_OK, stored),
+                ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1"}"#),
+            ])
+            .await;
+            let client = GatewayClient::new(host, "agpat_valid").expect("client");
+            let mut argv = vec!["fabric", "agent-gateway", "surfaces"];
+            argv.extend_from_slice(args);
+            let command = resolve_surface_command(&client, surface_command(&argv))
+                .await
+                .expect("the surface should resolve");
+            run_surfaces(&client, command, Output::Json)
+                .await
+                .expect("the edit should be saved");
+            let requests = full_requests(requests);
+            assert_eq!(
+                start_lines(&requests),
+                [LIST_REQUEST, S1_REQUEST, "PATCH /api/v1/surfaces/s-1 HTTP/1.1"],
+                "{args:?}"
+            );
+            assert!(requests[2].contains(in_patch), "{args:?}: {}", requests[2]);
+        }
     }
 
     #[tokio::test]
@@ -7983,6 +8724,8 @@ async fn run_surfaces(
             .map(Some),
         SurfaceCommand::AddFeature(args) => add_feature(client, args, output).await,
         SurfaceCommand::RemoveFeature(args) => remove_feature(client, args, output).await,
+        SurfaceCommand::AddTransitPoint(args) => add_transit_point(client, args, output).await,
+        SurfaceCommand::RemoveTransitPoint(args) => remove_transit_point(client, args, output).await,
         SurfaceCommand::Features { surface_id: Some(surface_id) } => {
             show_surface_features(client, &surface_id, output, &mut io::stdout()).await?;
             Ok(None)
@@ -8549,6 +9292,9 @@ enum ApiKeyCommand {
         /// Actor recorded in the audit trail.
         #[arg(long, default_value = "api")]
         actor: String,
+        /// Skip the confirmation prompt. Required when running non-interactively.
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Rotate an API key: revoke the current secret and issue a new one.
     Rotate {
@@ -8559,6 +9305,9 @@ enum ApiKeyCommand {
         /// Actor recorded in the audit trail.
         #[arg(long, default_value = "api")]
         actor: String,
+        /// Skip the confirmation prompt. Required when running non-interactively.
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Delete an API key.
     Delete {
@@ -8566,6 +9315,9 @@ enum ApiKeyCommand {
         key_id: String,
         #[command(flatten)]
         surface: ApiKeySurfaceArgs,
+        /// Skip the confirmation prompt. Required when running non-interactively.
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -8975,24 +9727,66 @@ async fn run_api_keys(
                 .await?;
             print_api_key_secret(&value, output, "Created")
         }
-        ApiKeyCommand::Revoke { key_id, surface, actor } => {
+        ApiKeyCommand::Revoke { key_id, surface, actor, yes } => {
+            refuse_without_terminal("revoke", &key_id, yes)?;
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
+            if !yes
+                && !confirm_action("revoke", &key_id, async {
+                    format!(
+                        "Revoke API key {} of Agent Surface {}?",
+                        describe_target(client, &api_key_path(&agent_id, &key_id), &key_id).await,
+                        sanitize_whole(&agent_id)
+                    )
+                })
+                .await?
+            {
+                println!("Aborted. API key '{}' was not revoked.", sanitize_whole(&key_id));
+                return Ok(());
+            }
             let path = format!("{}/revoke", api_key_path(&agent_id, &key_id));
             let value = client
                 .request(Method::POST, &path, Some(json!({"actor": actor})))
                 .await?;
             print_outcome(&value, output, &confirmation_line("Revoked", "API key", &key_id))
         }
-        ApiKeyCommand::Rotate { key_id, surface, actor } => {
+        ApiKeyCommand::Rotate { key_id, surface, actor, yes } => {
+            refuse_without_terminal("rotate", &key_id, yes)?;
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
+            if !yes
+                && !confirm_action("rotate", &key_id, async {
+                    format!(
+                        "Rotate API key {} of Agent Surface {}? Its current secret will stop working immediately.",
+                        describe_target(client, &api_key_path(&agent_id, &key_id), &key_id).await,
+                        sanitize_whole(&agent_id)
+                    )
+                })
+                .await?
+            {
+                println!("Aborted. API key '{}' was not rotated.", sanitize_whole(&key_id));
+                return Ok(());
+            }
             let path = format!("{}/rotate", api_key_path(&agent_id, &key_id));
             let value = client
                 .request(Method::POST, &path, Some(json!({"actor": actor})))
                 .await?;
             print_api_key_secret(&value, output, "Rotated")
         }
-        ApiKeyCommand::Delete { key_id, surface } => {
+        ApiKeyCommand::Delete { key_id, surface, yes } => {
+            refuse_without_terminal("delete", &key_id, yes)?;
             let agent_id = resolve_api_key_surface(client, &key_id, surface).await?;
+            if !yes
+                && !confirm_action("delete", &key_id, async {
+                    format!(
+                        "Delete API key {} of Agent Surface {}?",
+                        describe_target(client, &api_key_path(&agent_id, &key_id), &key_id).await,
+                        sanitize_whole(&agent_id)
+                    )
+                })
+                .await?
+            {
+                println!("Aborted. API key '{}' was not deleted.", sanitize_whole(&key_id));
+                return Ok(());
+            }
             let value = client
                 .request(Method::DELETE, &api_key_path(&agent_id, &key_id), None)
                 .await?;
@@ -9596,6 +10390,7 @@ mod identity_access_tests {
                 key_id: "atgk_1".to_owned(),
                 surface: ApiKeySurfaceArgs { agent_id: None },
                 actor: "ops-team".to_owned(),
+                yes: true,
             },
             Output::Json,
         )
@@ -10189,6 +10984,11 @@ mod identity_access_tests {
             ),
             (vec!["identities", "update", "i-1", "-f", "x.json"], "Updated identity 'i-1'"),
             (vec!["surfaces", "update", "s-1", "-f", "x.json"], "Updated surface 's-1'"),
+            (
+                vec!["surfaces", "add-transit-point", "s-1", "--alias", "billing", "--endpoint", "http://b:1"],
+                "Updated surface 's-1'",
+            ),
+            (vec!["surfaces", "remove-transit-point", "s-1", "billing"], "Updated surface 's-1'"),
         ] {
             let mut full = vec!["fabric", "agent-gateway"];
             full.extend(&arguments);
@@ -10263,7 +11063,15 @@ async fn run_access_tokens(
             print_json_or_else(&value, output, || print_access_token_table(&value))?;
         }
         AccessTokenCommand::Revoke(args) => {
-            if !args.yes && !confirm_token_action("revoke", &args.id, &format!("Revoke access token {}?", args.id))? {
+            if !args.yes
+                && !confirm_action("revoke", &args.id, async {
+                    format!(
+                        "Revoke access token {}?",
+                        describe_target(client, &entity_path("/v1/access-tokens", &args.id), &args.id).await
+                    )
+                })
+                .await?
+            {
                 println!("Aborted. Access token '{}' was not revoked.", args.id);
                 return Ok(());
             }
@@ -10276,11 +11084,13 @@ async fn run_access_tokens(
         }
         AccessTokenCommand::Rotate(args) => {
             if !args.yes
-                && !confirm_token_action(
-                    "rotate",
-                    &args.id,
-                    &format!("Rotate access token {}? Its current secret will stop working immediately.", args.id),
-                )?
+                && !confirm_action("rotate", &args.id, async {
+                    format!(
+                        "Rotate access token {}? Its current secret will stop working immediately.",
+                        describe_target(client, &entity_path("/v1/access-tokens", &args.id), &args.id).await
+                    )
+                })
+                .await?
             {
                 println!("Aborted. Access token '{}' was not rotated.", args.id);
                 return Ok(());
@@ -10298,11 +11108,17 @@ async fn run_access_tokens(
             print_value(&value, output)?;
         }
         AccessTokenCommand::Create(args) => {
-            let body = if let Some(file) = args.file {
+            let full_role = args.full_role;
+            let mut body = if let Some(file) = args.file {
                 read_json(&file)?
             } else {
                 access_token_body(args)?
             };
+            if let Some(expires_at) = require_scopes_and_expiry(&mut body, full_role, unix_now())? {
+                eprintln!(
+                    "note: no expiry was given, so this token expires on {expires_at} ({DEFAULT_TOKEN_LIFETIME_DAYS} days from now)"
+                );
+            }
             let value = client
                 .request(Method::POST, "/v1/access-tokens", Some(body))
                 .await
@@ -10342,22 +11158,68 @@ fn grantable_scopes(permissions: &Value) -> Vec<String> {
     scopes
 }
 
-/// Show `prompt` to confirm a destructive access-token action (`verb`, e.g.
-/// `revoke`) and return whether the operator agreed. Refuses instead of hanging
-/// when standard input is not a terminal, since the prompt could never be
-/// answered in that case.
-fn confirm_token_action(
+/// Names what a prompt is about as `'name' (id) on host`, reading the name
+/// from the entity's own route. The name is left out when the gateway has none
+/// or cannot be asked, so the prompt still shows the id and host.
+async fn describe_target(
+    client: &GatewayClient,
+    path: &str,
+    id: &str,
+) -> String {
+    let name = client
+        .request(Method::GET, path, None)
+        .await
+        .ok()
+        .and_then(|entity| {
+            ["name", "client_id"]
+                .iter()
+                .find_map(|key| {
+                    entity
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .map(sanitize_for_terminal)
+                })
+        });
+    let id = sanitize_whole(id);
+    let host = sanitize_for_terminal(client.host());
+    match name {
+        Some(name) => format!("'{name}' ({id}) on {host}"),
+        None => format!("{id} on {host}"),
+    }
+}
+
+/// Fails when a destructive action needs a confirmation (`yes` is not set) and
+/// standard input is not a terminal, so the prompt could never be answered.
+/// Called before any lookup, so a refused command sends nothing at all.
+fn refuse_without_terminal(
     verb: &str,
     id: &str,
-    prompt: &str,
-) -> Result<bool> {
-    if !io::stdin().is_terminal() {
+    yes: bool,
+) -> Result<()> {
+    if !yes && !io::stdin().is_terminal() {
         bail!(
-            "refusing to {verb} '{id}' without confirmation in a non-interactive session; pass --yes to skip the prompt"
+            "refusing to {verb} '{}' without confirmation in a non-interactive session; pass --yes to skip the prompt",
+            sanitize_whole(id)
         );
     }
-    print!("{prompt} [y/N] ");
-    io::Write::flush(&mut io::stdout()).context("flush the confirmation prompt")?;
+    Ok(())
+}
+
+/// Show the prompt on standard error to confirm a destructive action (`verb`,
+/// e.g. `revoke`) and return whether the operator agreed. The prompt goes to
+/// standard error so a piped standard output never swallows it, and is only
+/// built (it may ask the gateway for a name) once a terminal is known to be
+/// there. Refuses instead of hanging when standard input is not a terminal,
+/// since the prompt could never be answered in that case.
+async fn confirm_action(
+    verb: &str,
+    id: &str,
+    prompt: impl std::future::Future<Output = String>,
+) -> Result<bool> {
+    refuse_without_terminal(verb, id, false)?;
+    eprint!("{} [y/N] ", prompt.await);
+    io::Write::flush(&mut io::stderr()).context("flush the confirmation prompt")?;
     let mut answer = String::new();
     io::stdin()
         .read_line(&mut answer)
@@ -10374,6 +11236,76 @@ fn answer_is_yes(answer: &str) -> bool {
             .to_ascii_lowercase()
             .as_str(),
         "y" | "yes"
+    )
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// Checks a new token's request body before it is sent. A token with no scopes
+/// holds the creator's whole role on the whole appliance, so that has to be
+/// asked for with `--full-role`. A body with no expiry gets one
+/// [`DEFAULT_TOKEN_LIFETIME_DAYS`] days after `now`, which is returned so the
+/// caller can say so.
+fn require_scopes_and_expiry(
+    body: &mut Value,
+    full_role: bool,
+    now: u64,
+) -> Result<Option<String>> {
+    let has_scopes = body
+        .get("scopes")
+        .and_then(Value::as_array)
+        .is_some_and(|scopes| !scopes.is_empty());
+    if !has_scopes && !full_role {
+        bail!(
+            "a token with no scopes would hold your whole role, so name what it may do with --scope (see `fabric \
+             agent-gateway tokens scopes`), or pass --full-role if that is what you want"
+        );
+    }
+    let object = body
+        .as_object_mut()
+        .context("the token request must be a JSON object")?;
+    // A missing, null or empty expiry all mean "not chosen", so the default
+    // applies; a far-future date is the way to ask for a long-lived token.
+    if object
+        .get("expires_at")
+        .is_some_and(|expires_at| !expires_at.is_null() && expires_at.as_str() != Some(""))
+    {
+        return Ok(None);
+    }
+    let expires_at = rfc3339_utc(now + DEFAULT_TOKEN_LIFETIME_DAYS * 86_400);
+    object.insert("expires_at".to_owned(), json!(expires_at));
+    Ok(Some(expires_at))
+}
+
+/// `seconds` since the Unix epoch as an RFC 3339 UTC timestamp.
+fn rfc3339_utc(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let remainder = seconds % 86_400;
+    // Civil date from a day count (Howard Hinnant's algorithm).
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        remainder / 3_600,
+        remainder % 3_600 / 60,
+        remainder % 60
     )
 }
 
@@ -10475,7 +11407,7 @@ fn access_token_row(token: &Value) -> [String; 6] {
         })
         .filter(|scopes| !scopes.is_empty())
         .map(|scopes| table_cell(&summarize_scopes(&scopes)))
-        .unwrap_or_else(|| "-".to_owned());
+        .unwrap_or_else(|| FULL_ROLE_SCOPES.to_owned());
     let created = table_cell(&field("created_at"));
     let expires = match field("expires_at").as_str() {
         "-" => "never".to_owned(),
@@ -10483,6 +11415,10 @@ fn access_token_row(token: &Value) -> [String; 6] {
     };
     [name, id, status, scopes, created, expires]
 }
+
+/// SCOPES cell of a token with no scope list, which holds its creator's whole
+/// role.
+const FULL_ROLE_SCOPES: &str = "full role";
 
 /// Maximum width of the SCOPES table cell. A token can carry many long
 /// scope names, and since column widths are padded to the widest cell in
@@ -10617,6 +11553,73 @@ async fn remove_feature(
     send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
 }
 
+/// Longest transit point alias the gateway accepts. This and the character
+/// rule in [`new_transit_point`] mirror `TransitPoint::validate_alias` in the
+/// gateway's `src/config/agent_surface.rs`, so change them together.
+const MAX_TRANSIT_ALIAS_LEN: usize = 63;
+
+/// The alias or id `remove-transit-point` looks up, without surrounding
+/// spaces, refusing a blank one.
+fn transit_point_to_remove(args: &RemoveTransitPointArgs) -> Result<&str> {
+    let named = args.transit_point.trim();
+    if named.is_empty() {
+        bail!("give the alias or id of the transit point to remove");
+    }
+    Ok(named)
+}
+
+/// The transit point `add-transit-point` sends, after refusing a blank alias,
+/// a blank endpoint, or an alias the gateway would not accept.
+fn new_transit_point(args: &AddTransitPointArgs) -> Result<Value> {
+    let alias = args.alias.trim();
+    let endpoint = args.endpoint.trim();
+    if alias.is_empty() {
+        bail!("give a transit point alias with --alias");
+    }
+    if endpoint.is_empty() {
+        bail!("give the transit point's endpoint with --endpoint");
+    }
+    let well_formed = alias.starts_with(|c: char| c.is_ascii_lowercase())
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !well_formed {
+        bail!(
+            "the alias '{alias}' is not allowed: start with a lowercase letter and use only lowercase letters, digits and '-'"
+        );
+    }
+    if alias.len() > MAX_TRANSIT_ALIAS_LEN {
+        bail!("the alias '{alias}' is too long: use at most {MAX_TRANSIT_ALIAS_LEN} characters");
+    }
+    Ok(json!({"alias": alias, "target_endpoint": endpoint}))
+}
+
+async fn add_transit_point(
+    client: &GatewayClient,
+    args: AddTransitPointArgs,
+    output: Output,
+) -> Result<Option<Value>> {
+    let point = new_transit_point(&args)?;
+    let path = entity_path("/v1/surfaces", &args.surface_id);
+    let surface = fetch_surface(client, &path).await?;
+    surface_patch::require_new_transit_alias(&surface.value, args.alias.trim())?;
+    let patch = surface_patch::build_patch(&[], &[], &[format!("transit.points={point}")], &[], &surface.value)?;
+    send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
+}
+
+async fn remove_transit_point(
+    client: &GatewayClient,
+    args: RemoveTransitPointArgs,
+    output: Output,
+) -> Result<Option<Value>> {
+    let named = transit_point_to_remove(&args)?;
+    let path = entity_path("/v1/surfaces", &args.surface_id);
+    let surface = fetch_surface(client, &path).await?;
+    surface_patch::require_transit_point(&surface.value, named)?;
+    let patch = surface_patch::build_patch(&[], &[], &[], &[format!("transit.points={named}")], &surface.value)?;
+    send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
+}
+
 /// Response header the gateway puts on `GET /v1/surfaces/{id}` when its PATCH
 /// honours `?dry_run=true`, since a gateway without dry run ignores the query
 /// parameter and saves. The gateway declares its own copy in
@@ -10702,6 +11705,16 @@ async fn resolve_surface_command(
         SurfaceCommand::RemoveFeature(mut args) => {
             args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
             SurfaceCommand::RemoveFeature(args)
+        }
+        SurfaceCommand::AddTransitPoint(mut args) => {
+            new_transit_point(&args)?;
+            args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
+            SurfaceCommand::AddTransitPoint(args)
+        }
+        SurfaceCommand::RemoveTransitPoint(mut args) => {
+            transit_point_to_remove(&args)?;
+            args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
+            SurfaceCommand::RemoveTransitPoint(args)
         }
         SurfaceCommand::ToolGatePreview(mut args) => {
             if let Some(reference) = args.surface_id.take() {
@@ -12368,7 +13381,21 @@ async fn scrape_metrics(
     if !status.is_success() {
         return Err(gateway_error(status, &body, &client.secrets(auth)));
     }
-    write_response_body(&args.output_file, &body)
+    write_response_body(&args.output_file, &scrape_output(&args.output_file, &body))
+}
+
+/// The bytes a scrape writes. Metric names and labels come from the gateway, so
+/// what goes to standard output (the terminal) is stripped of control
+/// characters like any other server text; a file gets the body as sent.
+fn scrape_output(
+    path: &Path,
+    body: &[u8],
+) -> Vec<u8> {
+    if path == Path::new("-") {
+        sanitize_multiline(&String::from_utf8_lossy(body)).into_bytes()
+    } else {
+        body.to_vec()
+    }
 }
 
 async fn test_metrics_endpoint(
@@ -12403,7 +13430,7 @@ async fn run_logs(
     match command {
         LogsCommand::Download { output_file } => {
             let (status, body) = client
-                .request_bytes(Method::GET, "/v1/logs/download", RawAuth::Bearer)
+                .download_bytes("/v1/logs/download")
                 .await?;
             if !status.is_success() {
                 return Err(gateway_error(status, &body, &client.secrets(RawAuth::Bearer)));
@@ -14187,6 +15214,12 @@ fn update_confirmation(command: &Command) -> Option<String> {
         }
         | Command::Surfaces {
             command: SurfaceCommand::RemoveFeature(FeaturePlacementArgs { surface_id, .. }),
+        }
+        | Command::Surfaces {
+            command: SurfaceCommand::AddTransitPoint(AddTransitPointArgs { surface_id, .. }),
+        }
+        | Command::Surfaces {
+            command: SurfaceCommand::RemoveTransitPoint(RemoveTransitPointArgs { surface_id, .. }),
         } => ("surface", surface_id),
         _ => return None,
     };
@@ -14292,7 +15325,7 @@ mod tests {
             .set_token("local", "agpat_valid")
             .unwrap();
 
-        let info = whoami_info(&config, &credentials, None, None, false, None)
+        let info = whoami_info(&config, &credentials, None, None, HostFlags::default(), None)
             .await
             .expect("whoami_info should succeed");
 
@@ -14308,7 +15341,7 @@ mod tests {
             .set_token("local", "agpat_invalid")
             .unwrap();
 
-        let info = whoami_info(&config, &credentials, None, None, false, None)
+        let info = whoami_info(&config, &credentials, None, None, HostFlags::default(), None)
             .await
             .expect("whoami_info should succeed");
 
@@ -14325,7 +15358,7 @@ mod tests {
             .set_token("local", "session-token")
             .unwrap();
 
-        let info = whoami_info(&config, &credentials, None, None, false, None)
+        let info = whoami_info(&config, &credentials, None, None, HostFlags::default(), None)
             .await
             .expect("whoami_info should succeed");
 
@@ -14341,7 +15374,7 @@ mod tests {
             .set_token("local", "session-token")
             .unwrap();
 
-        let info = whoami_info(&config, &credentials, None, None, false, None)
+        let info = whoami_info(&config, &credentials, None, None, HostFlags::default(), None)
             .await
             .expect("whoami_info should succeed");
 
@@ -14417,6 +15450,1077 @@ mod tests {
             token: Some(token.to_owned()),
             pat: None,
         }
+    }
+
+    /// Serves one canned response per connection, in order, and records every
+    /// request it receives. Returns its base URL and the recorded requests.
+    async fn recording_server(responses: Vec<&'static str>) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener
+            .local_addr()
+            .expect("local addr");
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let read = socket
+                    .read(&mut buf)
+                    .await
+                    .unwrap_or(0);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let _ = socket
+                    .write_all(response.as_bytes())
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    /// A 200 answer carrying `body`, as the one canned response of a recording server.
+    fn ok_json(body: &str) -> &'static str {
+        Box::leak(
+            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                .into_boxed_str(),
+        )
+    }
+
+    const OK_EMPTY: &str = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const OK_EMPTY_LIST: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n[]";
+
+    fn gateway_args(args: &[&str]) -> AgentGatewayArgs {
+        Cli::try_parse_from(
+            ["fabric", "agent-gateway"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .expect("arguments should parse")
+        .into_agent_gateway()
+    }
+
+    fn credentials_bound_to(
+        connection: &str,
+        token: &str,
+        host: &str,
+    ) -> MemoryCredentials {
+        let credentials = MemoryCredentials::default();
+        credentials
+            .set_token(connection, token)
+            .unwrap();
+        credentials
+            .set_bound_host(connection, host)
+            .unwrap();
+        credentials
+    }
+
+    #[test]
+    fn the_saved_token_goes_to_the_host_it_was_saved_for() {
+        let saved = Connection::new("https://gateway.example.com".into());
+        let credentials = credentials_bound_to("prod", "agpat_x", "https://gateway.example.com");
+        check_token_host(&credentials, "prod", &saved, "https://gateway.example.com", false).unwrap();
+        check_token_host(&credentials, "prod", &saved, "https://GATEWAY.example.com:443/", false).unwrap();
+    }
+
+    #[test]
+    fn the_saved_token_is_not_sent_to_another_host() {
+        let saved = Connection::new("https://gateway.example.com".into());
+        let credentials = credentials_bound_to("prod", "agpat_x", "https://gateway.example.com");
+        let error = check_token_host(&credentials, "prod", &saved, "https://evil.example.net", false)
+            .expect_err("another host must be refused");
+        let message = error.to_string();
+        assert!(message.contains("belongs to https://gateway.example.com"), "{message}");
+        assert!(message.contains("not sent to https://evil.example.net"), "{message}");
+        assert!(message.contains("--allow-host-override"), "{message}");
+        assert!(!message.contains("agpat_x"), "{message}");
+    }
+
+    #[test]
+    fn the_saved_token_goes_to_another_host_when_asked_to() {
+        let saved = Connection::new("https://gateway.example.com".into());
+        let credentials = credentials_bound_to("prod", "agpat_x", "https://gateway.example.com");
+        check_token_host(&credentials, "prod", &saved, "https://other.example.net", true).unwrap();
+    }
+
+    #[test]
+    fn a_connection_saved_before_hosts_were_bound_uses_its_configured_host() {
+        let saved = Connection::new("https://gateway.example.com".into());
+        let credentials = MemoryCredentials::default();
+        credentials
+            .set_token("prod", "agpat_x")
+            .unwrap();
+        check_token_host(&credentials, "prod", &saved, "https://gateway.example.com", false).unwrap();
+        check_token_host(&credentials, "prod", &saved, "https://evil.example.net", false)
+            .expect_err("an unbound token must still stay with its configured host");
+    }
+
+    #[test]
+    fn an_edited_configuration_host_does_not_move_a_bound_token() {
+        let edited = Connection::new("https://evil.example.net".into());
+        let credentials = credentials_bound_to("prod", "agpat_x", "https://gateway.example.com");
+        check_token_host(&credentials, "prod", &edited, "https://evil.example.net", false)
+            .expect_err("the host the token was issued for wins over the configuration file");
+    }
+
+    #[tokio::test]
+    async fn a_command_with_another_host_sends_nothing_without_the_opt_in() {
+        let (other, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+        let config = config_with_connection("prod", "https://gateway.example.com");
+        let credentials = credentials_bound_to("prod", "agpat_secret", "https://gateway.example.com");
+
+        let error =
+            dispatch_with(gateway_args(&["--host", &other, "--allow-http", "surfaces", "list"]), config, &credentials)
+                .await
+                .expect_err("the saved token must not go to another host");
+
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to https://gateway.example.com"),
+            "{error}"
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_with_another_host_sends_the_saved_token_with_the_opt_in() {
+        let (other, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+        let config = config_with_connection("prod", "https://gateway.example.com");
+        let credentials = credentials_bound_to("prod", "agpat_secret", "https://gateway.example.com");
+
+        dispatch_with(
+            gateway_args(&["--host", &other, "--allow-http", "--allow-host-override", "surfaces", "list"]),
+            config,
+            &credentials,
+        )
+        .await
+        .expect("the opt-in lets the token go");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer agpat_secret"),
+            "{}",
+            requests[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_token_goes_to_an_explicit_host() {
+        let (other, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+        let config = config_with_connection("prod", "https://gateway.example.com");
+        let credentials = credentials_bound_to("prod", "agpat_saved", "https://gateway.example.com");
+
+        dispatch_with(
+            gateway_args(&["--host", &other, "--allow-http", "--token", "agpat_typed", "surfaces", "list"]),
+            config,
+            &credentials,
+        )
+        .await
+        .expect("a token the user typed for this command is theirs to send");
+
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer agpat_typed"),
+            "{}",
+            requests[0]
+        );
+        assert!(!requests[0].contains("agpat_saved"));
+    }
+
+    #[tokio::test]
+    async fn whoami_does_not_send_the_saved_token_to_another_host() {
+        let (other, requests) = recording_server(vec![OK_EMPTY]).await;
+        let config = config_with_connection("prod", "https://gateway.example.com");
+        let credentials = credentials_bound_to("prod", "agpat_secret", "https://gateway.example.com");
+        let flags = HostFlags {
+            allow_http: true,
+            allow_host_override: false,
+        };
+
+        whoami_info(&config, &credentials, None, Some(&other), flags, None)
+            .await
+            .expect_err("whoami must not leak the saved token");
+
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn login_binds_the_token_to_the_host() {
+        let host = one_shot_server("HTTP/1.1 200 OK", r#"{"authenticated": true}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        let credentials = MemoryCredentials::default();
+
+        login_and_save(&mut config, &credentials, "production", login_args_with_token(&host, "new"), false, &path)
+            .await
+            .expect("login should succeed");
+
+        assert_eq!(
+            credentials
+                .get_bound_host("production")
+                .unwrap()
+                .as_deref(),
+            Some(host.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_save_restores_the_previous_bound_host() {
+        let host = one_shot_server("HTTP/1.1 200 OK", r#"{"authenticated": true}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_connection("production", &host);
+        let credentials = credentials_bound_to("production", "old", "https://old.example.com");
+
+        login_and_save(&mut config, &credentials, "production", login_args_with_token(&host, "new"), false, dir.path())
+            .await
+            .expect_err("saving over a directory must fail");
+
+        assert_eq!(
+            credentials
+                .get_bound_host("production")
+                .unwrap()
+                .as_deref(),
+            Some("https://old.example.com")
+        );
+        assert_eq!(
+            credentials
+                .get_token("production")
+                .unwrap()
+                .as_deref(),
+            Some("old")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_save_removes_a_bound_host_that_was_not_there_before() {
+        let host = one_shot_server("HTTP/1.1 200 OK", r#"{"authenticated": true}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        let credentials = MemoryCredentials::default();
+
+        login_and_save(&mut config, &credentials, "production", login_args_with_token(&host, "new"), false, dir.path())
+            .await
+            .expect_err("saving over a directory must fail");
+
+        assert_eq!(
+            credentials
+                .get_bound_host("production")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_login_is_refused_when_the_host_answers_404() {
+        let host = one_shot_server("HTTP/1.1 404 Not Found", "").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        let credentials = MemoryCredentials::default();
+        let mut args = login_args_with_token(&host, "unused");
+        args.token = None;
+        args.pat = Some("agpat_valid".to_owned());
+
+        let error = login_and_save(&mut config, &credentials, "production", args, false, &path)
+            .await
+            .expect_err("a 404 must not count as a valid token");
+
+        assert!(format!("{error:#}").contains("gateway answered 404"), "{error:#}");
+        assert!(!path.exists());
+        assert_eq!(
+            credentials
+                .get_token("production")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_ends_a_session_on_the_gateway() {
+        let (host, requests) = recording_server(vec![OK_EMPTY]).await;
+        let credentials = credentials_bound_to("prod", "session-token", &host);
+        let connection = Connection::new(host.clone());
+
+        let note = end_remote_credential(&credentials, "prod", &connection, PatChoice::Keep)
+            .await
+            .expect("a note");
+
+        assert_eq!(note, format!("note: ended the session on {host}"));
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].starts_with("POST /api/auth/logout HTTP/1.1"), "{}", requests[0]);
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer session-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_sends_the_session_token_only_to_its_bound_host() {
+        let (other, requests) = recording_server(vec![OK_EMPTY]).await;
+        let (bound, bound_requests) = recording_server(vec![OK_EMPTY]).await;
+        let credentials = credentials_bound_to("prod", "session-token", &bound);
+        let edited = Connection::new(other);
+
+        end_remote_credential(&credentials, "prod", &edited, PatChoice::Keep).await;
+
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            bound_requests
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_still_removes_the_local_copy_when_the_gateway_is_unreachable() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = config_with_connection("prod", &host);
+        let credentials = credentials_bound_to("prod", "session-token", &host);
+
+        let note = end_remote_credential(&credentials, "prod", &config.connections["prod"].clone(), PatChoice::Keep)
+            .await
+            .expect("a note");
+        remove_connection(&mut config, &credentials, "prod", &path).expect("local removal");
+
+        assert!(note.starts_with(&format!("warning: could not reach {host} to end the session")), "{note}");
+        assert!(note.contains("stays valid there until it expires"), "{note}");
+        assert!(!note.contains("session-token"), "{note}");
+        assert_eq!(
+            credentials
+                .get_token("prod")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            credentials
+                .get_bound_host("prod")
+                .unwrap(),
+            None
+        );
+        assert!(config.connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn logout_reports_a_gateway_that_refuses_to_end_the_session() {
+        let host = one_shot_server("HTTP/1.1 500 Internal Server Error", "storage down").await;
+        let credentials = credentials_bound_to("prod", "session-token", &host);
+
+        let note = end_remote_credential(&credentials, "prod", &Connection::new(host.clone()), PatChoice::Keep)
+            .await
+            .expect("a note");
+
+        assert_eq!(
+            note,
+            format!(
+                "warning: {host} would not end the session (storage down), so it stays valid there until it expires"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_of_a_personal_access_token_says_how_to_revoke_it() {
+        let (host, requests) = recording_server(vec![ok_json(r#"{"user_id":"u","token_id":"tok-9"}"#)]).await;
+        let credentials = credentials_bound_to("prod", "agpat_secret", &host);
+        let connection = Connection::new(host.clone());
+
+        let note = end_remote_credential(&credentials, "prod", &connection, PatChoice::Keep)
+            .await
+            .expect("a note");
+
+        assert!(note.contains(&format!("still valid on {host}")), "{note}");
+        assert!(note.ends_with("fabric agent-gateway tokens revoke tok-9"), "{note}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/v1/token-info"), "{}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn logout_with_the_revoke_flag_revokes_the_personal_access_token_while_it_is_held() {
+        let (host, requests) = recording_server(vec![ok_json(r#"{"user_id":"u","token_id":"tok-9"}"#), OK_EMPTY]).await;
+        let credentials = credentials_bound_to("prod", "agpat_secret", &host);
+
+        let note = end_remote_credential(&credentials, "prod", &Connection::new(host.clone()), PatChoice::Revoke)
+            .await
+            .expect("a note");
+
+        assert_eq!(note, format!("note: revoked this personal access token on {host}"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("DELETE /api/v1/access-tokens/tok-9 HTTP/1.1"), "{}", requests[1]);
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer agpat_secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_treats_an_empty_token_id_as_no_id_and_sends_no_revoke() {
+        for body in [r#"{"user_id":"u","token_id":""}"#, r#"{"user_id":"u","token_id":"  "}"#] {
+            let (host, requests) = recording_server(vec![ok_json(body)]).await;
+            let credentials = credentials_bound_to("prod", "agpat_secret", &host);
+
+            let note = end_remote_credential(&credentials, "prod", &Connection::new(host.clone()), PatChoice::Revoke)
+                .await
+                .expect("a note");
+
+            assert!(note.contains("tokens revoke <token-id>"), "{note}");
+            assert_eq!(requests.lock().unwrap().len(), 1, "{body}");
+        }
+    }
+
+    #[test]
+    fn the_logout_prompt_names_the_token_and_the_host() {
+        assert_eq!(
+            revoke_pat_prompt("https://gateway.example", "tok-9"),
+            "Also revoke personal access token tok-9 on https://gateway.example?"
+        );
+    }
+
+    #[test]
+    fn the_saved_http_warning_is_shown_once_per_host() {
+        assert!(first_http_warning_for("http://first-warning-host.example"));
+        assert!(!first_http_warning_for("http://first-warning-host.example"));
+        assert!(first_http_warning_for("http://second-warning-host.example"));
+    }
+
+    #[test]
+    fn the_saved_http_warning_treats_spellings_of_one_host_as_one() {
+        assert!(first_http_warning_for("http://Spelling-Host.example:80/"));
+        assert!(!first_http_warning_for("http://spelling-host.example"));
+        assert!(!first_http_warning_for("HTTP://SPELLING-HOST.EXAMPLE:80"));
+    }
+
+    #[test]
+    fn the_saved_http_warning_ignores_login_name_and_path() {
+        assert!(first_http_warning_for("http://user:pw@userinfo-host.example/api/v1"));
+        assert!(!first_http_warning_for("http://userinfo-host.example"));
+        assert!(!first_http_warning_for("http://other@USERINFO-HOST.example:80/x/"));
+    }
+
+    #[test]
+    fn the_saved_http_warning_keeps_other_ports_and_ipv6_literals_apart() {
+        assert!(first_http_warning_for("http://port-host.example:8080/"));
+        assert!(!first_http_warning_for("http://user@port-host.example:8080/path"));
+        assert!(first_http_warning_for("http://port-host.example"));
+        assert!(first_http_warning_for("http://[2001:db8::7]:80/a"));
+        assert!(!first_http_warning_for("http://u@[2001:DB8::7]"));
+        assert!(first_http_warning_for("https://tls-port-host.example:443/"));
+        assert!(!first_http_warning_for("https://tls-port-host.example"));
+    }
+
+    #[test]
+    fn the_hash_name_warning_is_shown_once_per_name() {
+        let mut config = Config::default();
+        config
+            .connections
+            .insert("once#name".into(), Connection::new("https://gateway.example".into()));
+
+        assert_eq!(new_hash_name_warnings(&config).len(), 1);
+        assert!(new_hash_name_warnings(&config).is_empty());
+
+        config
+            .connections
+            .insert("twice#name".into(), Connection::new("https://gateway.example".into()));
+        let later = new_hash_name_warnings(&config);
+        assert_eq!(later.len(), 1);
+        assert!(later[0].contains("twice#name"), "{later:?}");
+    }
+
+    struct UnwritableCredentials(MemoryCredentials);
+
+    impl CredentialStore for UnwritableCredentials {
+        fn get_token(
+            &self,
+            connection: &str,
+        ) -> Result<Option<String>> {
+            self.0.get_token(connection)
+        }
+
+        fn set_token(
+            &self,
+            _connection: &str,
+            _token: &str,
+        ) -> Result<()> {
+            bail!("store is read-only")
+        }
+
+        fn delete_token(
+            &self,
+            connection: &str,
+        ) -> Result<()> {
+            self.0
+                .delete_token(connection)
+        }
+    }
+
+    #[test]
+    fn an_unwritable_store_still_lets_an_unrecorded_token_go_to_its_config_host() {
+        let memory = MemoryCredentials::default();
+        memory
+            .set_token("unwritable-conn", "agpat_x")
+            .unwrap();
+        let credentials = UnwritableCredentials(memory);
+        let saved = Connection::new("https://gateway.example.com".into());
+
+        for _ in 0..3 {
+            check_token_host(&credentials, "unwritable-conn", &saved, "https://gateway.example.com", false).unwrap();
+        }
+
+        assert!(
+            !first_warning_for("bound-host:unwritable-conn".into()),
+            "the first failed write should have used up the warning for this connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_without_the_revoke_flag_keeps_the_token_valid_and_sends_no_revoke() {
+        let (host, requests) = recording_server(vec![ok_json(r#"{"user_id":"u","token_id":"tok-9"}"#)]).await;
+        let credentials = credentials_bound_to("prod", "agpat_secret", &host);
+
+        let note = end_remote_credential(&credentials, "prod", &Connection::new(host.clone()), PatChoice::Keep)
+            .await
+            .expect("a note");
+
+        assert!(note.contains("still valid"), "{note}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("DELETE"))
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_reports_a_revoke_the_gateway_refuses_and_still_gives_the_hint() {
+        let (host, _) = recording_server(vec![
+            ok_json(r#"{"user_id":"u","token_id":"tok-9"}"#),
+            "HTTP/1.1 403 Forbidden\r\ncontent-length: 6\r\nconnection: close\r\n\r\ndenied",
+        ])
+        .await;
+        let credentials = credentials_bound_to("prod", "agpat_secret", &host);
+
+        let note = end_remote_credential(&credentials, "prod", &Connection::new(host.clone()), PatChoice::Revoke)
+            .await
+            .expect("a note");
+
+        assert!(note.starts_with(&format!("warning: could not revoke this personal access token on {host}")), "{note}");
+        assert!(note.contains("denied"), "{note}");
+        assert!(note.contains("still valid"), "{note}");
+        assert!(!note.contains("agpat_secret"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn the_revoke_flag_does_not_change_how_a_browser_session_ends() {
+        let (host, requests) = recording_server(vec![OK_EMPTY]).await;
+        let credentials = credentials_bound_to("prod", "session-token", &host);
+
+        let note = end_remote_credential(&credentials, "prod", &Connection::new(host.clone()), PatChoice::Revoke)
+            .await
+            .expect("a note");
+
+        assert_eq!(note, format!("note: ended the session on {host}"));
+        assert!(requests.lock().unwrap()[0].starts_with("POST /api/auth/logout"));
+    }
+
+    #[test]
+    fn logout_takes_an_explicit_revoke_token_flag() {
+        let Command::Logout(args) = gateway_args(&["logout", "--revoke-token"]).command else {
+            panic!("expected logout");
+        };
+        assert!(args.revoke_token);
+        let Command::Logout(args) = gateway_args(&["logout"]).command else {
+            panic!("expected logout");
+        };
+        assert!(!args.revoke_token);
+    }
+
+    #[test]
+    fn a_personal_access_token_note_without_an_id_points_at_the_list() {
+        let note = pat_still_valid_note("https://gateway.example.com", None);
+        assert!(note.contains("still valid on https://gateway.example.com"), "{note}");
+        assert!(note.contains("`fabric agent-gateway tokens list`"), "{note}");
+        assert!(note.ends_with("fabric agent-gateway tokens revoke <token-id>"), "{note}");
+    }
+
+    #[test]
+    fn removing_a_connection_that_does_not_exist_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        let error = remove_connection(&mut config, &MemoryCredentials::default(), "ghost", &dir.path().join("c.toml"))
+            .expect_err("unknown connection");
+        assert!(
+            error
+                .to_string()
+                .contains("does not exist"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_token_needs_scopes_or_full_role() {
+        let mut body = json!({"name": "ci", "scopes": []});
+        let error = require_scopes_and_expiry(&mut body, false, 0).expect_err("no scopes, no full role");
+        let message = error.to_string();
+        assert!(message.contains("--scope"), "{message}");
+        assert!(message.contains("--full-role"), "{message}");
+        assert!(require_scopes_and_expiry(&mut json!({"name": "ci"}), false, 0).is_err());
+        assert!(require_scopes_and_expiry(&mut json!({"name": "ci", "scopes": []}), true, 0).is_ok());
+        assert!(require_scopes_and_expiry(&mut json!({"name": "ci", "scopes": ["surfaces.view"]}), false, 0).is_ok());
+    }
+
+    #[test]
+    fn an_empty_expiry_gets_the_default_like_a_missing_one() {
+        let mut body = json!({"name": "ci", "scopes": ["surfaces.view"], "expires_at": ""});
+        assert!(
+            require_scopes_and_expiry(&mut body, false, 1_700_000_000)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(body["expires_at"], json!("2024-02-12T22:13:20Z"));
+
+        let mut chosen = json!({"name": "ci", "scopes": ["surfaces.view"], "expires_at": "2030-01-01T00:00:00Z"});
+        assert_eq!(require_scopes_and_expiry(&mut chosen, false, 1_700_000_000).unwrap(), None);
+        assert_eq!(chosen["expires_at"], json!("2030-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn a_token_without_an_expiry_gets_one_ninety_days_out() {
+        let mut body = json!({"name": "ci", "scopes": ["surfaces.view"]});
+        let note = require_scopes_and_expiry(&mut body, false, 1_700_000_000).unwrap();
+        assert_eq!(note.as_deref(), Some("2024-02-12T22:13:20Z"));
+        assert_eq!(body["expires_at"], json!("2024-02-12T22:13:20Z"));
+
+        let mut null_expiry = json!({"name": "ci", "scopes": ["surfaces.view"], "expires_at": null});
+        assert!(
+            require_scopes_and_expiry(&mut null_expiry, false, 1_700_000_000)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(null_expiry["expires_at"], json!("2024-02-12T22:13:20Z"));
+    }
+
+    #[test]
+    fn a_token_keeps_the_expiry_it_was_given() {
+        let mut body = json!({"name": "ci", "scopes": ["surfaces.view"], "expires_at": "2027-01-01T00:00:00Z"});
+        assert_eq!(require_scopes_and_expiry(&mut body, false, 1_700_000_000).unwrap(), None);
+        assert_eq!(body["expires_at"], json!("2027-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn a_token_request_that_is_not_an_object_is_refused() {
+        assert!(require_scopes_and_expiry(&mut json!(["x"]), true, 0).is_err());
+    }
+
+    #[test]
+    fn rfc3339_formats_known_moments() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(rfc3339_utc(4_102_444_799), "2099-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn full_role_cannot_be_combined_with_scopes() {
+        let error = Cli::try_parse_from([
+            "fabric",
+            "agent-gateway",
+            "tokens",
+            "create",
+            "--name",
+            "ci",
+            "--scope",
+            "surfaces.view",
+            "--full-role",
+        ])
+        .expect_err("--full-role conflicts with --scope");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let cli = Cli::try_parse_from(["fabric", "agent-gateway", "tokens", "create", "--name", "ci", "--full-role"])
+            .expect("--full-role alone parses");
+        let Command::AccessTokens {
+            command: AccessTokenCommand::Create(args),
+        } = cli
+            .into_agent_gateway()
+            .command
+        else {
+            panic!("expected tokens create");
+        };
+        assert!(args.full_role);
+    }
+
+    #[tokio::test]
+    async fn token_create_without_scopes_sends_nothing() {
+        let (host, requests) = recording_server(vec![OK_EMPTY]).await;
+        let client = GatewayClient::new(&host, "agpat_valid").unwrap();
+        let args = AccessTokenCreateArgs {
+            scopes: vec![],
+            ..minimal_access_token_args()
+        };
+
+        run_access_tokens(&client, AccessTokenCommand::Create(args), Output::Json)
+            .await
+            .expect_err("no scopes and no --full-role must be refused");
+
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn token_create_sends_the_default_expiry() {
+        let (host, requests) = recording_server(vec![ok_json("{}")]).await;
+        let client = GatewayClient::new(&host, "agpat_valid").unwrap();
+
+        run_access_tokens(&client, AccessTokenCommand::Create(minimal_access_token_args()), Output::Json)
+            .await
+            .expect("create");
+
+        let requests = requests.lock().unwrap();
+        let body: Value = serde_json::from_str(
+            requests[0]
+                .split("\r\n\r\n")
+                .nth(1)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["scopes"], json!(["surfaces.view"]));
+        assert!(
+            body["expires_at"]
+                .as_str()
+                .is_some_and(|expiry| expiry.ends_with('Z')),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn the_token_list_shows_a_full_role_token_as_such() {
+        for token in [
+            json!({"name": "a", "id": "1", "scopes": []}),
+            json!({"name": "a", "id": "1", "scopes": null}),
+            json!({"name": "a", "id": "1"}),
+        ] {
+            assert_eq!(access_token_row(&token)[3], "full role", "{token}");
+        }
+        assert_eq!(access_token_row(&json!({"name": "a", "id": "1", "scopes": ["surfaces.view"]}))[3], "surfaces.view");
+    }
+
+    #[test]
+    fn inline_secrets_are_warned_about_and_other_sources_are_not() {
+        let words = |line: &str| {
+            line.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        for (line, flag) in [
+            ("fabric agent-gateway --token abc surfaces list", "--token"),
+            ("fabric agent-gateway --token=abc surfaces list", "--token"),
+            ("fabric agent-gateway login --token abc", "--token"),
+            ("fabric agent-gateway login --pat agpat_x", "--pat"),
+            ("fabric agent-gateway login --pat=agpat_x", "--pat"),
+            ("fabric agent-gateway secrets create --value hunter2", "--value"),
+            ("fabric agent-gateway metrics scrape --username u --password pw", "--password"),
+        ] {
+            let warnings = inline_secret_warnings(&words(line));
+            assert_eq!(warnings.len(), 1, "{line}: {warnings:?}");
+            assert!(warnings[0].starts_with(&format!("warning: {flag} on the command line")), "{warnings:?}");
+            assert!(!warnings[0].contains("abc") && !warnings[0].contains("hunter2"), "{warnings:?}");
+        }
+        for line in [
+            "fabric agent-gateway login --pat",
+            "fabric agent-gateway login --pat --token-stdin",
+            "fabric agent-gateway login --token-stdin",
+            "fabric agent-gateway secrets create --value-stdin",
+            "fabric agent-gateway tokens create --name ci --scope surfaces.view",
+            "fabric agent-gateway surfaces list",
+        ] {
+            assert!(inline_secret_warnings(&words(line)).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_whoami_table_strips_control_characters_from_every_value() {
+        let info = json!({
+            "connection": "prod",
+            "host": "https://gateway.example.com",
+            "username": "eve\u{1b}[2Jmallory",
+            "email": "a@b.c\r\u{202e}evil",
+            "scopes": ["ok", "x\u{7}y"],
+            "error": "bad\u{1b}]0;title\u{7}",
+        });
+        let lines = info_table_lines(&info);
+        assert!(lines.contains(&"username: eve[2Jmallory".to_owned()), "{lines:?}");
+        assert!(lines.contains(&"email: a@b.cevil".to_owned()), "{lines:?}");
+        assert!(lines.contains(&"scopes: ok, xy".to_owned()), "{lines:?}");
+        assert!(lines.contains(&"error: bad]0;title".to_owned()), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| !line
+                .chars()
+                .any(|c| c.is_control())),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_newline_in_a_value_cannot_forge_a_whoami_line() {
+        let info = json!({"username": "bob\nrole: Administrator", "scopes": ["a\tb"]});
+        let lines = info_table_lines(&info);
+        assert_eq!(lines, vec!["username: bob role: Administrator".to_owned(), "scopes: a b".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_newline_in_a_name_stays_on_one_line_of_the_confirmation() {
+        let (host, _) = recording_server(vec![ok_json(r#"{"name":"ci\nDelete 'prod' (x)"}"#)]).await;
+        let client = GatewayClient::new(&host, "agpat_valid").unwrap();
+
+        let target = describe_target(&client, "/v1/access-tokens/tok-1", "tok\n1").await;
+
+        assert_eq!(target, format!("'ci Delete 'prod' (x)' (tok 1) on {host}"));
+    }
+
+    #[test]
+    fn the_secret_hint_only_names_token_stdin_on_login() {
+        let words = |line: &str| {
+            line.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let other = inline_secret_warnings(&words("fabric agent-gateway --token abc surfaces list"));
+        assert!(other[0].ends_with("use the FABRIC_TOKEN environment variable instead"), "{other:?}");
+        let login = inline_secret_warnings(&words("fabric agent-gateway login --token abc"));
+        assert!(login[0].contains("--token-stdin"), "{login:?}");
+    }
+
+    #[test]
+    fn words_after_the_end_of_options_are_not_read_as_secret_flags() {
+        let words = "fabric agent-gateway api get -- --token abc"
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(inline_secret_warnings(&words).is_empty());
+    }
+
+    #[test]
+    fn a_connection_name_with_a_hash_is_refused_at_login() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        let credentials = MemoryCredentials::default();
+        let error = runtime
+            .block_on(login_and_save(
+                &mut config,
+                &credentials,
+                "prod#bound-host",
+                login_args_with_token("http://127.0.0.1:1", "t"),
+                true,
+                &dir.path().join("config.toml"),
+            ))
+            .expect_err("a hash would collide with the bound-host key");
+        assert!(
+            error
+                .to_string()
+                .contains("must not contain '#'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_token_saved_before_hosts_were_bound_is_bound_on_first_use() {
+        let saved = Connection::new("https://gateway.example.com".into());
+        let credentials = MemoryCredentials::default();
+        credentials
+            .set_token("prod", "agpat_x")
+            .unwrap();
+
+        check_token_host(&credentials, "prod", &saved, "https://gateway.example.com", false).unwrap();
+        assert_eq!(
+            credentials
+                .get_bound_host("prod")
+                .unwrap()
+                .as_deref(),
+            Some("https://gateway.example.com")
+        );
+
+        let edited = Connection::new("https://evil.example.net".into());
+        check_token_host(&credentials, "prod", &edited, "https://evil.example.net", false)
+            .expect_err("the recorded host now wins over an edited configuration");
+    }
+
+    #[test]
+    fn an_override_does_not_bind_a_token_that_has_no_recorded_host() {
+        let saved = Connection::new("https://gateway.example.com".into());
+        let credentials = MemoryCredentials::default();
+        credentials
+            .set_token("prod", "agpat_x")
+            .unwrap();
+
+        check_token_host(&credentials, "prod", &saved, "https://other.example.net", true).unwrap();
+
+        assert_eq!(
+            credentials
+                .get_bound_host("prod")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_scrape_to_the_terminal_is_stripped_of_control_characters_but_a_file_is_not() {
+        let body = b"metric{label=\"a\x1b[2Jb\"} 1\n";
+        assert_eq!(scrape_output(Path::new("-"), body), b"metric{label=\"a[2Jb\"} 1\n");
+        assert_eq!(scrape_output(Path::new("out.txt"), body), body);
+    }
+
+    #[tokio::test]
+    async fn the_confirmation_names_the_target_with_its_id_and_host() {
+        let (host, requests) = recording_server(vec![ok_json(r#"{"name":"ci\u001b[2Jrunner"}"#)]).await;
+        let client = GatewayClient::new(&host, "agpat_valid").unwrap();
+
+        let target = describe_target(&client, "/v1/access-tokens/tok-1", "tok-1").await;
+
+        assert_eq!(target, format!("'ci[2Jrunner' (tok-1) on {host}"));
+        assert!(requests.lock().unwrap()[0].starts_with("GET /api/v1/access-tokens/tok-1"));
+    }
+
+    #[tokio::test]
+    async fn the_confirmation_still_names_id_and_host_when_the_name_cannot_be_read() {
+        let host = one_shot_server("HTTP/1.1 404 Not Found", "").await;
+        let client = GatewayClient::new(&host, "agpat_valid").unwrap();
+
+        let target = describe_target(&client, "/v1/access-tokens/tok-1", "tok-1").await;
+
+        assert_eq!(target, format!("tok-1 on {host}"));
+    }
+
+    #[tokio::test]
+    async fn api_key_delete_with_yes_deletes_without_asking() {
+        let (host, requests) = recording_server(vec![OK_EMPTY]).await;
+        let client = GatewayClient::new(&host, "agpat_valid").unwrap();
+        let command = ApiKeyCommand::Delete {
+            key_id: "atgk_1".into(),
+            surface: ApiKeySurfaceArgs {
+                agent_id: Some("surface-1".into()),
+            },
+            yes: true,
+        };
+
+        run_api_keys(&client, command, Output::Json)
+            .await
+            .expect("delete");
+
+        assert!(requests.lock().unwrap()[0].starts_with("DELETE /api/v1/api-keys/surface-1/atgk_1 HTTP/1.1"));
+    }
+
+    #[test]
+    fn api_key_delete_accepts_yes() {
+        for flag in ["--yes", "-y"] {
+            let args = gateway_args(&["api-keys", "delete", "atgk_1", flag]);
+            assert!(matches!(
+                args.command,
+                Command::ApiKeys {
+                    command: ApiKeyCommand::Delete { yes: true, .. }
+                }
+            ));
+        }
+        let args = gateway_args(&["api-keys", "delete", "atgk_1"]);
+        assert!(matches!(
+            args.command,
+            Command::ApiKeys {
+                command: ApiKeyCommand::Delete { yes: false, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn the_shell_carries_the_host_override_opt_in() {
+        let cli = Cli::try_parse_from(["fabric", "agent-gateway", "--allow-host-override", "shell"]).unwrap();
+        assert!(
+            cli.interactive_prefix()
+                .contains(&"--allow-host-override".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_host_override_has_no_environment_variable() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let gateway = command
+            .find_subcommand("agent-gateway")
+            .expect("agent-gateway");
+        let flag = gateway
+            .get_arguments()
+            .find(|argument| argument.get_id() == "allow_host_override")
+            .expect("the override flag");
+        assert_eq!(flag.get_env(), None);
+        assert!(
+            !gateway
+                .clone()
+                .render_long_help()
+                .to_string()
+                .contains("FABRIC_ALLOW_HOST_OVERRIDE")
+        );
+    }
+
+    #[test]
+    fn a_typed_host_and_token_get_no_environment_note() {
+        use clap::CommandFactory;
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "fabric",
+                "agent-gateway",
+                "--host",
+                "https://typed.example.com",
+                "--token",
+                "typed",
+                "surfaces",
+                "list",
+            ])
+            .unwrap();
+        assert_eq!(env_token_and_host_note(&matches), None);
     }
 
     #[tokio::test]
@@ -14894,6 +16998,7 @@ mod tests {
             name: Some("ci-runner".into()),
             description: "Used by CI".into(),
             scopes: vec!["surfaces.view".into()],
+            full_role: false,
             expires_at: None,
             resource_pattern: None,
             required_headers: vec![],
@@ -15325,6 +17430,29 @@ mod tests {
             parsed(&["fabric", "agent-gateway", "surfaces", "remove-feature", "s-1", "policy", "--dry-run"]),
             Command::Surfaces {
                 command: SurfaceCommand::RemoveFeature(FeaturePlacementArgs { dry_run: true, .. })
+            }
+        ));
+        assert!(matches!(
+            parsed(&[
+                "fabric",
+                "agent-gateway",
+                "surfaces",
+                "add-transit-point",
+                "s-1",
+                "--alias",
+                "billing",
+                "--endpoint",
+                "http://b:1",
+                "--dry-run"
+            ]),
+            Command::Surfaces {
+                command: SurfaceCommand::AddTransitPoint(AddTransitPointArgs { dry_run: true, .. })
+            }
+        ));
+        assert!(matches!(
+            parsed(&["fabric", "agent-gateway", "surfaces", "remove-transit-point", "s-1", "billing", "--dry-run"]),
+            Command::Surfaces {
+                command: SurfaceCommand::RemoveTransitPoint(RemoveTransitPointArgs { dry_run: true, .. })
             }
         ));
         assert!(matches!(

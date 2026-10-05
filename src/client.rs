@@ -1,10 +1,10 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use reqwest::header::{CONTENT_TYPE, HeaderMap};
-use reqwest::{Method, RequestBuilder, StatusCode};
+use reqwest::{Method, RequestBuilder, StatusCode, redirect};
 use serde_json::Value;
 
 /// Stand-in printed for a credential or a credential-bearing field.
@@ -13,11 +13,32 @@ pub(crate) const REDACTED: &str = "[redacted]";
 /// Content type `PATCH /v1/surfaces/{id}` requires; it answers 415 to any other.
 const MERGE_PATCH_CONTENT_TYPE: &str = "application/merge-patch+json";
 
+/// How long to wait for the gateway to accept a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a request may go without receiving any data, including the wait
+/// for the first byte. It is not a limit on the whole request, so a large
+/// download that keeps arriving, such as the log archive, is never cut off,
+/// while a gateway that stops answering still ends the call. The archive is
+/// built in memory by the gateway before it is sent, hence the generous value.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a whole request may take, from sending it to the last byte of its
+/// answer, for every call except the log archive download. It stops a gateway
+/// that sends one byte at a time from holding the CLI forever, which the
+/// inactivity timeout alone does not.
+pub(crate) const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Most redirects one request follows, and only to the same scheme, host and
+/// port, so the token never goes anywhere the user did not point the CLI at.
+const MAX_REDIRECTS: usize = 5;
+
 #[derive(Clone)]
 pub struct GatewayClient {
     host: String,
     token: String,
     http: reqwest::Client,
+    total_timeout: Duration,
 }
 
 impl GatewayClient {
@@ -28,11 +49,14 @@ impl GatewayClient {
         Ok(Self {
             host: host.into(),
             token: token.into(),
-            http: reqwest::Client::builder()
-                .user_agent(concat!("fabric-cli/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .context("build HTTP client")?,
+            http: build_http_client()?,
+            total_timeout: TOTAL_TIMEOUT,
         })
+    }
+
+    /// The gateway address every request of this client goes to.
+    pub fn host(&self) -> &str {
+        &self.host
     }
 
     pub async fn check_auth(&self) -> Result<()> {
@@ -49,26 +73,39 @@ impl GatewayClient {
         Ok(())
     }
 
-    /// Validate a personal access token by calling a protected route that
-    /// the session-based `/auth/check` route does not cover (`/auth/check`
-    /// only consults the browser/session store and is exempt from the
-    /// session-auth middleware that resolves PAT bearer tokens). Any
-    /// response other than 401 means the gateway accepted the token; a
-    /// role/RBAC rejection (e.g. 403) still proves the token itself is
-    /// valid, since RBAC only runs after authentication succeeds.
+    /// Validate a personal access token by calling `/v1/token-info`, which
+    /// answers any caller holding a token the gateway accepts, whatever role
+    /// or scopes it has, and which the session-based `/auth/check` route does
+    /// not cover (it only consults the browser/session store). Only a 200
+    /// counts: a 404 from a server that is not the gateway, a redirect or a
+    /// server error must not be taken for an accepted token.
     pub async fn check_pat_auth(&self) -> Result<()> {
-        let url = self.url("/v1/access-tokens")?;
+        let url = self.url("/v1/token-info")?;
         let response = self
             .http
             .get(&url)
+            .timeout(self.total_timeout)
             .bearer_auth(&self.token)
             .send()
             .await
             .with_context(|| format!("request {url}"))?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            bail!("gateway did not accept the bearer token");
+        match response.status() {
+            StatusCode::OK => Ok(()),
+            StatusCode::UNAUTHORIZED => bail!("gateway did not accept the bearer token"),
+            status => bail!(
+                "gateway answered {status} when checking the token; make sure --host is a gateway address and the \
+                 gateway is healthy"
+            ),
         }
-        Ok(())
+    }
+
+    /// End the session behind a session token on the gateway, so a copy of it
+    /// stops working. A personal access token has no session, so this is for
+    /// session logins only.
+    pub async fn end_session(&self) -> Result<()> {
+        self.request(Method::POST, "/auth/logout", None)
+            .await
+            .map(|_| ())
     }
 
     pub async fn request(
@@ -81,6 +118,7 @@ impl GatewayClient {
         let mut request = self
             .http
             .request(method, &url)
+            .timeout(self.total_timeout)
             .bearer_auth(&self.token);
         if let Some(body) = body {
             request = request.json(&body);
@@ -99,6 +137,7 @@ impl GatewayClient {
         let request = self
             .http
             .get(&url)
+            .timeout(self.total_timeout)
             .bearer_auth(&self.token);
         self.send_json_with_headers(request, &url)
             .await
@@ -118,6 +157,7 @@ impl GatewayClient {
         let request = self
             .http
             .request(Method::PATCH, &url)
+            .timeout(self.total_timeout)
             .bearer_auth(&self.token)
             .header(CONTENT_TYPE, MERGE_PATCH_CONTENT_TYPE)
             .body(body);
@@ -185,10 +225,35 @@ impl GatewayClient {
         path: &str,
         auth: RawAuth<'_>,
     ) -> Result<(StatusCode, Vec<u8>)> {
+        self.send_bytes(method, path, auth, Some(self.total_timeout))
+            .await
+    }
+
+    /// [`Self::request_bytes`] for the log archive, which the gateway builds
+    /// in memory before sending and which can be large, so only the
+    /// inactivity timeout applies and not the limit on the whole request.
+    pub async fn download_bytes(
+        &self,
+        path: &str,
+    ) -> Result<(StatusCode, Vec<u8>)> {
+        self.send_bytes(Method::GET, path, RawAuth::Bearer, None)
+            .await
+    }
+
+    async fn send_bytes(
+        &self,
+        method: Method,
+        path: &str,
+        auth: RawAuth<'_>,
+        total_timeout: Option<Duration>,
+    ) -> Result<(StatusCode, Vec<u8>)> {
         let url = self.url(path)?;
-        let request = self
+        let mut request = self
             .http
             .request(method, &url);
+        if let Some(limit) = total_timeout {
+            request = request.timeout(limit);
+        }
         let request = match auth {
             RawAuth::Bearer => request.bearer_auth(&self.token),
             RawAuth::Basic { username, password } => request.basic_auth(username, Some(password)),
@@ -232,8 +297,11 @@ impl GatewayClient {
         &self,
         path: &str,
     ) -> Result<String> {
-        if !path.starts_with('/') || path.contains("..") {
-            bail!("API path must start with '/' and must not contain '..'");
+        if !path.starts_with('/') || has_unsafe_segments(path) {
+            bail!(
+                "API path must start with '/' and must not contain '..', a '.' segment, a backslash, a control character or an \
+                 encoded slash"
+            );
         }
         if path.starts_with("/api/") {
             Ok(format!("{}{}", self.host, path))
@@ -241,6 +309,112 @@ impl GatewayClient {
             Ok(format!("{}/api{}", self.host, path))
         }
     }
+}
+
+/// The HTTP client every call to the gateway uses: connect and request
+/// timeouts, and redirects only within the origin the request went to. Shared
+/// with the browser login so the code exchange gets the same limits.
+pub(crate) fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(concat!("fabric-cli/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .redirect(same_origin_redirects())
+        .build()
+        .context("build HTTP client")
+}
+
+/// Redirects are followed only within the origin the request went to, so a
+/// gateway that moves a route keeps working but the `Authorization` header is
+/// never sent to another host. Any other redirect is left unfollowed and the
+/// 3xx answer is reported as an error.
+fn same_origin_redirects() -> redirect::Policy {
+    redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| previous.origin() == attempt.url().origin());
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if same_origin {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// Percent-decoding rounds tried before a path is refused as hiding something.
+const MAX_DECODE_ROUNDS: usize = 5;
+
+/// Whether the path part of `path` (the query is not looked at) could reach
+/// outside the API once a server or proxy decodes it: a `..` anywhere, a `.`
+/// or empty-looking dot segment, a backslash, or a slash that arrives encoded
+/// (`%2f`). Percent-encoding is undone again and again, so `%2e%2e` and
+/// `%252e%252e` are caught like the plain form.
+fn has_unsafe_segments(path: &str) -> bool {
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    // The URL parser drops tab, newline and carriage return before it resolves
+    // dot segments, so `.<tab>.` would become `..` after this check.
+    if path
+        .chars()
+        .any(char::is_control)
+    {
+        return true;
+    }
+    let mut current = path.to_owned();
+    for _ in 0..MAX_DECODE_ROUNDS {
+        if current.contains("..")
+            || current.contains('\\')
+            || current
+                .split('/')
+                .any(|segment| segment == ".")
+        {
+            return true;
+        }
+        let decoded = percent_decode_once(&current);
+        if decoded == current {
+            return false;
+        }
+        if decoded.matches('/').count() != current.matches('/').count() {
+            return true;
+        }
+        current = decoded;
+    }
+    true
+}
+
+/// Undo one layer of `%XX` escapes, leaving anything that is not a valid
+/// escape as it is.
+fn percent_decode_once(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .filter(|pair| {
+                pair.iter()
+                    .all(u8::is_ascii_hexdigit)
+            })
+            .and_then(|pair| std::str::from_utf8(pair).ok())
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 /// A gateway response with a non-success status. It renders as the message
@@ -449,14 +623,15 @@ fn redact_json(
 }
 
 /// Strips control characters (ANSI escape codes, carriage-return overwrite
-/// tricks, etc.) and the Unicode bidirectional controls that reorder how text
+/// tricks, etc.), turns newlines, tabs and the Unicode line and paragraph separators (U+2028, U+2029) into spaces so a value cannot start a
+/// line of its own, and strips the Unicode bidirectional controls that reorder how text
 /// is displayed (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) from
 /// gateway-supplied text, such as an error body or a table cell, before it
 /// reaches the operator's terminal, and caps its length. The gateway is
 /// normally trusted, but this is the last line of defense if a misconfigured
 /// or compromised backend ever puts something unexpected in a response.
 pub(crate) fn sanitize_for_terminal(input: &str) -> String {
-    printable(input)
+    folded(input)
         .take(500)
         .collect()
 }
@@ -464,7 +639,25 @@ pub(crate) fn sanitize_for_terminal(input: &str) -> String {
 /// Like [`sanitize_for_terminal`] without the length cap, for an identifier
 /// the user typed that has to be shown whole.
 pub(crate) fn sanitize_whole(input: &str) -> String {
-    printable(input).collect()
+    folded(input).collect()
+}
+
+/// Like [`sanitize_whole`] but keeps newlines and tabs and drops U+2028 and
+/// U+2029, for a multi-line body such as a metrics scrape.
+pub(crate) fn sanitize_multiline(input: &str) -> String {
+    printable(input)
+        .filter(|c| !matches!(c, '\u{2028}' | '\u{2029}'))
+        .collect()
+}
+
+fn folded(input: &str) -> impl Iterator<Item = char> + '_ {
+    printable(input).map(|c| {
+        if matches!(c, '\n' | '\t' | '\u{2028}' | '\u{2029}') {
+            ' '
+        } else {
+            c
+        }
+    })
 }
 
 fn printable(input: &str) -> impl Iterator<Item = char> + '_ {
@@ -571,15 +764,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_pat_auth_accepts_rbac_forbidden_as_valid_token() {
-        // RBAC only runs after authentication succeeds, so a 403 still
-        // proves the gateway accepted the bearer token.
-        let host = one_shot_server("HTTP/1.1 403 Forbidden").await;
-        let client = GatewayClient::new(host, "agpat_valid_but_no_role").expect("client");
+    async fn check_pat_auth_asks_the_token_info_route() {
+        let (host, request) = capturing_server().await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
         client
             .check_pat_auth()
             .await
-            .expect("RBAC rejection should still count as an accepted token");
+            .expect("a 200 should be accepted");
+        let request = request
+            .await
+            .expect("request");
+        assert!(request.starts_with("GET /api/v1/token-info HTTP/1.1"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn check_pat_auth_rejects_every_status_but_200() {
+        for status_line in [
+            "HTTP/1.1 404 Not Found",
+            "HTTP/1.1 403 Forbidden",
+            "HTTP/1.1 204 No Content",
+            "HTTP/1.1 302 Found",
+            "HTTP/1.1 500 Internal Server Error",
+        ] {
+            let host = one_shot_server(status_line).await;
+            let client = GatewayClient::new(host, "agpat_valid").expect("client");
+            let error = client
+                .check_pat_auth()
+                .await
+                .expect_err(status_line);
+            assert!(
+                error
+                    .to_string()
+                    .contains("make sure --host is a gateway address"),
+                "{status_line}: {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -680,6 +899,128 @@ mod tests {
         // actually put on the wire.
         let encoded = &client.secrets(auth)[0];
         assert!(head.contains(&format!("Basic {encoded}")), "{encoded} is not in the request: {head}");
+    }
+
+    /// Serves a 200 answer one byte every 50 ms, so no single wait is long but
+    /// the whole answer takes a long time.
+    async fn dripping_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener
+            .local_addr()
+            .expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n";
+                    if socket
+                        .write_all(head.as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    for _ in 0..1000 {
+                        if socket
+                            .write_all(b" ")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_server_that_drips_bytes_is_cut_off_by_the_total_timeout() {
+        let mut client = GatewayClient::new(dripping_server().await, "agpat_valid").expect("client");
+        client.total_timeout = Duration::from_millis(400);
+
+        let started = std::time::Instant::now();
+        let result = client
+            .request(Method::GET, "/v1/limits", None)
+            .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    }
+
+    /// Accepts connections and never answers, so only a limit on the whole
+    /// request ends a call, not the 120 second inactivity limit.
+    async fn silent_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener
+            .local_addr()
+            .expect("local addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn silent_client() -> GatewayClient {
+        let mut client = GatewayClient::new(silent_server().await, "agpat_valid").expect("client");
+        client.total_timeout = Duration::from_millis(300);
+        client
+    }
+
+    /// The call must fail on its own total timeout, well before the test's
+    /// own wait of 5 seconds runs out.
+    async fn assert_cut_off<T>(call: impl std::future::Future<Output = Result<T>>) {
+        let outcome = tokio::time::timeout(Duration::from_secs(5), call).await;
+        match outcome {
+            Ok(result) => assert!(result.is_err(), "the call should have failed"),
+            Err(_) => panic!("the call was not cut off by the total timeout"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_total_timeout_reaches_check_pat_auth() {
+        let client = silent_client().await;
+        assert_cut_off(client.check_pat_auth()).await;
+    }
+
+    #[tokio::test]
+    async fn the_total_timeout_reaches_get_with_headers() {
+        let client = silent_client().await;
+        assert_cut_off(client.get_with_headers("/v1/limits")).await;
+    }
+
+    #[tokio::test]
+    async fn the_total_timeout_reaches_merge_patch() {
+        let client = silent_client().await;
+        assert_cut_off(client.merge_patch("/v1/surfaces/s1", serde_json::json!({"a": 1}))).await;
+    }
+
+    #[tokio::test]
+    async fn the_total_timeout_reaches_request_bytes() {
+        let client = silent_client().await;
+        assert_cut_off(client.request_bytes(Method::GET, "/v1/metrics/prometheus", RawAuth::Bearer)).await;
+    }
+
+    #[tokio::test]
+    async fn the_log_download_is_not_held_to_the_total_timeout() {
+        let mut client = GatewayClient::new(dripping_server().await, "agpat_valid").expect("client");
+        client.total_timeout = Duration::from_millis(100);
+
+        let started = std::time::Instant::now();
+        let slow = tokio::time::timeout(Duration::from_millis(600), client.download_bytes("/v1/logs/download")).await;
+
+        assert!(slow.is_err(), "the download should still be running, not cut off after the total timeout");
+        assert!(started.elapsed() >= Duration::from_millis(600));
     }
 
     #[tokio::test]
@@ -819,6 +1160,23 @@ mod tests {
 
         let text = "a\u{061C}b\u{200E}c\u{200F}d\u{202A}e\u{202E}f\u{2066}g\u{2069}h";
         assert_eq!(sanitize_for_terminal(text), "abcdefgh");
+    }
+
+    /// A newline or tab in a name would start a line of its own in whoami or a
+    /// confirmation prompt, so single-value text folds them into spaces.
+    #[test]
+    fn single_value_text_folds_newlines_and_tabs_into_spaces() {
+        assert_eq!(sanitize_for_terminal("bob\nrole: Administrator"), "bob role: Administrator");
+        assert_eq!(sanitize_for_terminal("a\tb\r\nc"), "a b c");
+        assert_eq!(sanitize_whole("x\ny\tz"), "x y z");
+        assert_eq!(sanitize_multiline("x\ny\tz\u{1b}"), "x\ny\tz");
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_are_folded_or_dropped() {
+        assert_eq!(sanitize_for_terminal("a\u{2028}b\u{2029}c"), "a b c");
+        assert_eq!(sanitize_whole("a\u{2028}b\u{2029}c"), "a b c");
+        assert_eq!(sanitize_multiline("a\u{2028}b\u{2029}c\nd"), "abc\nd");
     }
 
     /// A plain-text body made only of control characters says nothing, so it
@@ -1312,5 +1670,187 @@ mod tests {
 
         assert_eq!(error.to_string(), "Merged surface failed to deserialise: missing field `endpoint`");
         assert_eq!(response_status(&error), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn url_refuses_percent_encoded_dot_segments() {
+        let client = GatewayClient::new("https://gateway.example.com", "agpat_valid").expect("client");
+        for path in [
+            "/v1/../admin",
+            "/v1/%2e%2e/admin",
+            "/v1/%2E%2E/admin",
+            "/v1/%2e./admin",
+            "/v1/.%2E/admin",
+            "/v1/%252e%252e/admin",
+            "/v1/%25252e%25252e/admin",
+            "/v1/%2e/admin",
+            "/v1/./admin",
+            "/v1/%2E",
+        ] {
+            assert!(client.url(path).is_err(), "{path} should be refused");
+        }
+    }
+
+    /// The URL parser drops tab, newline and carriage return before it resolves
+    /// dot segments, so `.<tab>.` would turn into `..` behind the check.
+    #[test]
+    fn url_refuses_control_characters_hiding_a_dot_segment() {
+        let client = GatewayClient::new("https://gateway.example.com", "agpat_valid").expect("client");
+        for path in [
+            "/v1/.\t./admin",
+            "/v1/.\n./admin",
+            "/v1/.\r./admin",
+            "/v1/.\t/admin",
+            "/v1/%2e\n%2e/admin",
+            "/v1/a\u{1b}b",
+            "/v1/a\0b",
+            "/v1/a\u{7f}b",
+            "/v1/a\u{85}b",
+            "/v1/a\u{9b}b",
+            "/v1/\n",
+        ] {
+            assert!(client.url(path).is_err(), "{path:?} should be refused");
+        }
+        assert!(
+            client
+                .url("/v1/a?filter=x%0Ay")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn url_refuses_encoded_slashes_and_backslashes() {
+        let client = GatewayClient::new("https://gateway.example.com", "agpat_valid").expect("client");
+        for path in ["/v1/a%2fb", "/v1/a%2Fb", "/v1/a%252fb", "/v1/a\\b", "/v1/a%5cb", "/v1/a%5Cb", "/v1/a%255cb"] {
+            assert!(client.url(path).is_err(), "{path} should be refused");
+        }
+    }
+
+    #[test]
+    fn url_refuses_a_path_that_keeps_decoding() {
+        let client = GatewayClient::new("https://gateway.example.com", "agpat_valid").expect("client");
+        let path = format!("/v1/{}2e%{}2e", "%25".repeat(8), "25".repeat(8));
+        assert!(client.url(&path).is_err());
+    }
+
+    #[test]
+    fn url_keeps_ordinary_paths_and_encoded_query_dots() {
+        let client = GatewayClient::new("https://gateway.example.com", "agpat_valid").expect("client");
+        assert_eq!(
+            client
+                .url("/v1/secrets/a%20b.c?filter=a%2E%2Eb")
+                .unwrap(),
+            "https://gateway.example.com/api/v1/secrets/a%20b.c?filter=a%2E%2Eb"
+        );
+        assert_eq!(
+            client
+                .url("/api/v1/limits")
+                .unwrap(),
+            "https://gateway.example.com/api/v1/limits"
+        );
+        assert!(
+            client
+                .url("v1/limits")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn percent_decoding_leaves_bad_escapes_alone() {
+        assert_eq!(percent_decode_once("%2e%2E%zz%+f%4"), "..%zz%+f%4");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_host_is_not_followed_and_never_gets_the_token() {
+        let (other_host, other_request) = capturing_server().await;
+        let location: &'static str = Box::leak(format!("{other_host}/steal").into_boxed_str());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener
+            .local_addr()
+            .expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = socket
+                    .write_all(response.as_bytes())
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let client = GatewayClient::new(format!("http://{addr}"), "agpat_secret").expect("client");
+        let error = client
+            .request(Method::GET, "/v1/limits", None)
+            .await
+            .expect_err("a redirect to another host must fail");
+        assert_eq!(response_status(&error), Some(StatusCode::FOUND), "{error:#}");
+        let reached = tokio::time::timeout(Duration::from_millis(300), other_request).await;
+        assert!(reached.is_err(), "the other host must never be called");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_within_the_same_host_is_followed() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener
+            .local_addr()
+            .expect("local addr");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut sender = Some(sender);
+            for round in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let read = socket
+                    .read(&mut buf)
+                    .await
+                    .unwrap_or(0);
+                let response: &[u8] = if round == 0 {
+                    b"HTTP/1.1 302 Found\r\nlocation: /api/v1/moved\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    if let Some(sender) = sender.take() {
+                        let _ = sender.send(String::from_utf8_lossy(&buf[..read]).into_owned());
+                    }
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                };
+                let _ = socket
+                    .write_all(response)
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let client = GatewayClient::new(format!("http://{addr}"), "agpat_secret").expect("client");
+        client
+            .request(Method::GET, "/v1/limits", None)
+            .await
+            .expect("a same-host redirect should be followed");
+        let request = receiver
+            .await
+            .expect("second request");
+        assert!(request.starts_with("GET /api/v1/moved HTTP/1.1"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn end_session_posts_to_the_logout_route_with_the_token() {
+        let (host, request) = capturing_server().await;
+        let client = GatewayClient::new(host, "session-token").expect("client");
+        client
+            .end_session()
+            .await
+            .expect("logout");
+        let request = request
+            .await
+            .expect("request")
+            .to_ascii_lowercase();
+        assert!(request.starts_with("post /api/auth/logout http/1.1"), "{request}");
+        assert!(request.contains("authorization: bearer session-token"), "{request}");
     }
 }
