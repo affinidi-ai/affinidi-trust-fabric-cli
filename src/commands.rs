@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 
 use crate::{
     client::{
-        GatewayClient, id_from_response, response_status, sanitize_for_terminal, sanitize_multiline, sanitize_whole,
+        GatewayClient, id_from_response, pretty_json_for_terminal, response_status, sanitize_for_terminal,
+        sanitize_multiline, sanitize_whole,
     },
     config::{Config, Connection, normalize_host, normalize_user_host, saved_host_http_warning},
     credentials::{CredentialStore, OsCredentialStore},
@@ -1715,37 +1716,10 @@ async fn whoami(
 ) -> Result<()> {
     let info = whoami_info(config, credentials, connection, host_override, flags, token_override).await?;
     match output {
-        Output::Json => println!("{}", whoami_json(&info)?),
+        Output::Json => println!("{}", pretty_json_for_terminal(&info)?),
         Output::Table => print_info_table(&info),
     }
     Ok(())
-}
-
-/// The whoami answer as pretty JSON with every character a terminal can act on
-/// written as a `\uXXXX` escape: bidi controls, C1 controls, and U+2028 and
-/// U+2029 (serde_json already escapes the C0 controls). The text parses back
-/// to the same values.
-fn whoami_json(info: &Value) -> Result<String> {
-    let pretty = serde_json::to_string_pretty(info)?;
-    let mut escaped = String::with_capacity(pretty.len());
-    for c in pretty.chars() {
-        if matches!(
-            c,
-            '\u{80}'..='\u{9f}'
-                | '\u{61c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        ) {
-            escaped.push_str(&format!("\\u{:04x}", u32::from(c)));
-        } else {
-            escaped.push(c);
-        }
-    }
-    Ok(escaped)
 }
 
 /// Resolve the active connection, its host, and the identity behind the
@@ -1853,6 +1827,15 @@ async fn whoami_info(
     Ok(info)
 }
 
+/// The id of the token the gateway says is held, from its `/v1/token-info`
+/// answer. An id that is not text or is blank counts as none.
+fn held_token_id(token_info: &Value) -> Option<&str> {
+    token_info
+        .get("token_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// Add the held token's `scopes`, `token_id` and `token_name` to `fields`.
 /// A session/passkey login has none of them, so nothing is inserted. The name
 /// comes from the token's own record and is left out, without a warning, when
@@ -1873,11 +1856,7 @@ async fn insert_token_details(
             {
                 fields.insert("scopes".to_owned(), scopes.clone());
             }
-            if let Some(token_id) = token_info
-                .get("token_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-            {
+            if let Some(token_id) = held_token_id(&token_info) {
                 fields.insert("token_id".to_owned(), json!(token_id));
                 match client
                     .request(Method::GET, &entity_path("/v1/access-tokens", token_id), None)
@@ -2026,12 +2005,7 @@ async fn end_remote_credential(
             .request(Method::GET, "/v1/token-info", None)
             .await
             .ok()
-            .and_then(|info| {
-                info.get("token_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_owned)
-            });
+            .and_then(|info| held_token_id(&info).map(str::to_owned));
         let shown_id = id
             .as_deref()
             .map(sanitize_whole);
@@ -3634,16 +3608,29 @@ mod gateway_config_tests {
     }
 
     #[test]
-    fn a_created_surface_target_row_drops_credentials_query_and_fragment() {
+    fn a_created_surface_target_row_shows_only_scheme_host_and_port() {
         let target =
             |endpoint: &str| surface_lines(&json!({"surface_id": "s-1", "target": {"endpoint": endpoint}}))[2].clone();
 
-        assert_eq!(target("https://user:pass@host:8443/mcp?key=abc#frag"), "  target: https://host:8443/mcp");
-        assert_eq!(target("https://token@host/mcp#frag"), "  target: https://host/mcp");
+        assert_eq!(target("https://user:pass@host:8443/mcp?key=abc#frag"), "  target: https://host:8443");
+        assert_eq!(target("https://token@host/mcp#frag"), "  target: https://host");
+        assert_eq!(target("https://mcp.example.com/api/mcp/s/sekret/mcp"), "  target: https://mcp.example.com");
         assert_eq!(target("http://127.0.0.1:3000"), "  target: http://127.0.0.1:3000");
-        assert_eq!(target("http://host/"), "  target: http://host/");
-        assert_eq!(target("user:pass@host:8443/mcp?key=abc"), "  target: host:8443/mcp");
-        assert_eq!(target("not a url?key=abc"), "  target: not a url");
+        assert_eq!(target("http://host/"), "  target: http://host");
+    }
+
+    #[test]
+    fn a_created_surface_target_row_for_text_that_is_not_a_url_never_shows_a_password() {
+        let rows = |endpoint: &str| surface_lines(&json!({"surface_id": "s-1", "target": {"endpoint": endpoint}}));
+
+        assert_eq!(rows("http://u:a/b@host/x")[2], "  target: host/x");
+        assert_eq!(rows("user:pass@host:8443/mcp?key=abc")[2], "  target: host:8443/mcp");
+        assert_eq!(rows("host:8443/mcp")[2], "  target: host:8443/mcp");
+        assert_eq!(rows("not a url?key=abc")[2], "  target: not a url");
+        assert_eq!(rows("a@b@c")[2], "  target: c");
+        for endpoint in ["http://u:p#ss@host", "http://u:p?x=@y", "@", "user:pass@", "?key=abc", "#frag"] {
+            assert_eq!(rows(endpoint), ["Created surface 's-1'", "  id: s-1"], "{endpoint}");
+        }
     }
 
     #[test]
@@ -3789,6 +3776,16 @@ mod gateway_config_tests {
     }
 
     #[test]
+    fn held_token_id_gives_text_ids_only_and_none_for_blank_or_other_values() {
+        assert_eq!(held_token_id(&json!({"token_id": "t-1"})), Some("t-1"));
+        assert_eq!(held_token_id(&json!({"token_id": ""})), None);
+        assert_eq!(held_token_id(&json!({"token_id": " \t"})), None);
+        assert_eq!(held_token_id(&json!({"token_id": 7})), None);
+        assert_eq!(held_token_id(&json!({"token_id": null})), None);
+        assert_eq!(held_token_id(&json!({})), None);
+    }
+
+    #[test]
     fn the_whoami_json_escapes_terminal_unsafe_text_and_parses_back_to_the_same_values() {
         let info = json!({
             "username": "a\u{202e}b",
@@ -3797,7 +3794,7 @@ mod gateway_config_tests {
             "scopes": ["s"],
         });
 
-        let printed = whoami_json(&info).expect("json");
+        let printed = pretty_json_for_terminal(&info).expect("json");
 
         for unsafe_char in ['\u{202e}', '\u{9b}', '\u{2028}', '\u{2029}', '\u{61c}', '\u{200f}', '\u{2066}', '\u{1b}'] {
             assert!(!printed.contains(unsafe_char), "{unsafe_char:?} in {printed}");
@@ -3810,7 +3807,25 @@ mod gateway_config_tests {
     fn the_whoami_json_leaves_a_normal_answer_as_serde_prints_it() {
         let info = json!({"username": "admin", "token_name": "ci \u{e9}\u{4e2d}", "scopes": ["a", "b"]});
 
-        assert_eq!(whoami_json(&info).expect("json"), serde_json::to_string_pretty(&info).expect("json"));
+        assert_eq!(pretty_json_for_terminal(&info).expect("json"), serde_json::to_string_pretty(&info).expect("json"));
+    }
+
+    #[test]
+    fn a_surface_printed_as_json_escapes_terminal_unsafe_text_and_parses_back_to_the_same_value() {
+        let surface = json!({
+            "surface_id": "s-1",
+            "name": "a\u{202e}b\u{9b}c\u{7f}d\u{2028}e\u{2029}f",
+            "tags": ["\u{1b}[2J", "x\ny"],
+        });
+
+        let printed = pretty_json_for_terminal(&surface).expect("json");
+
+        for unsafe_char in ['\u{202e}', '\u{9b}', '\u{7f}', '\u{2028}', '\u{2029}', '\u{1b}'] {
+            assert!(!printed.contains(unsafe_char), "{unsafe_char:?} in {printed}");
+        }
+        assert!(printed.contains(r"a\u202eb\u009bc"), "{printed}");
+        assert!(printed.contains(r"c\u007fd"), "{printed}");
+        assert_eq!(serde_json::from_str::<Value>(&printed).expect("parses"), surface);
     }
 
     #[test]
@@ -4176,6 +4191,26 @@ mod gateway_config_tests {
             patch_body(&requests),
             json!({"transit": {"points": [{"alias": "billing", "target_endpoint": "http://billing:3000"}]}})
         );
+    }
+
+    const MCP_TRANSIT_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales","protocol":"mcp"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[{"alias":"gh","protocol":"http"}]}}"#;
+
+    #[tokio::test]
+    async fn add_transit_point_gives_the_new_point_the_protocol_of_the_surface() {
+        let requests = feature_dry_run(&ADD_BILLING, MCP_TRANSIT_SURFACE)
+            .await
+            .expect("a new alias should be added");
+        let body = patch_body(&requests);
+        assert_eq!(body["transit"]["points"][1]["alias"], "billing");
+        assert_eq!(body["transit"]["points"][1]["protocol"], "mcp");
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_keeps_the_protocol_a_point_already_on_the_surface_names() {
+        let requests = feature_dry_run(&ADD_BILLING, MCP_TRANSIT_SURFACE)
+            .await
+            .expect("a new alias should be added");
+        assert_eq!(patch_body(&requests)["transit"]["points"][0], json!({"alias": "gh", "protocol": "http"}));
     }
 
     /// Runs a surface command that saves, against a gateway that answers the
@@ -8862,8 +8897,8 @@ async fn run_surfaces(
 /// field the answer lacks is left out. An answer with no usable id has nothing
 /// to confirm, so this returns `None` and the caller prints the whole answer.
 /// A value that is empty, only whitespace or only control characters counts as
-/// missing. The target row shows the endpoint's scheme, host, port and path
-/// only, so credentials and query strings never reach a terminal or CI log.
+/// missing. The target row shows the endpoint's scheme, host and port only, so
+/// credentials, paths and query strings never reach a terminal or CI log.
 fn created_surface_lines(surface: &Value) -> Option<Vec<String>> {
     let text_at = |path: &[&str]| {
         path.iter()
@@ -8888,7 +8923,7 @@ fn created_surface_lines(surface: &Value) -> Option<Vec<String>> {
             "target",
             cleaned(
                 text_at(&["target", "endpoint"])
-                    .map(target_without_secrets)
+                    .and_then(target_without_secrets)
                     .as_deref(),
             ),
         ),
@@ -8900,10 +8935,12 @@ fn created_surface_lines(surface: &Value) -> Option<Vec<String>> {
     Some(lines)
 }
 
-/// An endpoint reduced to scheme, host, port and path. Text that is not a URL
-/// keeps its own text with any `user:pass@` part and anything after the first
-/// `?` or `#` removed.
-fn target_without_secrets(endpoint: &str) -> String {
+/// An endpoint reduced to `scheme://host[:port]`. Text that does not parse as
+/// a URL with a host keeps its own text after the last `@` that comes before
+/// the first `?` or `#`, cut at that `?` or `#`. When nothing sensible remains,
+/// or an `@` is still left anywhere (a password could hold a `?` or `#`), there
+/// is no target to show and this returns `None`.
+fn target_without_secrets(endpoint: &str) -> Option<String> {
     let endpoint = endpoint.trim();
     if let Ok(url) = url::Url::parse(endpoint)
         && let Some(host) = url.host_str()
@@ -8912,31 +8949,23 @@ fn target_without_secrets(endpoint: &str) -> String {
             .port()
             .map(|port| format!(":{port}"))
             .unwrap_or_default();
-        let before_query = endpoint
-            .split(['?', '#'])
-            .next()
-            .unwrap_or_default();
-        let path = if url.path() == "/" && !before_query.ends_with('/') {
-            ""
-        } else {
-            url.path()
-        };
-        return format!("{}://{host}{port}{path}", url.scheme());
+        return Some(format!("{}://{host}{port}", url.scheme()));
     }
-    let without_query = endpoint
+    let query_at = endpoint
+        .find(['?', '#'])
+        .unwrap_or(endpoint.len());
+    if endpoint[query_at..].contains('@') {
+        return None;
+    }
+    let after_userinfo = match endpoint[..query_at].rfind('@') {
+        Some(at) => &endpoint[at + 1..],
+        None => endpoint,
+    };
+    let kept = after_userinfo
         .split(['?', '#'])
         .next()
         .unwrap_or_default();
-    let authority_start = without_query
-        .find("://")
-        .map_or(0, |at| at + 3);
-    let authority_end = without_query[authority_start..]
-        .find('/')
-        .map_or(without_query.len(), |at| authority_start + at);
-    match without_query[authority_start..authority_end].rfind('@') {
-        Some(at) => format!("{}{}", &without_query[..authority_start], &without_query[authority_start + at + 1..]),
-        None => without_query.to_owned(),
-    }
+    (!kept.trim().is_empty() && !kept.contains('@')).then(|| kept.to_owned())
 }
 
 /// Where a surface keeps its MCP tool gating.
@@ -15010,7 +15039,7 @@ fn print_value(
     output: Output,
 ) -> Result<()> {
     match output {
-        Output::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        Output::Json => println!("{}", pretty_json_for_terminal(value)?),
         Output::Table => print_table(value),
     }
     Ok(())
