@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, ArgMatches, Args, Parser, Subcommand, ValueEnum, parser::ValueSource};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
@@ -67,8 +67,9 @@ struct AgentGatewayArgs {
 
     /// Send the saved token to a --host other than the one it was saved for.
     /// Without this the CLI refuses, so a mistyped or swapped host cannot
-    /// receive your token.
-    #[arg(long, global = true, env = "FABRIC_ALLOW_HOST_OVERRIDE")]
+    /// receive your token. Only the typed flag counts, never an environment
+    /// variable, so a project file cannot turn it on.
+    #[arg(long, global = true)]
     allow_host_override: bool,
 
     /// Output format for commands that return data.
@@ -1124,6 +1125,31 @@ pub fn inline_secret_warnings(args: &[String]) -> Vec<String> {
         index += 1;
     }
     warnings
+}
+
+/// A note for standard error when both the token and the host of this run came
+/// from environment variables, so a token set in a shell profile and a host set
+/// by a project's `.envrc` do not meet without a word. A token or host typed on
+/// the command line, or a host that comes from the saved connection, is the
+/// user's own choice and gets no note. `matches` is the parsed command line.
+pub fn env_token_and_host_note(matches: &ArgMatches) -> Option<String> {
+    let gateway = matches.subcommand_matches("agent-gateway")?;
+    let login = gateway.subcommand_matches("login");
+    let source = |id: &str| {
+        login
+            .and_then(|login| login.value_source(id))
+            .or_else(|| gateway.value_source(id))
+    };
+    if source("token") != Some(ValueSource::EnvVariable) || source("host") != Some(ValueSource::EnvVariable) {
+        return None;
+    }
+    let host = login
+        .and_then(|login| login.get_one::<String>("host"))
+        .or_else(|| gateway.get_one::<String>("host"))?;
+    Some(format!(
+        "note: sending the token from FABRIC_TOKEN to the host from FABRIC_HOST ({})",
+        sanitize_for_terminal(host)
+    ))
 }
 
 /// Runs a command that needs no saved connection, token or gateway, before
@@ -15684,6 +15710,45 @@ mod tests {
             cli.interactive_prefix()
                 .contains(&"--allow-host-override".to_owned())
         );
+    }
+
+    #[test]
+    fn the_host_override_has_no_environment_variable() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let gateway = command
+            .find_subcommand("agent-gateway")
+            .expect("agent-gateway");
+        let flag = gateway
+            .get_arguments()
+            .find(|argument| argument.get_id() == "allow_host_override")
+            .expect("the override flag");
+        assert_eq!(flag.get_env(), None);
+        assert!(
+            !gateway
+                .clone()
+                .render_long_help()
+                .to_string()
+                .contains("FABRIC_ALLOW_HOST_OVERRIDE")
+        );
+    }
+
+    #[test]
+    fn a_typed_host_and_token_get_no_environment_note() {
+        use clap::CommandFactory;
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "fabric",
+                "agent-gateway",
+                "--host",
+                "https://typed.example.com",
+                "--token",
+                "typed",
+                "surfaces",
+                "list",
+            ])
+            .unwrap();
+        assert_eq!(env_token_and_host_note(&matches), None);
     }
 
     #[tokio::test]
