@@ -105,9 +105,9 @@ impl GatewayClient {
     }
 
     /// Send `patch` as a JSON Merge Patch
-    /// (https://www.rfc-editor.org/rfc/rfc7396), which the gateway only
-    /// accepts with the `application/merge-patch+json` content type that
-    /// [`Self::request`] cannot set. The response is handled the same way.
+    /// (https://www.rfc-editor.org/rfc/rfc7396). The gateway's PATCH routes
+    /// (surfaces and variants) accept only the `application/merge-patch+json`
+    /// content type, which [`Self::request`] cannot set. The response is handled the same way.
     pub async fn merge_patch(
         &self,
         path: &str,
