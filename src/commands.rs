@@ -748,6 +748,15 @@ enum SurfaceCommand {
     /// Where the feature is found is worked out from its name, the same as
     /// for add-feature.
     RemoveFeature(FeaturePlacementArgs),
+    /// Add a transit point to an Agent Surface from its alias and endpoint.
+    ///
+    /// For example:
+    /// `surfaces add-transit-point $ID --alias billing --endpoint http://billing:3000`.
+    /// The point is appended to the surface's transit points, and an alias
+    /// the surface already uses is refused.
+    AddTransitPoint(AddTransitPointArgs),
+    /// Remove a transit point from an Agent Surface by its alias or id.
+    RemoveTransitPoint(RemoveTransitPointArgs),
     /// Show which tools a set of MCP tool gates would allow or deny, and which
     /// gate decided, before anything is saved.
     ///
@@ -900,6 +909,35 @@ struct AddFeatureArgs {
     /// Feature configuration from a JSON file ('-' for standard input).
     #[arg(short, long)]
     file: Option<PathBuf>,
+    /// Check the change with the gateway and show what it would change,
+    /// without saving anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct AddTransitPointArgs {
+    /// Surface ID or name (see `fabric agent-gateway surfaces list`).
+    surface_id: String,
+    /// Alias the new transit point is known by: a lowercase letter, then
+    /// lowercase letters, digits or `-`, at most 63 characters long.
+    #[arg(long)]
+    alias: String,
+    /// Endpoint the transit point sends requests to.
+    #[arg(long)]
+    endpoint: String,
+    /// Check the change with the gateway and show what it would change,
+    /// without saving anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct RemoveTransitPointArgs {
+    /// Surface ID or name (see `fabric agent-gateway surfaces list`).
+    surface_id: String,
+    /// Alias or id of the transit point to remove.
+    transit_point: String,
     /// Check the change with the gateway and show what it would change,
     /// without saving anything.
     #[arg(long)]
@@ -3676,6 +3714,288 @@ mod gateway_config_tests {
         let requests = full_requests(requests);
         assert_eq!(start_lines(&requests), [LIST_REQUEST, S1_REQUEST, "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]);
         assert_eq!(body_of(&requests[2]), own_pattern_patch());
+    }
+
+    const ADD_BILLING: [&str; 6] =
+        ["add-transit-point", "s-1", "--alias", "billing", "--endpoint", "http://billing:3000"];
+
+    #[tokio::test]
+    async fn add_transit_point_sends_the_whole_list_with_the_new_point_appended() {
+        let requests = feature_dry_run(&ADD_BILLING, TRANSIT_SURFACE)
+            .await
+            .expect("a new alias should be added");
+        assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [
+                {"alias": "gh"},
+                {"alias": "billing", "target_endpoint": "http://billing:3000"}
+            ]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_to_a_surface_without_a_transit_block_sends_a_one_point_list() {
+        let requests = feature_dry_run(&ADD_BILLING, STORED_SURFACE)
+            .await
+            .expect("the first point should be added");
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"alias": "billing", "target_endpoint": "http://billing:3000"}]}})
+        );
+    }
+
+    /// Runs a surface command that saves, against a gateway that answers the
+    /// read of the surface and then the patch, and returns the requests made.
+    async fn saving_command(
+        args: &[&str],
+        stored: &'static str,
+    ) -> Result<Vec<String>> {
+        let (host, requests) =
+            scripted_server(vec![(DRY_RUN_GATEWAY_OK, stored), ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1"}"#)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let mut argv = vec!["fabric", "agent-gateway", "surfaces"];
+        argv.extend_from_slice(args);
+        run_surfaces(&client, surface_command(&argv), Output::Json).await?;
+        Ok(full_requests(requests))
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_without_dry_run_saves_the_patch() {
+        let requests = saving_command(&ADD_BILLING, TRANSIT_SURFACE)
+            .await
+            .expect("a new alias should be saved");
+        assert_eq!(
+            start_lines(&requests),
+            ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]
+        );
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [
+                {"alias": "gh"},
+                {"alias": "billing", "target_endpoint": "http://billing:3000"}
+            ]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_refuses_an_alias_the_surface_already_has_before_sending() {
+        let (host, requests) = scripted_server(vec![(DRY_RUN_GATEWAY_OK, TRANSIT_SURFACE)]).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+        let command = surface_command(&[
+            "fabric",
+            "agent-gateway",
+            "surfaces",
+            "add-transit-point",
+            "s-1",
+            "--alias",
+            "gh",
+            "--endpoint",
+            "http://gh:3000",
+        ]);
+        let error = run_surfaces(&client, command, Output::Json)
+            .await
+            .expect_err("a duplicate alias should be refused");
+        assert_eq!(
+            error.to_string(),
+            "this surface already has a transit point with alias 'gh': run remove-transit-point on it first"
+        );
+        assert_eq!(request_lines(requests), ["GET /api/v1/surfaces/s-1 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_refuses_a_blank_or_badly_formed_alias_or_endpoint_before_any_request() {
+        let too_long = "a".repeat(MAX_TRANSIT_ALIAS_LEN + 1);
+        let too_long_flags = ["--alias", too_long.as_str(), "--endpoint", "http://a:1"];
+        let too_long_message = format!("the alias '{too_long}' is too long: use at most 63 characters");
+        let cases: [(&[&str], &str); 10] = [
+            (&["--alias", " ", "--endpoint", "http://a:1"], "give a transit point alias with --alias"),
+            (&["--alias", "a", "--endpoint", "  "], "give the transit point's endpoint with --endpoint"),
+            (&["--alias", "Billing", "--endpoint", "http://a:1"], "the alias 'Billing' is not allowed"),
+            (&["--alias", "1abc", "--endpoint", "http://a:1"], "the alias '1abc' is not allowed"),
+            (&["--alias", "a_b", "--endpoint", "http://a:1"], "the alias 'a_b' is not allowed"),
+            (&["--alias=-a", "--endpoint", "http://a:1"], "the alias '-a' is not allowed"),
+            (&["--alias", "caf\u{e9}", "--endpoint", "http://a:1"], "the alias 'caf\u{e9}' is not allowed"),
+            (&["--alias", "a.b", "--endpoint", "http://a:1"], "the alias 'a.b' is not allowed"),
+            (&["--alias", "a[0]", "--endpoint", "http://a:1"], "the alias 'a[0]' is not allowed"),
+            (&too_long_flags, too_long_message.as_str()),
+        ];
+        for (flags, expected) in cases {
+            let (host, requests) = scripted_server(vec![]).await;
+            let client = GatewayClient::new(host, "agpat_valid").expect("client");
+            let mut argv = vec!["fabric", "agent-gateway", "surfaces", "add-transit-point", "Sales"];
+            argv.extend_from_slice(flags);
+            let error = resolve_surface_command(&client, surface_command(&argv))
+                .await
+                .expect_err("the arguments should be refused before the surface is looked up")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            argv[4] = "s-1";
+            let error = run_surfaces(&client, surface_command(&argv), Output::Json)
+                .await
+                .expect_err("the arguments should be refused before the surface is read")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(full_requests(requests).is_empty(), "{flags:?} sent a request");
+        }
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_accepts_digits_and_dashes_after_the_first_letter() {
+        let requests = feature_dry_run(
+            &["add-transit-point", "s-1", "--alias", "bill-2", "--endpoint", " http://b:1 "],
+            TRANSIT_SURFACE,
+        )
+        .await
+        .expect("the alias is well formed");
+        assert_eq!(
+            patch_body(&requests)["transit"]["points"][1],
+            json!({"alias": "bill-2", "target_endpoint": "http://b:1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn add_transit_point_accepts_an_alias_of_63_characters() {
+        let alias = "a".repeat(MAX_TRANSIT_ALIAS_LEN);
+        let requests = feature_dry_run(
+            &["add-transit-point", "s-1", "--alias", alias.as_str(), "--endpoint", "http://b:1"],
+            TRANSIT_SURFACE,
+        )
+        .await
+        .expect("an alias at the limit is accepted");
+        assert_eq!(patch_body(&requests)["transit"]["points"][1]["alias"], json!(alias));
+    }
+
+    const TWO_POINT_SURFACE: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[{"id":"tp-1","alias":"billing","target_endpoint":"http://billing:3000"},{"id":"tp-2","alias":"gh","target_endpoint":"http://gh:3000"}]}}"#;
+
+    #[tokio::test]
+    async fn remove_transit_point_matches_by_alias_or_by_id() {
+        for name in ["billing", "tp-1"] {
+            let requests = feature_dry_run(&["remove-transit-point", "s-1", name], TWO_POINT_SURFACE)
+                .await
+                .expect("an existing point should be removed");
+            assert_eq!(start_lines(&requests), READ_AND_DRY_RUN);
+            assert_eq!(
+                patch_body(&requests),
+                json!({"transit": {"points": [{"id": "tp-2", "alias": "gh", "target_endpoint": "http://gh:3000"}]}}),
+                "removing by {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_without_dry_run_saves_the_patch() {
+        let requests = saving_command(&["remove-transit-point", "s-1", "billing"], TWO_POINT_SURFACE)
+            .await
+            .expect("an existing point should be removed");
+        assert_eq!(
+            start_lines(&requests),
+            ["GET /api/v1/surfaces/s-1 HTTP/1.1", "PATCH /api/v1/surfaces/s-1 HTTP/1.1"]
+        );
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"id": "tp-2", "alias": "gh", "target_endpoint": "http://gh:3000"}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_ignores_spaces_around_the_name() {
+        let requests = feature_dry_run(&["remove-transit-point", "s-1", " billing "], TWO_POINT_SURFACE)
+            .await
+            .expect("the name should be trimmed");
+        assert_eq!(
+            patch_body(&requests),
+            json!({"transit": {"points": [{"id": "tp-2", "alias": "gh", "target_endpoint": "http://gh:3000"}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_refuses_a_blank_name_before_any_request() {
+        for blank in ["", "  "] {
+            let (host, requests) = scripted_server(vec![]).await;
+            let client = GatewayClient::new(host, "agpat_valid").expect("client");
+            let argv = ["fabric", "agent-gateway", "surfaces", "remove-transit-point", "Sales", blank];
+            let error = resolve_surface_command(&client, surface_command(&argv))
+                .await
+                .expect_err("a blank name should be refused before the surface is looked up")
+                .to_string();
+            assert_eq!(error, "give the alias or id of the transit point to remove");
+            let argv = ["fabric", "agent-gateway", "surfaces", "remove-transit-point", "s-1", blank];
+            run_surfaces(&client, surface_command(&argv), Output::Json)
+                .await
+                .expect_err("a blank name should be refused before the surface is read");
+            assert!(full_requests(requests).is_empty(), "{blank:?} sent a request");
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_unknown_name_lists_the_points_that_exist() {
+        let error = feature_dry_run(&["remove-transit-point", "s-1", "nope"], TWO_POINT_SURFACE)
+            .await
+            .expect_err("an unknown point should be refused")
+            .to_string();
+        assert!(error.contains("no transit point 'nope'"), "{error}");
+        assert!(error.contains("billing, gh"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_on_a_surface_without_points_says_it_has_none() {
+        for stored in [
+            STORED_SURFACE,
+            r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[]}}"#,
+        ] {
+            let error = feature_dry_run(&["remove-transit-point", "s-1", "gh"], stored)
+                .await
+                .expect_err("there is nothing to remove")
+                .to_string();
+            assert!(error.contains("no transit point 'gh': it has no transit points yet"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_transit_point_with_an_alias_shared_by_two_points_asks_for_the_id() {
+        const SHARED_ALIAS: &str = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[{"id":"tp-1","alias":"gh"},{"id":"tp-2","alias":"gh"}]}}"#;
+        let error = feature_dry_run(&["remove-transit-point", "s-1", "gh"], SHARED_ALIAS)
+            .await
+            .expect_err("two points have this alias")
+            .to_string();
+        assert!(error.contains("more than one transit point has the alias 'gh': use its id"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_transit_point_commands_find_the_surface_by_name() {
+        let runs: [(&[&str], &'static str, &str); 2] = [
+            (
+                &["add-transit-point", "Sales", "--alias", "billing", "--endpoint", "http://billing:3000"],
+                TRANSIT_SURFACE,
+                "billing",
+            ),
+            (&["remove-transit-point", "Sales", "billing"], TWO_POINT_SURFACE, "tp-2"),
+        ];
+        for (args, stored, in_patch) in runs {
+            let (host, requests) = scripted_server(vec![
+                LIST_OK,
+                (DRY_RUN_GATEWAY_OK, stored),
+                ("HTTP/1.1 200 OK", r#"{"surface_id":"s-1"}"#),
+            ])
+            .await;
+            let client = GatewayClient::new(host, "agpat_valid").expect("client");
+            let mut argv = vec!["fabric", "agent-gateway", "surfaces"];
+            argv.extend_from_slice(args);
+            let command = resolve_surface_command(&client, surface_command(&argv))
+                .await
+                .expect("the surface should resolve");
+            run_surfaces(&client, command, Output::Json)
+                .await
+                .expect("the edit should be saved");
+            let requests = full_requests(requests);
+            assert_eq!(
+                start_lines(&requests),
+                [LIST_REQUEST, S1_REQUEST, "PATCH /api/v1/surfaces/s-1 HTTP/1.1"],
+                "{args:?}"
+            );
+            assert!(requests[2].contains(in_patch), "{args:?}: {}", requests[2]);
+        }
     }
 
     #[tokio::test]
@@ -8078,6 +8398,8 @@ async fn run_surfaces(
             .map(Some),
         SurfaceCommand::AddFeature(args) => add_feature(client, args, output).await,
         SurfaceCommand::RemoveFeature(args) => remove_feature(client, args, output).await,
+        SurfaceCommand::AddTransitPoint(args) => add_transit_point(client, args, output).await,
+        SurfaceCommand::RemoveTransitPoint(args) => remove_transit_point(client, args, output).await,
         SurfaceCommand::Features { surface_id: Some(surface_id) } => {
             show_surface_features(client, &surface_id, output, &mut io::stdout()).await?;
             Ok(None)
@@ -10304,6 +10626,11 @@ mod identity_access_tests {
             ),
             (vec!["identities", "update", "i-1", "-f", "x.json"], "Updated identity 'i-1'"),
             (vec!["surfaces", "update", "s-1", "-f", "x.json"], "Updated surface 's-1'"),
+            (
+                vec!["surfaces", "add-transit-point", "s-1", "--alias", "billing", "--endpoint", "http://b:1"],
+                "Updated surface 's-1'",
+            ),
+            (vec!["surfaces", "remove-transit-point", "s-1", "billing"], "Updated surface 's-1'"),
         ] {
             let mut full = vec!["fabric", "agent-gateway"];
             full.extend(&arguments);
@@ -10868,6 +11195,73 @@ async fn remove_feature(
     send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
 }
 
+/// Longest transit point alias the gateway accepts. This and the character
+/// rule in [`new_transit_point`] mirror `TransitPoint::validate_alias` in the
+/// gateway's `src/config/agent_surface.rs`, so change them together.
+const MAX_TRANSIT_ALIAS_LEN: usize = 63;
+
+/// The alias or id `remove-transit-point` looks up, without surrounding
+/// spaces, refusing a blank one.
+fn transit_point_to_remove(args: &RemoveTransitPointArgs) -> Result<&str> {
+    let named = args.transit_point.trim();
+    if named.is_empty() {
+        bail!("give the alias or id of the transit point to remove");
+    }
+    Ok(named)
+}
+
+/// The transit point `add-transit-point` sends, after refusing a blank alias,
+/// a blank endpoint, or an alias the gateway would not accept.
+fn new_transit_point(args: &AddTransitPointArgs) -> Result<Value> {
+    let alias = args.alias.trim();
+    let endpoint = args.endpoint.trim();
+    if alias.is_empty() {
+        bail!("give a transit point alias with --alias");
+    }
+    if endpoint.is_empty() {
+        bail!("give the transit point's endpoint with --endpoint");
+    }
+    let well_formed = alias.starts_with(|c: char| c.is_ascii_lowercase())
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !well_formed {
+        bail!(
+            "the alias '{alias}' is not allowed: start with a lowercase letter and use only lowercase letters, digits and '-'"
+        );
+    }
+    if alias.len() > MAX_TRANSIT_ALIAS_LEN {
+        bail!("the alias '{alias}' is too long: use at most {MAX_TRANSIT_ALIAS_LEN} characters");
+    }
+    Ok(json!({"alias": alias, "target_endpoint": endpoint}))
+}
+
+async fn add_transit_point(
+    client: &GatewayClient,
+    args: AddTransitPointArgs,
+    output: Output,
+) -> Result<Option<Value>> {
+    let point = new_transit_point(&args)?;
+    let path = entity_path("/v1/surfaces", &args.surface_id);
+    let surface = fetch_surface(client, &path).await?;
+    surface_patch::require_new_transit_alias(&surface.value, args.alias.trim())?;
+    let patch = surface_patch::build_patch(&[], &[], &[format!("transit.points={point}")], &[], &surface.value)?;
+    send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
+}
+
+async fn remove_transit_point(
+    client: &GatewayClient,
+    args: RemoveTransitPointArgs,
+    output: Output,
+) -> Result<Option<Value>> {
+    let named = transit_point_to_remove(&args)?;
+    let path = entity_path("/v1/surfaces", &args.surface_id);
+    let surface = fetch_surface(client, &path).await?;
+    surface_patch::require_transit_point(&surface.value, named)?;
+    let patch = surface_patch::build_patch(&[], &[], &[], &[format!("transit.points={named}")], &surface.value)?;
+    send_surface_patch(client, &path, &surface, patch, args.dry_run, output).await
+}
+
 /// Response header the gateway puts on `GET /v1/surfaces/{id}` when its PATCH
 /// honours `?dry_run=true`, since a gateway without dry run ignores the query
 /// parameter and saves. The gateway declares its own copy in
@@ -10953,6 +11347,16 @@ async fn resolve_surface_command(
         SurfaceCommand::RemoveFeature(mut args) => {
             args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
             SurfaceCommand::RemoveFeature(args)
+        }
+        SurfaceCommand::AddTransitPoint(mut args) => {
+            new_transit_point(&args)?;
+            args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
+            SurfaceCommand::AddTransitPoint(args)
+        }
+        SurfaceCommand::RemoveTransitPoint(mut args) => {
+            transit_point_to_remove(&args)?;
+            args.surface_id = resolve_surface_id(client, &args.surface_id).await?;
+            SurfaceCommand::RemoveTransitPoint(args)
         }
         SurfaceCommand::ToolGatePreview(mut args) => {
             if let Some(reference) = args.surface_id.take() {
@@ -14448,6 +14852,12 @@ fn update_confirmation(command: &Command) -> Option<String> {
         }
         | Command::Surfaces {
             command: SurfaceCommand::RemoveFeature(FeaturePlacementArgs { surface_id, .. }),
+        }
+        | Command::Surfaces {
+            command: SurfaceCommand::AddTransitPoint(AddTransitPointArgs { surface_id, .. }),
+        }
+        | Command::Surfaces {
+            command: SurfaceCommand::RemoveTransitPoint(RemoveTransitPointArgs { surface_id, .. }),
         } => ("surface", surface_id),
         _ => return None,
     };
@@ -16658,6 +17068,29 @@ mod tests {
             parsed(&["fabric", "agent-gateway", "surfaces", "remove-feature", "s-1", "policy", "--dry-run"]),
             Command::Surfaces {
                 command: SurfaceCommand::RemoveFeature(FeaturePlacementArgs { dry_run: true, .. })
+            }
+        ));
+        assert!(matches!(
+            parsed(&[
+                "fabric",
+                "agent-gateway",
+                "surfaces",
+                "add-transit-point",
+                "s-1",
+                "--alias",
+                "billing",
+                "--endpoint",
+                "http://b:1",
+                "--dry-run"
+            ]),
+            Command::Surfaces {
+                command: SurfaceCommand::AddTransitPoint(AddTransitPointArgs { dry_run: true, .. })
+            }
+        ));
+        assert!(matches!(
+            parsed(&["fabric", "agent-gateway", "surfaces", "remove-transit-point", "s-1", "billing", "--dry-run"]),
+            Command::Surfaces {
+                command: SurfaceCommand::RemoveTransitPoint(RemoveTransitPointArgs { dry_run: true, .. })
             }
         ));
         assert!(matches!(

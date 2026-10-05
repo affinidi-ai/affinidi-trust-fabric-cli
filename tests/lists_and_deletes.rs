@@ -1141,7 +1141,7 @@ fn payments_with_a_failing_store_say_none_were_returned() {
 }
 
 #[test]
-fn adding_and_removing_a_feature_print_one_line_in_table_mode() {
+fn adding_and_removing_a_feature_or_transit_point_print_one_line_in_table_mode() {
     let bare = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
     let limited = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales","rate_limit":{"requests":10,"window_secs":60}},"target":{"endpoint":"http://127.0.0.1:3000"}}"#;
     let routes = |current: &'static str| {
@@ -1159,8 +1159,17 @@ fn adding_and_removing_a_feature_print_one_line_in_table_mode() {
     let removed = fabric(routes(limited), &["surfaces", "remove-feature", "s-1", "rate-limit"]);
     let json = fabric(routes(limited), &["-o", "json", "surfaces", "remove-feature", "s-1", "rate-limit"]);
 
+    let with_point = r#"{"surface_id":"s-1","name":"Sales","access_point":{"listen_address":"0.0.0.0:8080","route":"/sales"},"target":{"endpoint":"http://127.0.0.1:3000"},"transit":{"points":[{"id":"tp-1","alias":"billing","target_endpoint":"http://billing:3000"}]}}"#;
+    let point_added = fabric(
+        routes(bare),
+        &["surfaces", "add-transit-point", "s-1", "--alias", "billing", "--endpoint", "http://billing:3000"],
+    );
+    let point_removed = fabric(routes(with_point), &["surfaces", "remove-transit-point", "s-1", "billing"]);
+
     assert_eq!(added.stdout, "Updated surface 's-1'\n", "{}", added.stderr);
     assert_eq!(removed.stdout, "Updated surface 's-1'\n", "{}", removed.stderr);
+    assert_eq!(point_added.stdout, "Updated surface 's-1'\n", "{}", point_added.stderr);
+    assert_eq!(point_removed.stdout, "Updated surface 's-1'\n", "{}", point_removed.stderr);
     assert!(
         json.stdout
             .contains("\"surface_id\": \"s-1\""),
