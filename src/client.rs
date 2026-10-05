@@ -144,9 +144,9 @@ impl GatewayClient {
     }
 
     /// Send `patch` as a JSON Merge Patch
-    /// (https://www.rfc-editor.org/rfc/rfc7396), which the gateway only
-    /// accepts with the `application/merge-patch+json` content type that
-    /// [`Self::request`] cannot set. The response is handled the same way.
+    /// (https://www.rfc-editor.org/rfc/rfc7396). The gateway's PATCH routes
+    /// (surfaces and variants) accept only the `application/merge-patch+json`
+    /// content type, which [`Self::request`] cannot set. The response is handled the same way.
     pub async fn merge_patch(
         &self,
         path: &str,
@@ -663,10 +663,36 @@ fn folded(input: &str) -> impl Iterator<Item = char> + '_ {
 fn printable(input: &str) -> impl Iterator<Item = char> + '_ {
     input
         .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .filter(
-            |c| !matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'),
-        )
+        .filter(|c| !is_hidden_control(*c) || *c == '\n' || *c == '\t')
+}
+
+/// The characters a terminal can act on without showing them: control
+/// characters (C0, DEL and C1) and the Unicode bidirectional controls that
+/// reorder how text is displayed (U+061C, U+200E, U+200F, U+202A-U+202E,
+/// U+2066-U+2069). The one definition behind [`sanitize_for_terminal`] and
+/// [`pretty_json_for_terminal`].
+fn is_hidden_control(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `value` as pretty JSON with every character a terminal can act on written
+/// as a `\uXXXX` escape: the hidden controls of [`is_hidden_control`] and the
+/// line and paragraph separators U+2028 and U+2029. serde_json already escapes
+/// the C0 controls, and the newlines and spaces of the layout stay. The text
+/// parses back to the same value.
+pub(crate) fn pretty_json_for_terminal(value: &Value) -> Result<String> {
+    let pretty = serde_json::to_string_pretty(value)?;
+    let mut escaped = String::with_capacity(pretty.len());
+    for c in pretty.chars() {
+        let hidden = is_hidden_control(c) && (!c.is_ascii() || c == '\u{7f}');
+        if hidden || matches!(c, '\u{2028}' | '\u{2029}') {
+            escaped.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            escaped.push(c);
+        }
+    }
+    Ok(escaped)
 }
 
 pub fn id_from_response(value: &Value) -> Option<&str> {

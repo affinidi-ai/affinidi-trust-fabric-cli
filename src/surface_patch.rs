@@ -66,7 +66,8 @@ pub fn build_patch(
         });
     }
     if !adds.is_empty() || !removes.is_empty() {
-        edits.extend(list_edits(adds, removes, surface)?);
+        let protocol = protocol_after(&edits, surface);
+        edits.extend(list_edits(adds, removes, surface, protocol.as_ref())?);
     }
     reject_overlaps(&edits)?;
     let mut patch = Map::new();
@@ -172,6 +173,7 @@ fn list_edits<'a>(
     adds: &'a [String],
     removes: &'a [String],
     surface: &Value,
+    protocol: Option<&Value>,
 ) -> Result<Vec<Edit<'a>>> {
     let mut changes: Vec<ListChange<'a>> = Vec::new();
     let mut pattern_edits: Vec<PatternEdit<'a>> = Vec::new();
@@ -185,7 +187,10 @@ fn list_edits<'a>(
                 continue;
             }
             let keys = parse_path(path, flag)?;
-            let item = ListItem { raw, value: parse_value(raw) };
+            let mut item = ListItem { raw, value: parse_value(raw) };
+            if is_add && keys == ["transit", "points"] {
+                give_surface_protocol(&mut item.value, protocol);
+            }
             let change = match changes
                 .iter_mut()
                 .position(|change| change.keys == keys)
@@ -230,6 +235,56 @@ fn list_edits<'a>(
         .collect::<Result<Vec<_>>>()?;
     edits.extend(pattern_list_edits(&pattern_edits, surface)?);
     Ok(edits)
+}
+
+/// The protocol of the surface's `access_point` once the `--set` and
+/// `--unset` edits are applied, which a transit point added in the same
+/// command follows. An object set on `access_point` merges into the old one,
+/// while an unset or a value that is not an object leaves no protocol. Only a
+/// text protocol counts.
+fn protocol_after(
+    edits: &[Edit<'_>],
+    surface: &Value,
+) -> Option<Value> {
+    let mut protocol = surface
+        .pointer("/access_point/protocol")
+        .cloned();
+    for edit in edits {
+        match edit.keys.as_slice() {
+            ["access_point", "protocol"] => protocol = Some(edit.value.clone()),
+            ["access_point"] => match &edit.value {
+                // A merge patch merges an object into the old one: a `protocol`
+                // key replaces it (`null` removes it) and no key keeps it.
+                Value::Object(fields) => {
+                    if let Some(given) = fields.get("protocol") {
+                        protocol = Some(given.clone());
+                    }
+                }
+                // Any other value, or an unset, removes the whole object.
+                _ => protocol = None,
+            },
+            _ => {}
+        }
+    }
+    protocol.filter(Value::is_string)
+}
+
+/// Give a transit point added without a `protocol`, or with a `null` one, the
+/// surface's protocol, so it follows the surface. A protocol the point already
+/// has is kept, and a surface with no protocol changes nothing.
+fn give_surface_protocol(
+    point: &mut Value,
+    protocol: Option<&Value>,
+) {
+    let (Some(protocol), Value::Object(fields)) = (protocol, point) else {
+        return;
+    };
+    let field = fields
+        .entry("protocol")
+        .or_insert(Value::Null);
+    if field.is_null() {
+        *field = protocol.clone();
+    }
 }
 
 /// Split an `--add` or `--remove` flag at its first `=` outside square
@@ -971,6 +1026,108 @@ mod tests {
         patch(sets, unsets)
             .expect_err("the flags should be refused")
             .to_string()
+    }
+
+    fn mcp_surface() -> Value {
+        let mut surface = surface();
+        surface["access_point"]["protocol"] = json!("mcp");
+        surface
+    }
+
+    fn added_point(
+        sets: &[&str],
+        unsets: &[&str],
+        add: &str,
+        surface: &Value,
+    ) -> Value {
+        build_patch(&strings(sets), &strings(unsets), &strings(&[add]), &[], surface).expect("patch")["transit"]
+            ["points"][2]
+            .clone()
+    }
+
+    #[test]
+    fn an_added_transit_point_follows_the_surface_protocol_unless_it_names_one() {
+        let surface = mcp_surface();
+
+        assert_eq!(
+            added_point(&[], &[], r#"transit.points={"id":"tp-3"}"#, &surface),
+            json!({"id": "tp-3", "protocol": "mcp"})
+        );
+        assert_eq!(
+            added_point(&[], &[], r#"transit.points={"id":"tp-3","protocol":"a2a"}"#, &surface),
+            json!({"id": "tp-3", "protocol": "a2a"})
+        );
+    }
+
+    #[test]
+    fn an_added_transit_point_with_a_null_protocol_follows_the_surface_protocol() {
+        assert_eq!(
+            added_point(&[], &[], r#"transit.points={"id":"tp-3","protocol":null}"#, &mcp_surface()),
+            json!({"id": "tp-3", "protocol": "mcp"})
+        );
+    }
+
+    #[test]
+    fn an_added_transit_point_stays_as_given_when_the_surface_has_no_protocol() {
+        assert_eq!(added_point(&[], &[], r#"transit.points={"id":"tp-3"}"#, &surface()), json!({"id": "tp-3"}));
+    }
+
+    #[test]
+    fn an_added_transit_point_follows_the_protocol_set_in_the_same_command() {
+        let surface = mcp_surface();
+        let add = r#"transit.points={"id":"tp-3"}"#;
+
+        assert_eq!(
+            added_point(&["access_point.protocol=a2a"], &[], add, &surface),
+            json!({"id": "tp-3", "protocol": "a2a"})
+        );
+        assert_eq!(
+            added_point(&[r#"access_point={"protocol":"a2a"}"#], &[], add, &surface),
+            json!({"id": "tp-3", "protocol": "a2a"})
+        );
+        assert_eq!(added_point(&[], &["access_point.protocol"], add, &surface), json!({"id": "tp-3"}));
+    }
+
+    #[test]
+    fn an_added_transit_point_keeps_the_protocol_when_an_access_point_object_has_none() {
+        assert_eq!(
+            added_point(&[r#"access_point={"route":"/x"}"#], &[], r#"transit.points={"id":"tp-3"}"#, &mcp_surface()),
+            json!({"id": "tp-3", "protocol": "mcp"})
+        );
+    }
+
+    #[test]
+    fn an_added_transit_point_gets_no_protocol_when_the_access_point_is_unset_or_replaced() {
+        let surface = mcp_surface();
+        let add = r#"transit.points={"id":"tp-3"}"#;
+
+        assert_eq!(added_point(&[], &["access_point"], add, &surface), json!({"id": "tp-3"}));
+        assert_eq!(added_point(&["access_point=\"/x\""], &[], add, &surface), json!({"id": "tp-3"}));
+        assert_eq!(added_point(&["access_point=7"], &[], add, &surface), json!({"id": "tp-3"}));
+    }
+
+    #[test]
+    fn an_added_item_that_is_not_an_object_is_left_alone() {
+        let surface = json!({"access_point": {"protocol": "mcp"}, "transit": {"points": ["tp-1"]}});
+        let patch = build_patch(&[], &[], &strings(&["transit.points=tp-2"]), &[], &surface).expect("patch");
+
+        assert_eq!(patch, json!({"transit": {"points": ["tp-1", "tp-2"]}}));
+    }
+
+    #[test]
+    fn a_remove_does_not_get_the_surface_protocol() {
+        let surface = json!({"access_point": {"protocol": "mcp"}, "transit": {"points": [{"id": "tp-1"}]}});
+        let patch = build_patch(&[], &[], &[], &strings(&["transit.points=tp-1"]), &surface).expect("patch");
+
+        assert_eq!(patch, json!({"transit": {"points": []}}));
+    }
+
+    #[test]
+    fn an_add_to_another_list_does_not_get_the_surface_protocol() {
+        let surface = json!({"access_point": {"protocol": "mcp"}, "extras": [{"id": "e-1"}]});
+        let patch = build_patch(&[], &[], &strings(&[r#"extras={"id":"e-2"}"#]), &[], &surface).expect("patch");
+
+        assert_eq!(patch, json!({"extras": [{"id": "e-1"}, {"id": "e-2"}]}));
     }
 
     #[test]
