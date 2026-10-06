@@ -316,7 +316,7 @@ impl GatewayClient {
 /// with the browser login so the code exchange gets the same limits.
 pub(crate) fn build_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent(concat!("fabric-cli/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("affinidi-trust-fabric-cli/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .redirect(same_origin_redirects())

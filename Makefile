@@ -14,7 +14,7 @@ NC := $(shell printf '\033[0m')
 # The first available codesigning identity is used; on a machine with more
 # than one, sign warns which one it picked. Override with
 # `make build SIGN_IDENTITY="Developer ID Application: ..."`.
-BUNDLE_ID ?= com.affinidi.fabric-cli
+BUNDLE_ID ?= com.affinidi.trust-fabric-cli
 CODESIGN_IDENTITY_COUNT := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -c '".*"')
 SIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null | grep -m1 -oE '"[^"]+"' | tr -d '"')
 BIN ?= target/debug/fabric
