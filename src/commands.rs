@@ -61,15 +61,16 @@ struct AgentGatewayArgs {
     #[arg(long, global = true, env = "FABRIC_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
-    /// Allow a plain http:// host that is not localhost. The session token is
-    /// sent unencrypted, so only use this on a network you trust.
+    /// Allow a plain http:// host other than this machine, typed with --host or
+    /// set in FABRIC_HOST.
+    /// The token is then sent unencrypted, so only use this on a network you
+    /// trust.
     #[arg(long, global = true)]
     allow_http: bool,
 
     /// Send the saved token to a --host other than the one it was saved for.
-    /// Without this the CLI refuses, so a mistyped or swapped host cannot
-    /// receive your token. Only the typed flag counts, never an environment
-    /// variable, so a project file cannot turn it on.
+    /// Without this the CLI refuses, so a mistyped host cannot receive your
+    /// token. It has no environment variable, so it must be typed.
     #[arg(long, global = true)]
     allow_host_override: bool,
 
@@ -167,18 +168,38 @@ impl Output {
 enum Command {
     /// Authenticate and save a named gateway connection.
     ///
-    /// Opens a browser to complete the gateway's passkey or SSO login and
-    /// captures the token automatically. Use --paste, --token-stdin, or
-    /// FABRIC_TOKEN to supply a token manually instead.
-    Login(LoginArgs),
-    /// Remove locally saved authentication.
+    /// Opens a browser for the gateway's passkey or SSO login and captures the
+    /// token. Use --pat for a personal access token, or --paste, --token-stdin,
+    /// or FABRIC_TOKEN for a session token. Piped standard input is read as the
+    /// token.
     ///
-    /// For a browser login this also ends the session on the gateway, if it
-    /// can be reached, which signs you out of the browser as well. A personal
-    /// access token stays valid on the gateway unless you revoke it: you are
-    /// asked in a terminal, or pass --revoke-token.
+    /// The token is checked with the gateway before anything is saved. The
+    /// connection is saved under --connection (or `default`) and becomes
+    /// current; logging in again under the same name replaces it.
+    ///
+    /// See docs/AUTHENTICATION.md for details.
+    #[command(after_long_help = LOGIN_EXAMPLES)]
+    Login(LoginArgs),
+    /// Sign out and remove a saved gateway connection.
+    ///
+    /// Removes the connection's name, host, and token from this machine.
+    /// Without --connection it removes the current connection, and the first
+    /// remaining one by name becomes current, so the next command may go to a
+    /// different gateway.
+    ///
+    /// A browser login's session also ends on the gateway, if reachable,
+    /// signing you out of the browser too. A personal access token stays valid
+    /// unless you revoke it: you're asked in a terminal, or pass --revoke-token;
+    /// otherwise logout prints how to revoke it.
+    ///
+    /// See docs/AUTHENTICATION.md for details.
+    #[command(after_long_help = LOGOUT_EXAMPLES)]
     Logout(LogoutArgs),
     /// Manage local gateway profiles.
+    ///
+    /// Profiles are the connections saved by `fabric agent-gateway login`. These
+    /// commands work only on this machine and never contact a gateway.
+    #[command(after_long_help = CONFIG_EXAMPLES)]
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -204,12 +225,14 @@ enum Command {
     },
     /// Inspect and publish Terms of Use.
     ///
-    /// Accepting terms is deliberately absent. When authenticated with a
-    /// personal access token the gateway refuses every route until terms are
-    /// accepted, including the acceptance route itself, so acceptance can only
-    /// be completed in a browser. A session-token login is exempt on that one
-    /// route and can accept with
+    /// There is no command to accept terms. Until they are accepted, a
+    /// personal access token is refused on every authenticated route, the
+    /// acceptance route included, so its owner must accept in a browser. A
+    /// session-token login can still run `terms status` and `terms applicable`,
+    /// and accept with
     /// `fabric agent-gateway api post /v1/terms/acceptances --file <json>`.
+    ///
+    /// See docs/GATEWAY_CONFIGURATION.md for details.
     Terms {
         #[command(subcommand)]
         command: TermsCommand,
@@ -227,83 +250,177 @@ enum Command {
         command: NotificationCommand,
     },
     /// Show the current login session and connected gateway.
+    ///
+    /// Checks the token live with the gateway and shows the connection, host,
+    /// whether a token is stored (`token_stored`) and accepted
+    /// (`authenticated`), and the signed-in user. For a personal access token it
+    /// also shows the token's ID, name, and scopes. A failed check is shown as
+    /// `error`.
+    ///
+    /// The command exits 0 even when the token is rejected, so scripts should
+    /// read `authenticated`.
+    #[command(after_long_help = WHOAMI_EXAMPLES)]
     Whoami,
     /// Manage Agent Surfaces.
     Surfaces {
         #[command(subcommand)]
         command: SurfaceCommand,
     },
-    /// Manage gateway-to-gateway connections.
+    /// Manage connections, the Gateway records of this gateway and its peers.
+    ///
+    /// Each record holds a gateway's DID, type (`self` or `remote`), status and
+    /// exposed surfaces. `update` changes only the name, description and status;
+    /// the DID cannot change. These commands call the gateway's `/v1/gateways`
+    /// routes.
+    #[command(mut_subcommands(crud_help(
+        "connections",
+        "a connection",
+        "connections",
+        CrudUpdate::ChangesSentFields
+    )))]
     Connections {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage connection points.
+    /// Manage connection points, the DIDComm endpoints other appliances use to
+    /// connect to this one.
+    ///
+    /// `update` changes only `name`, `description`, `enabled` and the
+    /// integration list. It takes that list as `integration_integrations`,
+    /// although `get` prints it as `integrations`; other fields are ignored.
     #[command(name = "connection-points")]
+    #[command(mut_subcommands(crud_help(
+        "connection-points",
+        "a connection point",
+        "connection points",
+        CrudUpdate::Custom(CONNECTION_POINTS_UPDATE_HELP)
+    )))]
     ConnectionPoints {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage policy definitions.
+    /// Manage the Rego policy definitions the gateway enforces on traffic.
     Policies {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    /// Manage Issuers.
+    /// Manage issuers, the DID-carrying units that own surfaces.
+    #[command(mut_subcommands(crud_help("issuers", "an issuer", "issuers", CrudUpdate::Custom(ISSUERS_UPDATE_HELP))))]
     Issuers {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage Authorities.
+    /// Manage authorities, external DIDs recorded as trust anchors.
+    ///
+    /// An authority is operator-supplied metadata about an external DID that
+    /// policies and Trust Check templates can refer to. It holds no keys, and
+    /// its DID cannot be changed after it is created.
+    #[command(mut_subcommands(crud_help("authorities", "an authority", "authorities", CrudUpdate::Replaces)))]
     Authorities {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage Trust Registries.
+    /// Manage the trust registries this gateway connects to for Trust Checks.
     #[command(name = "trust-registries")]
+    #[command(mut_subcommands(crud_help(
+        "trust-registries",
+        "a trust registry",
+        "trust registries",
+        CrudUpdate::ChangesSentFields
+    )))]
     TrustRegistries {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage Mediators.
+    /// Manage DIDComm mediator records.
+    #[command(mut_subcommands(crud_help("mediators", "a mediator", "mediators", CrudUpdate::ChangesSentFields)))]
     Mediators {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage MCP Proxies.
+    /// Manage MCP proxies, the services a surface Target can route MCP traffic
+    /// through.
     #[command(name = "mcp-proxies")]
+    #[command(mut_subcommands(crud_help(
+        "mcp-proxies",
+        "an MCP proxy",
+        "MCP proxies",
+        CrudUpdate::ChangesSentFields
+    )))]
     McpProxies {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage A2A Proxies.
+    /// Manage A2A proxies, which expose a managed agent that does not speak A2A
+    /// as an A2A endpoint.
     #[command(name = "a2a-proxies")]
+    #[command(mut_subcommands(crud_help(
+        "a2a-proxies",
+        "an A2A proxy",
+        "A2A proxies",
+        CrudUpdate::ChangesSentFields
+    )))]
     A2aProxies {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage STS clients.
+    /// Manage STS clients, the OAuth clients allowed to exchange tokens with the
+    /// gateway's Security Token Service.
+    ///
+    /// Each client can limit the audiences and scopes it may request; an empty
+    /// list allows any. The client stores no secret value: its
+    /// `client_secret_ref` names the secret by `secret_id`, and the value lives
+    /// in `fabric agent-gateway secrets`.
     #[command(name = "sts-clients")]
+    #[command(mut_subcommands(crud_help("sts-clients", "an STS client", "STS clients", CrudUpdate::Replaces)))]
     StsClients {
         #[command(subcommand)]
         command: CrudCommand,
     },
-    /// Manage credential providers.
+    /// Manage credential providers, the OAuth 2.0 and API-key providers used for
+    /// outbound credential delegation.
+    ///
+    /// Surfaces refer to a provider from their `outbound_credentials`. A
+    /// provider stores no secret values: its `client_id_secret_ref`,
+    /// `client_secret_secret_ref` and `api_key_secret_ref` fields name them by
+    /// `secret_id`, and the values live in `fabric agent-gateway secrets`.
     #[command(name = "credential-providers")]
+    #[command(mut_subcommands(crud_help(
+        "credential-providers",
+        "a credential provider",
+        "credential providers",
+        CrudUpdate::ChangesSentFields
+    )))]
     CredentialProviders {
         #[command(subcommand)]
         command: CrudCommand,
     },
     /// Manage TLS certificates and their private keys.
     #[command(
+        mut_subcommand("list", |list| list.about("List certificates")),
+        mut_subcommand("create", |create| create.about("Create a certificate from a JSON document")),
         mut_subcommand("get", certificate_reference_help("Get a certificate by its id or name")),
-        mut_subcommand("update", certificate_reference_help("Replace a certificate from a JSON document")),
-        mut_subcommand("delete", certificate_reference_help("Delete a certificate by its id or name"))
+        mut_subcommand("update", |update| {
+            certificate_reference_help("Update a certificate from a JSON document")(update).long_about(
+                "Update a certificate from a JSON document.\n\n\
+                 The gateway changes only the fields the document sets and keeps the rest. A document that still \
+                 carries the masked private key is refused: re-read the certificate with --reveal, or drop \
+                 `private_key_pem` to keep the stored key.",
+            )
+        }),
+        mut_subcommand("delete", |delete| {
+            certificate_reference_help("Delete a certificate by its id or name")(delete).long_about(
+                "Delete a certificate by its id or name.\n\n\
+                 The certificate is deleted as soon as the command runs: there is no confirmation prompt and no \
+                 --yes flag.",
+            )
+        })
     )]
     Certificates {
         #[command(subcommand)]
         command: CrudCommand,
-        /// Print the stored private key instead of masking it.
+        /// Print the stored private key instead of masking it. Applies to get,
+        /// create, and update; list and delete never print a key.
         #[arg(long, global = true)]
         reveal: bool,
     },
@@ -311,7 +428,9 @@ enum Command {
     Secrets {
         #[command(subcommand)]
         command: SecretCommand,
-        /// Print secret values instead of masking them.
+        /// Print secret values instead of masking them. Applies to get,
+        /// create, and update; list responses never carry values and delete
+        /// prints none.
         #[arg(long, global = true)]
         reveal: bool,
     },
@@ -321,7 +440,14 @@ enum Command {
         #[command(subcommand)]
         command: DelegationVaultCommand,
     },
-    /// Manage notification integrations.
+    /// Manage integrations, such as the email, Slack or webhook senders the
+    /// gateway notifies through.
+    ///
+    /// Each integration has a type, a category that sets which runtime
+    /// variables its message can use, its connection settings, and the message
+    /// content with ${VARIABLE} placeholders. The types and categories on offer
+    /// come from the gateway's configuration.
+    #[command(mut_subcommands(crud_help("integrations", "an integration", "integrations", CrudUpdate::Replaces)))]
     Integrations {
         #[command(subcommand)]
         command: CrudCommand,
@@ -352,7 +478,25 @@ enum Command {
         command: TenantOwnershipCommand,
     },
     /// Manage JWT verification strategies.
-    #[command(name = "jwt-verification-strategies")]
+    ///
+    /// A strategy names the issuer the gateway expects in a JWT and where it
+    /// gets the keys that verify it. `create` takes a document `{name,
+    /// expected_issuer, jwks_source, tenant_id?}`, where `jwks_source` is
+    /// `{"type": "remote", "jwks_uri": ...}` or `{"type": "static", "jwks":
+    /// [...]}`. `update` takes the same document and replaces the strategy's
+    /// name, issuer and key source; it ignores `tenant_id` and keeps the
+    /// current tenant, which `tenant-ownership set jwt-verification-strategies
+    /// <id>` changes. `delete` runs at once, with no confirmation prompt.
+    #[command(
+        name = "jwt-verification-strategies",
+        after_long_help = JWT_VERIFICATION_STRATEGIES_EXAMPLES,
+        mut_subcommands(crud_help(
+            "jwt-verification-strategies",
+            "a JWT verification strategy",
+            "JWT verification strategies",
+            CrudUpdate::Custom(JWT_VERIFICATION_STRATEGIES_UPDATE_HELP)
+        ))
+    )]
     JwtVerificationStrategies {
         #[command(subcommand)]
         command: JwtStrategyCommand,
@@ -384,10 +528,95 @@ enum Command {
         command: LogsCommand,
     },
     /// Call any authenticated management API endpoint.
+    ///
+    /// Reaches the endpoints no other command covers, with the current
+    /// connection's token. Give a body with --data or --file, not both; `patch`
+    /// needs one and sends it as a JSON Merge Patch. A body still carrying the
+    /// masked placeholder is refused.
+    ///
+    /// Responses print as the gateway sent them, without the masking that
+    /// commands such as `secrets` apply. In table mode a JSON array prints as a
+    /// NAME ID DESCRIPTION table, anything else as JSON.
+    ///
+    /// See docs/SCRIPTING_AND_OUTPUT.md for details.
+    #[command(after_long_help = API_EXAMPLES)]
     Api(ApiArgs),
     /// Open the interactive shell.
+    ///
+    /// Type commands without the `fabric agent-gateway` prefix, such as
+    /// `surfaces list`. Global options given when the shell starts, such as
+    /// --connection or --output, become defaults that a single command can
+    /// override. A failed command prints its error and the shell keeps running.
+    ///
+    /// Type `help` to list commands, and `exit`, `quit` or Ctrl-D to leave.
+    /// History lasts for the session only and skips any line that types a
+    /// secret, such as a --token value.
+    ///
+    /// See docs/INTERACTIVE_SHELL.md for details.
+    #[command(after_long_help = SHELL_EXAMPLES)]
     Shell,
 }
+
+/// Examples shown at the bottom of `api --help`.
+const API_EXAMPLES: &str = r#"Examples:
+  Read an endpoint as JSON:
+    fabric agent-gateway api get /v1/limits --output json
+
+  Send a body from a file, or from standard input with '-':
+    fabric agent-gateway api post /v1/policy-definitions/<policy-id>/simulate \
+      --file input.json
+
+  Change one field of a surface (sent as a JSON Merge Patch):
+    fabric agent-gateway api patch /v1/surfaces/<surface-id> \
+      --data '{"description":"Updated"}'"#;
+
+/// Examples shown at the bottom of `shell --help`.
+const SHELL_EXAMPLES: &str = r#"Examples:
+  Open the shell with a saved connection and JSON output as defaults:
+    fabric agent-gateway --connection production --output json shell
+
+  Then type commands without the prefix:
+    fabric agent-gateway> surfaces list
+    fabric agent-gateway> surfaces list --output table
+    fabric agent-gateway> exit"#;
+
+/// Examples shown at the bottom of `login --help`.
+const LOGIN_EXAMPLES: &str = r#"Examples:
+  Sign in through the browser and save the connection as "default":
+    fabric agent-gateway login --host https://gateway.example.com
+
+  Save another connection, named "production":
+    fabric agent-gateway --connection production login \
+      --host https://gateway.example.com
+
+  Sign in with a personal access token, prompted for without echo:
+    fabric agent-gateway login --host https://gateway.example.com --pat
+
+  Sign in with a personal access token from a script:
+    printf '%s' "$PAT" | fabric agent-gateway login \
+      --host https://gateway.example.com --pat --token-stdin"#;
+
+/// Examples shown at the bottom of `logout --help`.
+const LOGOUT_EXAMPLES: &str = r#"Examples:
+  Sign out of the current connection:
+    fabric agent-gateway logout
+
+  Sign out of a named connection:
+    fabric agent-gateway --connection production logout
+
+  Sign out and revoke the saved personal access token without asking:
+    fabric agent-gateway logout --revoke-token"#;
+
+/// Examples shown at the bottom of `whoami --help`.
+const WHOAMI_EXAMPLES: &str = r#"Examples:
+  Check the current connection:
+    fabric agent-gateway whoami
+
+  Check a named connection:
+    fabric agent-gateway --connection production whoami
+
+  Fail a script when the saved token no longer works:
+    fabric agent-gateway whoami --output json | jq -e .authenticated"#;
 
 #[derive(Debug, Args)]
 struct LogoutArgs {
@@ -403,7 +632,8 @@ struct LoginArgs {
     #[arg(long, env = "FABRIC_HOST")]
     host: Option<String>,
     /// Read the bearer token from standard input. Safer than --token, which
-    /// stays in shell history.
+    /// stays in shell history. With --pat, this reads the personal access
+    /// token.
     #[arg(long, conflicts_with = "token")]
     token_stdin: bool,
     /// Paste a bearer token manually instead of using the browser login.
@@ -414,9 +644,9 @@ struct LoginArgs {
     #[arg(long, env = "FABRIC_TOKEN", hide_env_values = true)]
     token: Option<String>,
     /// Authenticate with a personal access token (agpat_...) instead of the
-    /// browser login. Leave the value off and the CLI prompts for it, or
-    /// supply it with --token-stdin or FABRIC_PAT (set once --pat is passed).
-    /// A value typed after the flag stays in shell history.
+    /// browser login. Leave the value off to be prompted, or supply it with
+    /// FABRIC_PAT (read only when --pat is given) or --token-stdin. A value
+    /// typed after the flag stays in shell history.
     #[arg(
         long,
         num_args = 0..=1,
@@ -428,13 +658,43 @@ struct LoginArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    /// List configured gateway profiles.
+    /// List saved gateway profiles, with their hosts and which one is current.
     List,
     /// Select the default gateway profile.
-    Use { name: String },
-    /// Remove a gateway profile.
-    Remove { name: String },
+    ///
+    /// Commands not given --connection (or FABRIC_CONNECTION) use this profile
+    /// from now on.
+    Use {
+        /// Name of a saved profile (see `fabric agent-gateway config list`).
+        name: String,
+    },
+    /// Remove a gateway profile and its saved token, without contacting the
+    /// gateway.
+    ///
+    /// The token is deleted from the OS credential store only. A browser
+    /// session stays open and a personal access token stays valid on the
+    /// gateway; use `fabric agent-gateway logout` to end the session or revoke
+    /// the token as well. When the removed profile was current, another saved
+    /// profile, if any, becomes current (the first by name).
+    Remove {
+        /// Name of the saved profile to remove.
+        name: String,
+    },
 }
+
+/// Examples shown at the bottom of `config --help`.
+const CONFIG_EXAMPLES: &str = r#"Examples:
+  List saved profiles and see which one is current:
+    fabric agent-gateway config list
+
+  Make "production" the profile later commands use:
+    fabric agent-gateway config use production
+
+  Use another profile for one command only:
+    fabric agent-gateway --connection staging surfaces list
+
+  Forget a profile on this machine, without contacting the gateway:
+    fabric agent-gateway config remove staging"#;
 
 #[derive(Debug, Subcommand)]
 enum RuntimeCommand {
@@ -445,18 +705,35 @@ enum RuntimeCommand {
     },
     /// Reload surface configuration from the configured source.
     ///
-    /// Nothing is written. Surfaces changed through this CLI or the dashboard
-    /// already reload themselves; this covers configuration edited outside the
-    /// gateway, such as a direct `_storage/` edit.
+    /// Re-reads the configured source and swaps surfaces in place. It changes
+    /// no configuration you set, though a full reload can persist housekeeping
+    /// fixes, such as upgrading legacy `channel.policy` definitions. Surfaces
+    /// changed through this CLI or the dashboard already reload themselves;
+    /// this covers configuration edited outside the gateway, such as a direct
+    /// `_storage/` edit.
+    #[command(after_long_help = RUNTIME_RELOAD_EXAMPLES)]
     Reload {
-        /// Reload one surface by its configuration id, the id `fabric agent-gateway surfaces
-        /// list` shows, instead of all of them. The gateway answers an id no
-        /// surface has with a 500, not a 404, so after a server error the CLI
-        /// checks the id itself and reports one it cannot find as not found.
+        /// Reload only this surface, by the id `fabric agent-gateway surfaces
+        /// list` shows. The gateway answers an unknown id with a 500, so after
+        /// a server error the CLI checks the id and reports a missing one as
+        /// not found.
         #[arg(long)]
         surface: Option<String>,
     },
 }
+
+/// Examples shown at the bottom of `runtime reload --help`.
+const RUNTIME_RELOAD_EXAMPLES: &str = r#"Examples:
+  Reload every surface:
+    fabric agent-gateway runtime reload
+
+  Reload one surface, by the id `fabric agent-gateway surfaces list` shows:
+    fabric agent-gateway runtime reload --surface <surface-id>
+
+Reading the result:
+  A full reload prints channels_count, surfaces_count and is_fallback. With
+  --surface it prints the surface's channel_name and is_fallback. Either one
+  adds a warning when the gateway sends one."#;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum RuntimeView {
@@ -492,12 +769,14 @@ enum SettingsCommand {
     /// Apply a partial update from a JSON document.
     ///
     /// Absent fields are left unchanged, but `feature_flags` replaces the
-    /// stored map wholesale. `payments_min_display` is ignored here — it is
-    /// settable only per user, with `fabric agent-gateway user-settings set`. A
-    /// `prometheus_auth_password` is sent as plaintext and hashed by the
-    /// gateway. A document carrying `feature_flags.terms` is refused, because
-    /// the gateway reports that flag from its configuration on every read.
-    /// Prints the settings as read back after the write.
+    /// stored map wholesale, so a flag missing from it is removed.
+    /// `payments_min_display` is ignored here; set it per user with
+    /// `fabric agent-gateway user-settings set`. A document carrying
+    /// `feature_flags.terms` is refused. Prints the settings as read back after
+    /// the write.
+    ///
+    /// See docs/GATEWAY_CONFIGURATION.md for details.
+    #[command(after_long_help = SETTINGS_SET_EXAMPLES)]
     Set(JsonFileArgs),
     /// Overwrite the whole document with the built-in defaults and show them.
     ///
@@ -506,13 +785,40 @@ enum SettingsCommand {
     /// emptied, and every window, interval and threshold goes back to its
     /// default. Refused without --force, because the Prometheus password it
     /// erases cannot be restored from a `fabric agent-gateway settings show` backup.
+    #[command(after_long_help = SETTINGS_RESET_EXAMPLES)]
     Reset {
-        /// Clear the appliance settings although the pre-flight check refuses
-        /// the command.
+        /// Confirm the reset. Without it the command lists what it would
+        /// clear and sends nothing.
         #[arg(long)]
         force: bool,
     },
 }
+
+/// Examples shown at the bottom of `settings set --help`.
+const SETTINGS_SET_EXAMPLES: &str = r#"Examples:
+  Change one setting and leave the rest as they are:
+    echo '{"audit_enabled": true}' | fabric agent-gateway settings set --file -
+
+  Edit a full copy. A `show` document always carries feature_flags.terms, which
+  is refused, so delete it first:
+    fabric agent-gateway settings show --output json | jq \
+      'del(.feature_flags.terms)' > settings.json
+    fabric agent-gateway settings set --file settings.json
+
+  Change the Prometheus password, from a file holding
+  {"prometheus_auth_password": "<password>"} so it stays out of shell history.
+  It is sent as plaintext and hashed by the gateway:
+    fabric agent-gateway settings set --file prometheus-password.json
+
+Fields the gateway will not store as sent (payments_min_display,
+prometheus_auth_password_hash) and a feature_flags map that replaces the stored
+one draw a warning on stderr."#;
+
+/// Examples shown at the bottom of `settings reset --help`.
+const SETTINGS_RESET_EXAMPLES: &str = r#"Examples:
+  Keep a copy, then reset (a copy does not bring back the Prometheus password):
+    fabric agent-gateway settings show --output json > settings-backup.json
+    fabric agent-gateway settings reset --force"#;
 
 #[derive(Debug, Subcommand)]
 enum UserSettingsCommand {
@@ -520,8 +826,8 @@ enum UserSettingsCommand {
     ///
     /// Without --overrides this is the effective document — appliance defaults
     /// merged with this user's overrides — so a field that was never set still
-    /// looks set. Pass --overrides for the only honest view of what is stored
-    /// against the account.
+    /// looks set. Pass --overrides to see only what is stored for your
+    /// account, the view to start a `set` document from.
     Show {
         /// Show only this user's stored overrides, without appliance defaults
         /// merged in.
@@ -530,18 +836,51 @@ enum UserSettingsCommand {
     },
     /// Apply a partial update from a JSON document.
     ///
-    /// Every field present becomes a personal override. Omitting a field, or
-    /// sending null, is indistinguishable from leaving it alone, so a single
-    /// override cannot be cleared — only `reset` clears, and it clears all of
-    /// them. A document carrying fields a per-user update cannot store is
-    /// refused, because it came from `show` without --overrides and would
-    /// persist appliance defaults as personal overrides. A document carrying
-    /// `feature_flags.terms` is refused even with --force, because the gateway
-    /// reports that flag from its configuration on every read.
+    /// Every field present becomes a personal override. Omitting a field or
+    /// sending null leaves it alone, so a single override cannot be cleared;
+    /// only `reset` clears them. `feature_flags` is the exception: it replaces
+    /// your stored flags, so a flag missing from it is cleared.
+    ///
+    /// A plain `show` document is refused without --force, because sending it
+    /// would save the current value of every per-user field and flag as a
+    /// personal override. A document carrying `feature_flags.terms` is always
+    /// refused.
+    ///
+    /// See docs/GATEWAY_CONFIGURATION.md for details.
+    #[command(after_long_help = USER_SETTINGS_SET_EXAMPLES)]
     Set(GuardedJsonFileArgs),
     /// Clear every personal override and show the resulting settings.
+    ///
+    /// Runs without a prompt and needs no --force. It deletes only this
+    /// account's overrides and touches no appliance setting or other account.
+    /// A `show --overrides` copy taken beforehand restores them through `set`.
+    #[command(after_long_help = USER_SETTINGS_RESET_EXAMPLES)]
     Reset,
 }
+
+/// Examples shown at the bottom of `user-settings set --help`.
+const USER_SETTINGS_SET_EXAMPLES: &str = r#"Examples:
+  Set one personal override:
+    echo '{"refresh_interval_seconds": 30}' | fabric agent-gateway \
+      user-settings set --file -
+
+  Edit your stored overrides as a whole, starting from --overrides (a plain
+  `show` document is refused):
+    fabric agent-gateway user-settings show --overrides --output json > \
+      overrides.json
+    fabric agent-gateway user-settings set --file overrides.json
+
+Fields a personal override can hold: refresh_interval_seconds,
+log_timestamp_format, bucket_seconds, badge_threshold_minutes,
+payments_min_display, feature_flags."#;
+
+/// Examples shown at the bottom of `user-settings reset --help`.
+const USER_SETTINGS_RESET_EXAMPLES: &str = r#"Examples:
+  Keep a copy of your overrides, clear them, and restore them later:
+    fabric agent-gateway user-settings show --overrides --output json > \
+      overrides.json
+    fabric agent-gateway user-settings reset
+    fabric agent-gateway user-settings set --file overrides.json"#;
 
 #[derive(Debug, Subcommand)]
 enum TermsCommand {
@@ -555,16 +894,46 @@ enum TermsCommand {
     #[command(name = "provider-health")]
     ProviderHealth,
     /// Save the customer Terms of Use draft from a JSON document.
+    ///
+    /// The document carries `version`, `title` and `url` (an absolute https
+    /// URL), plus an optional `requires_reconsent` that defaults to false.
+    /// Saving replaces any earlier draft. Nothing applies to users until
+    /// `fabric agent-gateway terms publish`.
+    #[command(after_long_help = TERMS_DRAFT_EXAMPLES)]
     Draft(JsonFileArgs),
     /// Publish the saved customer Terms of Use draft as a new version.
+    ///
+    /// Runs without a prompt. The published version becomes the current
+    /// customer Terms of Use, the draft is used up, and the new version is
+    /// printed. Refused with TERMS_DRAFT_REQUIRED when no draft is saved, and
+    /// with TERMS_INVALID when a version with the same `version` was already
+    /// published.
     Publish,
     /// Deactivate the published customer Terms of Use.
+    ///
+    /// Runs without a prompt. The customer Terms of Use stop applying, and
+    /// the versions published so far are kept. To apply customer terms again,
+    /// save and publish a draft with a new `version`. Prints a confirmation
+    /// line, or `null` with --output json.
     Deactivate,
 }
 
+/// Examples shown at the bottom of `terms draft --help`.
+const TERMS_DRAFT_EXAMPLES: &str = r#"Examples:
+  Save a draft from terms.json, then publish it:
+    fabric agent-gateway terms draft --file terms.json
+    fabric agent-gateway terms publish
+  where terms.json is:
+    {
+      "version": "2.0",
+      "title": "Acme Terms of Use",
+      "url": "https://example.com/terms-2.0",
+      "requires_reconsent": true
+    }"#;
+
 #[derive(Debug, Subcommand)]
 enum NotificationCommand {
-    /// Manage the welcome notification sent to new users.
+    /// Manage the welcome notification sent to newly approved users.
     #[command(name = "welcome-template")]
     WelcomeTemplate {
         #[command(subcommand)]
@@ -572,28 +941,47 @@ enum NotificationCommand {
     },
     /// Send a welcome notification to a user.
     ///
-    /// The gateway enforces no permission check here and takes the recipient
-    /// from the request, so any authenticated caller can post a notification
-    /// into any user's feed. It also never checks that the recipient exists,
-    /// so the CLI looks the user up first and refuses an unknown id. A caller
-    /// without the `users.view` permission cannot look another user up, and is
-    /// warned that the recipient went unverified instead.
-    #[command(name = "send-welcome")]
+    /// The gateway accepts any recipient id, so the CLI looks the user up
+    /// first and refuses an unknown id. A caller without the `users.view`
+    /// permission cannot look another user up, and is warned that the
+    /// recipient went unverified instead.
+    #[command(name = "send-welcome", after_long_help = NOTIFICATIONS_SEND_WELCOME_EXAMPLES)]
     SendWelcome(SendWelcomeArgs),
 }
+
+/// Examples shown at the bottom of `notifications send-welcome --help`.
+const NOTIFICATIONS_SEND_WELCOME_EXAMPLES: &str = r#"Examples:
+  Send a welcome notification:
+    fabric agent-gateway notifications send-welcome --user-id <user-id> \
+      --title "Welcome" --message "Your account is ready"
+
+The recipient lookup is an ordinary user read: it records an accessed user event
+and fires any integration bound to the user.accessed event. Prints a
+confirmation line, or null with --output json."#;
 
 #[derive(Debug, Subcommand)]
 enum WelcomeTemplateCommand {
     /// Show the welcome notification template.
     Show,
-    /// Replace the welcome notification template from a JSON document with
-    /// "title" and "message".
+    /// Replace the welcome notification template from a JSON document.
     ///
-    /// The gateway enforces no permission check on this route despite the
-    /// handler being documented as administrator-only, so any authenticated
-    /// caller can replace the template every future user receives.
+    /// The document carries "title" and "message". The gateway sends the
+    /// template to each user approved from now on, except administrators.
+    /// Prints a confirmation line, or `null` with --output json.
+    #[command(after_long_help = NOTIFICATIONS_WELCOME_TEMPLATE_SET_EXAMPLES)]
     Set(JsonFileArgs),
 }
+
+/// Examples shown at the bottom of `notifications welcome-template set --help`.
+const NOTIFICATIONS_WELCOME_TEMPLATE_SET_EXAMPLES: &str = r#"Examples:
+  Replace the template, starting from the current one:
+    fabric agent-gateway notifications welcome-template show --output json > \
+      template.json
+    fabric agent-gateway notifications welcome-template set --file template.json
+
+  Replace it from standard input:
+    echo '{"title": "Welcome", "message": "Your account is ready"}' | fabric \
+      agent-gateway notifications welcome-template set --file -"#;
 
 #[derive(Debug, Args)]
 struct GuardedJsonFileArgs {
@@ -627,9 +1015,10 @@ enum CrudCommand {
     Get { id: String },
     /// Create an entity from a JSON document.
     Create(JsonFileArgs),
-    /// Replace an entity from a JSON document.
+    /// Update an entity from a JSON document.
     Update {
         id: String,
+        /// JSON document to send. Use '-' to read from standard input.
         #[arg(short, long)]
         file: PathBuf,
     },
@@ -654,28 +1043,32 @@ enum SurfaceCommand {
         surface_id: String,
     },
     /// Create an Agent Surface using flags or a complete JSON document.
+    ///
+    /// With flags, only --name is required. Unless told otherwise, the surface
+    /// listens on 0.0.0.0:8080 with the a2a protocol, forwards to
+    /// http://127.0.0.1:3000, and its route is a URL-safe form of the name.
+    /// With --file, the JSON document is sent as it is and the other creation
+    /// flags are ignored.
+    ///
+    /// Table output prints the new surface's id, name, route, protocol and
+    /// target. Use --output json to get the whole surface, for example to read
+    /// its id in a script.
+    #[command(after_long_help = SURFACES_CREATE_EXAMPLES)]
     Create(SurfaceCreateArgs),
-    /// Update an Agent Surface, either replacing it whole from a JSON document
-    /// with --file or changing single fields and list items with --set,
-    /// --unset, --add and --remove.
+    /// Update an Agent Surface's fields, or replace it from a JSON document.
     ///
-    /// All the single-field flags go to the gateway as one merge patch, so
-    /// fields they do not name keep their current values. Setting an object
-    /// merges it into the existing object, and setting a list replaces the
-    /// whole list. The surface is read first, so --add and --remove send its
-    /// list with only their items changed (a change someone else makes to
-    /// that list between the read and the write is overwritten), and the
-    /// edited surface is checked for its required fields before it is sent.
+    /// --set, --unset, --add and --remove send one merge patch: fields they
+    /// don't name keep their values, objects are merged, and a list you set is
+    /// replaced whole. --file replaces the whole surface, checking only the
+    /// file.
     ///
-    /// To change one tool pattern without retyping its gate, put the gate's
-    /// id (or name) in square brackets, and quote the flag so the shell leaves
-    /// the brackets alone. The CLI sends the surface's whole gates list, or
-    /// the whole transit.points list for a transit point, so a change someone
-    /// else makes to that list between the read and the write is overwritten:
+    /// The other flags read the surface first and check the result; without
+    /// surfaces.view, --set and --unset are sent unchecked, with a warning.
+    /// --add and --remove send the whole list they change, overwriting any
+    /// change someone else made to it meanwhile.
     ///
-    ///   --add 'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
-    ///
-    ///   --remove 'transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
+    /// See docs/SURFACES.md for details.
+    #[command(after_long_help = SURFACES_UPDATE_EXAMPLES)]
     #[command(group(ArgGroup::new("change").required(true).multiple(true).args(["file", "set", "unset", "add", "remove"])))]
     Update {
         /// Surface ID or name (see `fabric agent-gateway surfaces list`).
@@ -695,20 +1088,16 @@ enum SurfaceCommand {
         #[arg(long, value_name = "PATH")]
         unset: Vec<String>,
         /// Add one item to a list, as the list's dot path and the item, read
-        /// the same way as a --set value (`tags=beta`,
-        /// `access_point.trust_check_list='{"id":"tc-1",...}'`). An item
-        /// already in the list is refused. To add one tool pattern to a gate,
-        /// name the gate in brackets:
-        /// `'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'`.
-        /// Repeatable.
+        /// the same way as a --set value (`tags=beta`). An item already in the
+        /// list is refused. To add one tool pattern, name its gate in brackets,
+        /// as in the examples. Repeatable.
         #[arg(long, value_name = "PATH=ITEM")]
         add: Vec<String>,
-        /// Remove one item from a list, named by its value for a list of text
-        /// (`tags=beta`) and for a list of objects by its `id`, else its
-        /// `alias` (`transit.points=billing`), else some of its fields as JSON.
-        /// Removes run before adds, so removing an item and adding it back
-        /// replaces it. To remove one tool pattern from a gate, name the gate
-        /// in brackets, on a transit point too:
+        /// Remove one item from a list: text by its value (`tags=beta`), an
+        /// object by its `id`, else its `alias` (`transit.points=billing`), else
+        /// some of its fields as JSON. Removes run before adds, so removing an
+        /// item and adding it back replaces it. A tool pattern on a transit
+        /// point is named like
         /// `'transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns=fs_.*'`.
         /// Repeatable.
         #[arg(long, value_name = "PATH=ITEM")]
@@ -720,80 +1109,249 @@ enum SurfaceCommand {
         dry_run: bool,
     },
     /// Delete an Agent Surface by ID or name.
+    ///
+    /// The surface is deleted as soon as the command runs. There is no
+    /// confirmation prompt. A name must belong to only one surface: when more
+    /// than one surface has it, the CLI lists their IDs and asks for the ID.
     Delete {
         /// Surface ID or name (see `fabric agent-gateway surfaces list`).
         surface_id: String,
     },
-    /// List the features that can be added to a surface, or with a surface
-    /// given, show which of them it has and where each one is set.
+    /// List the features a surface can have, or the ones a given surface has.
     ///
-    /// The names shown are the ones `add-feature` and `remove-feature` take.
-    /// On or off reflects the surface itself, and a note says when an enabled
-    /// variant sets a feature or, being complete, replaces whole blocks.
+    /// With a surface given, it also shows where each feature is set. The
+    /// names shown are the ones `add-feature` and `remove-feature` take.
+    #[command(after_long_help = SURFACES_FEATURES_EXAMPLES)]
     Features {
         /// Surface ID or name (see `fabric agent-gateway surfaces list`).
         surface_id: Option<String>,
     },
     /// Add a feature to an Agent Surface.
     ///
-    /// Where the feature goes is worked out from its name, so no edge flags
-    /// are needed, for example:
-    /// `surfaces add-feature $ID tool-gating --json '{...}'`. A feature with one
-    /// place uses it, and otherwise the request place is used unless you add
-    /// --response. --transit-point picks one transit point, and --edge ma-tp
-    /// picks the target leg of trust-check. --edge is otherwise only needed
-    /// when the command asks you to choose.
+    /// Feature names come from `fabric agent-gateway surfaces features`.
+    /// Configure it with --json or --file, or --policy-id for a policy. An
+    /// object feature replaces what was there; a list feature, such as
+    /// trust-check, gets the new item appended.
+    ///
+    /// The place is worked out from the name: the request place unless you add
+    /// --response, or one transit point with --transit-point. A transit-point
+    /// feature sends the whole transit.points list, overwriting any change
+    /// someone else made to it meanwhile.
+    #[command(after_long_help = SURFACES_ADD_FEATURE_EXAMPLES)]
     AddFeature(AddFeatureArgs),
     /// Remove a feature from an Agent Surface.
     ///
     /// Where the feature is found is worked out from its name, the same as
-    /// for add-feature.
+    /// for add-feature, and --response, --transit-point and --edge pick
+    /// another place. `fabric agent-gateway surfaces features <surface>` shows
+    /// each place the surface has the feature and the flags needed to remove
+    /// it from there. A feature that is not set is refused.
+    #[command(after_long_help = SURFACES_REMOVE_FEATURE_EXAMPLES)]
     RemoveFeature(FeaturePlacementArgs),
     /// Add a transit point to an Agent Surface from its alias and endpoint.
     ///
-    /// For example:
-    /// `surfaces add-transit-point $ID --alias billing --endpoint http://billing:3000`.
-    /// The point is appended to the surface's transit points, and an alias
-    /// the surface already uses is refused.
+    /// The point is appended to the surface's transit points and takes the
+    /// protocol of the surface's access point, so on a didcomm surface the
+    /// gateway refuses it. An alias the surface already uses is refused. The
+    /// CLI sends the whole transit.points list, so a change someone else makes
+    /// to it between the read and the write is overwritten.
+    #[command(after_long_help = SURFACES_ADD_TRANSIT_POINT_EXAMPLES)]
     AddTransitPoint(AddTransitPointArgs),
     /// Remove a transit point from an Agent Surface by its alias or id.
+    ///
+    /// The point is matched by its id first, then by its alias. When no point
+    /// has that name, the CLI lists the ones the surface has. The CLI sends the
+    /// surface's whole transit.points list, so a change someone else makes to
+    /// that list between the read and the write is overwritten.
+    #[command(after_long_help = SURFACES_REMOVE_TRANSIT_POINT_EXAMPLES)]
     RemoveTransitPoint(RemoveTransitPointArgs),
-    /// Show which tools a set of MCP tool gates would allow or deny, and which
-    /// gate decided, before anything is saved.
+    /// Preview which tools a set of MCP tool gates would allow or deny.
     ///
-    /// The gates come from a surface (the ones it has saved) or from a JSON
-    /// file, so gates that are not saved yet can be checked. Only the
-    /// surface's own gating (`target.mcp_tool_gating`) is previewed, not the
-    /// gating of its variants or transit points. Nothing is changed, and with
-    /// --gates-file nothing is read from the gateway either.
+    /// The gates come from a saved surface's own `target.mcp_tool_gating` (not
+    /// its variants or transit points) or from --gates-file. Nothing is saved.
     ///
-    /// A gate's condition is a policy only the gateway can evaluate for a
-    /// caller, so state what you know with --condition, such as
-    /// `--condition admins=met`. Every other condition policy is tried both
-    /// ways, and a tool whose result or deciding gate depends on it is shown
-    /// once per combination. At most 3 can be left unpinned. A condition whose
-    /// policy does not exist or is disabled acts as a block gate on and an
-    /// allow gate off, and the preview cannot tell, so check the policy
-    /// exists. A pattern matches anywhere in a tool name unless it is
-    /// anchored, and with alternatives each one needs its own ^, or wrap them
-    /// as ^(?:a|b).
+    /// Pin what you know about the caller with --condition; other conditions
+    /// are tried both ways (at most 3). A missing or disabled condition policy
+    /// keeps a block gate on and an allow gate off, which the preview can't
+    /// detect.
+    ///
+    /// See docs/SURFACES.md for pattern rules and details.
     #[command(after_long_help = TOOL_GATE_PREVIEW_EXAMPLES)]
     ToolGatePreview(ToolGatePreviewArgs),
 }
 
+/// Long help for `issuers update`, which keeps omitted fields but always
+/// requires `name`.
+const ISSUERS_UPDATE_HELP: &str = r#"Update an issuer from a JSON document.
+
+The gateway changes only the fields the document sets and keeps the rest, but
+`name` is always required: a document without it, or with an empty one, is
+refused. Start from the current issuer:
+
+  fabric agent-gateway issuers get <ID> \
+    --output json > record.json
+  fabric agent-gateway issuers update <ID> \
+    --file record.json
+
+Use `--file -` to read the document from standard input."#;
+
+/// Long help for `connection-points update`. Its integration list is read
+/// under a different name than `get` prints, so a `get` round trip would
+/// silently drop an integration edit.
+const CONNECTION_POINTS_UPDATE_HELP: &str = r#"Update a connection point from a JSON document.
+
+The gateway changes only name, description, enabled, and the integration list,
+and ignores other fields. It reads the integration list as
+`integration_integrations`, not as the `integrations` field that `get` prints,
+so send only the fields you change rather than editing `get` output:
+
+  echo '{"description": "EU partners", "enabled": true}' | \
+    fabric agent-gateway connection-points update <ID> --file -
+
+Use `--file -` to read the document from standard input."#;
+
+/// Long help for `jwt-verification-strategies update`, which always replaces
+/// the strategy rather than following the shared CRUD wording.
+const JWT_VERIFICATION_STRATEGIES_UPDATE_HELP: &str = r#"Update a JWT verification strategy from a JSON document.
+
+The document replaces the strategy's name, expected_issuer and jwks_source, so
+send all three. tenant_id is ignored and the strategy keeps its tenant; change
+it with `fabric agent-gateway tenant-ownership set jwt-verification-strategies
+<ID>`. Start from the current strategy:
+
+  fabric agent-gateway jwt-verification-strategies get <ID> \
+    --output json > record.json
+  fabric agent-gateway jwt-verification-strategies update <ID> \
+    --file record.json
+
+Use `--file -` to read the document from standard input."#;
+
 /// Examples shown at the bottom of `tool-gate-preview --help`.
 const TOOL_GATE_PREVIEW_EXAMPLES: &str = r#"Examples:
   Check the gates a surface has saved, named by its name or ID:
-    fabric agent-gateway surfaces tool-gate-preview my-agent --tool delete_user,get_user
+    fabric agent-gateway surfaces tool-gate-preview my-agent \
+      --tool delete_user,get_user
 
   Check gates that are not saved yet, from a file:
-    fabric agent-gateway surfaces tool-gate-preview --gates-file gates.json --tool delete_user
+    fabric agent-gateway surfaces tool-gate-preview --gates-file gates.json \
+      --tool delete_user
 
   Say what you know about the caller (an admin who is not a contractor):
-    fabric agent-gateway surfaces tool-gate-preview my-agent --tool delete_user --condition admins=met --condition contractors=unmet
+    fabric agent-gateway surfaces tool-gate-preview my-agent \
+      --tool delete_user --condition admins=met --condition contractors=unmet
 
 Reading the result:
-  RESULT is ALLOW or DENY. DECIDED BY is the gate that decided, or the default when no gate matched. A tool gets one row per combination of conditions, named in a CONDITION column, only when its answer or deciding gate depends on them. Otherwise each tool gets a single row and the CONDITION column is left out."#;
+  RESULT is ALLOW or DENY. DECIDED BY is the gate that decided, or the default
+  when no gate matched. A tool gets one row per combination of conditions, named
+  in a CONDITION column, only when its answer or deciding gate depends on them.
+  Otherwise each tool gets a single row and the CONDITION column is left out."#;
+
+/// Examples shown at the bottom of `surfaces create --help`.
+const SURFACES_CREATE_EXAMPLES: &str = r#"Examples:
+  Create a surface with the default listener, protocol and target:
+    fabric agent-gateway surfaces create --name "Sales Agent" \
+      --description "Routes sales traffic"
+
+  Create an MCP surface that forwards to your own server, with two tags:
+    fabric agent-gateway surfaces create --name "Sales Agent" --protocol mcp \
+      --target-endpoint http://sales:3000 --tags sales,beta
+
+  Create a surface from a complete AgentSurface JSON document:
+    fabric agent-gateway surfaces create --file surface.json
+
+  Print only the new surface's id, for a script:
+    fabric agent-gateway surfaces create --name "Sales Agent" --output json | \
+      jq -r .surface_id"#;
+
+/// Examples shown at the bottom of `surfaces update --help`.
+const SURFACES_UPDATE_EXAMPLES: &str = r#"Examples:
+  Change one field and remove another, naming the surface by its name:
+    fabric agent-gateway surfaces update "Sales Agent" \
+      --set access_point.rate_limit.requests=100 --unset description
+
+  Add a tag and remove a transit point by its alias:
+    fabric agent-gateway surfaces update <surface-id> --add tags=beta \
+      --remove transit.points=billing
+
+  Add one tool pattern to gate g-1, quoted so the shell leaves the brackets
+  alone:
+    fabric agent-gateway surfaces update <surface-id> \
+      --add 'target.mcp_tool_gating.gates[g-1].action.patterns=fs_.*'
+
+  Replace the whole surface, starting from its current JSON:
+    fabric agent-gateway surfaces get <surface-id> --output json > surface.json
+    fabric agent-gateway surfaces update <surface-id> --file surface.json"#;
+
+/// Examples shown at the bottom of `surfaces features --help`.
+const SURFACES_FEATURES_EXAMPLES: &str = r#"Examples:
+  List every feature that can be added, with the places it can go:
+    fabric agent-gateway surfaces features
+
+  Show which features a surface has, and how to remove each one:
+    fabric agent-gateway surfaces features "Sales Agent"
+
+Reading the result:
+  For one surface, FEATURE is the name add-feature and remove-feature take, ON
+  is on or off for the surface itself, and WHERE lists each place the feature is
+  set with the remove-feature flags it needs, such as "remove with
+  --transit-point billing" or "remove with no flags". A Notes section under the
+  table says when an enabled variant changes what the table shows."#;
+
+/// Examples shown at the bottom of `surfaces add-feature --help`.
+const SURFACES_ADD_FEATURE_EXAMPLES: &str = r#"Examples:
+  Enforce a policy on requests, by its policy definition id:
+    fabric agent-gateway surfaces add-feature "Sales Agent" policy \
+      --policy-id allow-sales
+
+  Limit inbound requests:
+    fabric agent-gateway surfaces add-feature <surface-id> rate-limit \
+      --json '{"requests":100,"window_secs":60}'
+
+  Add a trust check on the target leg:
+    fabric agent-gateway surfaces add-feature <surface-id> trust-check \
+      --edge ma-tp --file trust-check.json
+
+  Enforce a policy on one transit point's responses:
+    fabric agent-gateway surfaces add-feature <surface-id> policy \
+      --transit-point billing --response --policy-id allow-billing"#;
+
+/// Examples shown at the bottom of `surfaces remove-feature --help`.
+const SURFACES_REMOVE_FEATURE_EXAMPLES: &str = r#"Examples:
+  See where a surface has each feature and the flags to remove it:
+    fabric agent-gateway surfaces features "Sales Agent"
+
+  Remove a feature that is set in one place:
+    fabric agent-gateway surfaces remove-feature "Sales Agent" rate-limit
+
+  Remove the response policy:
+    fabric agent-gateway surfaces remove-feature <surface-id> policy --response
+
+  Remove tool gating from one transit point:
+    fabric agent-gateway surfaces remove-feature <surface-id> mcp-tool-gating \
+      --transit-point billing"#;
+
+/// Examples shown at the bottom of `surfaces add-transit-point --help`.
+const SURFACES_ADD_TRANSIT_POINT_EXAMPLES: &str = r#"Examples:
+  Add a transit point:
+    fabric agent-gateway surfaces add-transit-point "Sales Agent" \
+      --alias billing --endpoint http://billing:3000
+
+  Preview it without saving:
+    fabric agent-gateway surfaces add-transit-point <surface-id> \
+      --alias billing --endpoint http://billing:3000 --dry-run
+
+  Then enforce a policy on that transit point:
+    fabric agent-gateway surfaces add-feature <surface-id> policy \
+      --transit-point billing --policy-id allow-billing"#;
+
+/// Examples shown at the bottom of `surfaces remove-transit-point --help`.
+const SURFACES_REMOVE_TRANSIT_POINT_EXAMPLES: &str = r#"Examples:
+  Remove a transit point by its alias:
+    fabric agent-gateway surfaces remove-transit-point "Sales Agent" billing
+
+  Preview it without saving:
+    fabric agent-gateway surfaces remove-transit-point <surface-id> billing \
+      --dry-run"#;
 
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("gates_source").required(true).args(["surface_id", "gates_file"])))]
@@ -818,22 +1376,28 @@ struct ToolGatePreviewArgs {
 
 #[derive(Debug, Args)]
 struct SurfaceCreateArgs {
+    /// Surface name. Required unless --file is given.
     #[arg(long, required_unless_present = "file")]
     name: Option<String>,
+    /// What the surface is for.
     #[arg(long, default_value = "")]
     description: String,
     /// Complete AgentSurface JSON. Other creation flags are ignored when set.
     #[arg(short, long)]
     file: Option<PathBuf>,
+    /// Address the gateway listens on for this surface's inbound traffic.
     #[arg(long, default_value = "0.0.0.0:8080")]
     listen_address: String,
     /// Inbound route. Defaults to a URL-safe form of the name.
     #[arg(long)]
     route: Option<String>,
+    /// Protocol of the surface's inbound traffic.
     #[arg(long, value_enum, default_value_t = Protocol::A2a)]
     protocol: Protocol,
+    /// Endpoint of the agent or service the surface forwards requests to.
     #[arg(long, default_value = "http://127.0.0.1:3000")]
     target_endpoint: String,
+    /// Tags to attach, comma-separated or with the flag repeated.
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
 }
@@ -878,13 +1442,12 @@ impl From<EdgeOpt> for features::Edge {
 /// worked out from the feature name.
 #[derive(Debug, Args)]
 struct PlacementFlags {
-    /// Pipeline edge. Only needed when the command asks for it; it is worked
-    /// out from the feature otherwise. Use ma-tp for a place with no transit
-    /// point alias, such as the target leg of trust-check.
+    /// Pipeline edge, needed only when the command asks you to choose. Use
+    /// ma-tp for the target leg of trust-check.
     #[arg(long, value_enum, conflicts_with = "transit_point")]
     edge: Option<EdgeOpt>,
-    /// Put the feature on the transit point with this alias instead of on the
-    /// whole surface (implies the ma-tp edge).
+    /// Alias of the transit point whose place to use, instead of the
+    /// surface's own place (implies the ma-tp edge).
     #[arg(long)]
     transit_point: Option<String>,
     /// Use the response place instead of the request place, when the feature
@@ -901,7 +1464,8 @@ struct AddFeatureArgs {
     feature: String,
     #[command(flatten)]
     placement: PlacementFlags,
-    /// Shortcut for policy features: the policy definition id.
+    /// Shortcut for policy features: the policy definition id. Ignored when
+    /// --json or --file is given.
     #[arg(long)]
     policy_id: Option<String>,
     /// Feature configuration as inline JSON.
@@ -962,18 +1526,92 @@ struct FeaturePlacementArgs {
 #[derive(Debug, Subcommand)]
 enum AccessTokenCommand {
     /// List personal access tokens.
+    ///
+    /// STATUS is REVOKED for a token that has been revoked or has expired, and
+    /// ACTIVE otherwise. SCOPES is shortened to fit and ends with
+    /// "+N more" for the scopes left out; a token with no scope list holds its
+    /// creator's whole role and shows "full role". EXPIRES is "never" for a
+    /// token without an expiry. Use `tokens get` or --output json for the full
+    /// scope list.
     List,
     /// Get a personal access token by ID.
-    Get { id: String },
+    Get {
+        /// ID of the personal access token (see `fabric agent-gateway tokens
+        /// list`).
+        id: String,
+    },
     /// Create a personal access token using flags or a complete JSON document.
+    ///
+    /// Give at least one --scope (or a `scopes` list in --file), or --full-role
+    /// for your whole role. The token expires after 90 days unless you set
+    /// --expires-at, at most 3650 days ahead; it can't be made to never expire.
+    ///
+    /// The secret is shown only once. In table output it is printed alone on
+    /// standard output, so `PAT=$(...)` captures it; with --output json the
+    /// whole response is printed.
+    ///
+    /// See docs/AUTHENTICATION.md for details.
+    #[command(after_long_help = TOKENS_CREATE_EXAMPLES)]
     Create(AccessTokenCreateArgs),
     /// Revoke a personal access token.
+    ///
+    /// Takes the token's ID, not its name. There is no command to undo a
+    /// revoke, and if this CLI is logged in with the token, its saved
+    /// connection stops working too. You are asked to confirm, and only `y` or
+    /// `yes` revokes. Without a terminal the command refuses before sending
+    /// anything unless --yes is given.
+    #[command(after_long_help = TOKENS_REVOKE_EXAMPLES)]
     Revoke(AccessTokenRevokeArgs),
-    /// List the scopes you're allowed to grant a new token, based on your own role.
+    /// List the scopes your role holds, which you can give a new token.
+    ///
+    /// The list comes from your role only. When you are signed in with a
+    /// scoped personal access token, a new token can get only scopes that
+    /// token also holds.
     Scopes,
     /// Replace a personal access token's secret, keeping its ID, name, and scopes.
+    ///
+    /// The current secret stops working immediately, so update every script
+    /// that uses it; if this CLI is logged in with the token, log in again with
+    /// the new secret. The new secret is shown only once: in table output it is
+    /// printed alone on standard output, and the "Rotated access token" line
+    /// goes to standard error. You are asked to confirm; without a terminal the
+    /// command refuses unless --yes is given.
+    #[command(after_long_help = TOKENS_ROTATE_EXAMPLES)]
     Rotate(AccessTokenRotateArgs),
 }
+
+/// Examples shown at the bottom of `tokens create --help`.
+const TOKENS_CREATE_EXAMPLES: &str = r#"Examples:
+  Create a token for a CI job and capture its secret:
+    PAT=$(fabric agent-gateway tokens create --name ci-deploy \
+      --scope surfaces.view --scope surfaces.edit \
+      --expires-at 2027-01-01T00:00:00Z)
+
+  Limit a token to one tenant's surfaces:
+    fabric agent-gateway tokens create --name acme-surfaces \
+      --scope surfaces.view --required-header x-tenant-id=acme \
+      --resource-pattern 'TENANT:${x-tenant-id}:surfaces:.*'
+
+  Create a token from a JSON document on standard input:
+    echo '{"name": "ci-read", "scopes": ["surfaces.view"]}' | fabric \
+      agent-gateway tokens create --file -"#;
+
+/// Examples shown at the bottom of `tokens revoke --help`.
+const TOKENS_REVOKE_EXAMPLES: &str = r#"Examples:
+  Find the token's ID, then revoke it after confirming:
+    fabric agent-gateway tokens list
+    fabric agent-gateway tokens revoke <token-id>
+
+  Revoke without the prompt, for scripts:
+    fabric agent-gateway tokens revoke <token-id> --yes"#;
+
+/// Examples shown at the bottom of `tokens rotate --help`.
+const TOKENS_ROTATE_EXAMPLES: &str = r#"Examples:
+  Rotate a token after confirming:
+    fabric agent-gateway tokens rotate <token-id>
+
+  Rotate from a script and capture the new secret:
+    PAT=$(fabric agent-gateway tokens rotate <token-id> --yes)"#;
 
 #[derive(Debug, Args)]
 struct AccessTokenRevokeArgs {
@@ -995,8 +1633,10 @@ struct AccessTokenRotateArgs {
 
 #[derive(Debug, Args)]
 struct AccessTokenCreateArgs {
+    /// Token name. Required unless --file is given.
     #[arg(long, required_unless_present = "file")]
     name: Option<String>,
+    /// What the token is for.
     #[arg(long, default_value = "")]
     description: String,
     /// Scope to grant the token. Repeat for multiple scopes. Required unless
@@ -1008,8 +1648,8 @@ struct AccessTokenCreateArgs {
     /// scopes. Use it only when a limited token will not do.
     #[arg(long, conflicts_with = "scopes")]
     full_role: bool,
-    /// RFC 3339 expiry timestamp, for example 2027-01-01T00:00:00Z. Omit it
-    /// and the token expires 90 days from now.
+    /// RFC 3339 expiry timestamp, for example 2027-01-01T00:00:00Z. Defaults
+    /// to 90 days from now.
     #[arg(long)]
     expires_at: Option<String>,
     /// Resource the token is limited to, as
@@ -1017,13 +1657,14 @@ struct AccessTokenCreateArgs {
     /// one of the --required-header flags. Omit for an appliance-wide token.
     #[arg(long)]
     resource_pattern: Option<String>,
-    /// Header the caller must send, as name=pattern (pattern is a regex the
-    /// header value must match). Repeat for multiple required headers.
+    /// Header the caller must send, as name=pattern, where pattern is a regex
+    /// the whole header value must match. Repeat for more headers. The header
+    /// named in --resource-pattern must normally be one exact value, such as
+    /// acme.
     #[arg(long = "required-header", value_parser = parse_required_header)]
     required_headers: Vec<(String, String)>,
-    /// Complete CreateAccessTokenRequest JSON. Other creation flags except
-    /// --full-role are ignored when set. It still needs scopes (or
-    /// --full-role) and gets the 90 day expiry when it has none.
+    /// JSON request body, or - for standard input. Other creation flags except
+    /// --full-role are ignored when set.
     #[arg(short, long)]
     file: Option<PathBuf>,
 }
@@ -1048,37 +1689,91 @@ fn parse_required_header(raw: &str) -> Result<(String, String), String> {
 
 #[derive(Debug, Subcommand)]
 enum PolicyCommand {
+    /// List policy definitions.
     List,
+    /// Get a policy definition by ID.
     Get {
+        /// Policy definition ID (see `fabric agent-gateway policies list`).
         policy_id: String,
     },
+    /// Create a policy definition from a Rego file.
+    ///
+    /// The file holds Rego source, not JSON, and must declare
+    /// `package surface.policy` (or `package gateway.policy` with
+    /// --policy-type gateway); any other package is refused. The new policy is
+    /// enabled as soon as it is created. To enforce it on an Agent Surface,
+    /// use `fabric agent-gateway surfaces add-feature <surface> policy
+    /// --policy-id <id>`.
+    #[command(after_long_help = POLICY_CREATE_EXAMPLES)]
     Create {
+        /// ID for the new policy definition, used to refer to it from surfaces
+        /// and other commands.
         #[arg(long)]
         id: String,
+        /// Human-readable name.
         #[arg(long)]
         name: String,
+        /// What the policy is for.
         #[arg(long, default_value = "")]
         description: String,
+        /// Whether the policy is for an Agent Surface or for the gateway as a
+        /// whole. It cannot be changed after creation.
         #[arg(long, value_enum, default_value_t = PolicyType::AgentSurface)]
         policy_type: PolicyType,
+        /// File holding the policy's Rego source.
         #[arg(long)]
         policy_file: PathBuf,
     },
+    /// Replace a policy definition from a JSON document.
+    ///
+    /// The document replaces the stored definition. Its `id` must match
+    /// POLICY_ID and its `policy_type` cannot change. Start from the output of
+    /// `fabric agent-gateway policies get <policy-id> --output json`, where the
+    /// Rego source is the `policy` field, as a string.
     Update {
+        /// Policy definition ID.
         policy_id: String,
+        /// Complete policy definition JSON. Use '-' to read from standard
+        /// input.
         #[arg(short, long)]
         file: PathBuf,
     },
+    /// Delete a policy definition.
+    ///
+    /// The definition is deleted as soon as the command runs. There is no
+    /// confirmation prompt, and the gateway does not check whether surfaces or
+    /// gateways still use it. To see how many do, run `fabric agent-gateway
+    /// policies impact <policy-id>` first.
     Delete {
+        /// Policy definition ID.
         policy_id: String,
     },
+    /// List the saved versions of a policy definition.
+    ///
+    /// Newest first, each with its number, content hash, time, author and
+    /// note.
     Versions {
+        /// Policy definition ID.
         policy_id: String,
     },
+    /// Show how many surfaces and gateways use a policy definition.
+    ///
+    /// The report also says whether the policy is enforced appliance-wide.
     Impact {
+        /// Policy definition ID.
         policy_id: String,
     },
 }
+
+/// Examples shown at the bottom of `policies create --help`.
+const POLICY_CREATE_EXAMPLES: &str = r#"Examples:
+  Create a policy for Agent Surfaces from a Rego file:
+    fabric agent-gateway policies create --id allow-sales --name "Allow sales" \
+      --policy-file allow-sales.rego
+
+  Enforce it on a surface:
+    fabric agent-gateway surfaces add-feature "Sales Agent" policy \
+      --policy-id allow-sales"#;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PolicyType {
@@ -1088,14 +1783,15 @@ enum PolicyType {
 
 #[derive(Debug, Args)]
 struct ApiArgs {
+    /// HTTP method.
     #[arg(value_enum)]
     method: ApiMethod,
     /// API path such as /v1/limits.
     path: String,
-    /// Inline JSON request body. Required for `patch`, which is sent as a JSON Merge Patch.
+    /// Inline JSON request body.
     #[arg(long, conflicts_with = "file")]
     data: Option<String>,
-    /// JSON request body file. Use '-' for standard input. Required for `patch`, which is sent as a JSON Merge Patch.
+    /// JSON request body file. Use '-' for standard input.
     #[arg(short, long)]
     file: Option<PathBuf>,
 }
@@ -6099,6 +6795,128 @@ mod gateway_config_tests {
     }
 
     #[test]
+    fn every_shared_crud_group_names_its_own_resource() {
+        use clap::CommandFactory;
+        let groups = [
+            ("connections", "connections"),
+            ("connection-points", "connection points"),
+            ("issuers", "issuers"),
+            ("authorities", "authorities"),
+            ("trust-registries", "trust registries"),
+            ("mediators", "mediators"),
+            ("mcp-proxies", "MCP proxies"),
+            ("a2a-proxies", "A2A proxies"),
+            ("sts-clients", "STS clients"),
+            ("credential-providers", "credential providers"),
+            ("integrations", "integrations"),
+            ("jwt-verification-strategies", "JWT verification strategies"),
+        ];
+        let mut cli = Cli::command();
+        cli.build();
+        let gateway = cli
+            .find_subcommand("agent-gateway")
+            .expect("agent-gateway");
+        for (group, many) in groups {
+            let command = gateway
+                .find_subcommand(group)
+                .unwrap_or_else(|| panic!("group {group}"));
+            for name in ["list", "get", "create", "update", "delete"] {
+                let about = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("{group} {name}"))
+                    .get_about()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                assert!(!about.contains("entit"), "{group} {name} kept the generic help: {about}");
+            }
+            let list = command
+                .find_subcommand("list")
+                .and_then(clap::Command::get_about)
+                .map(ToString::to_string);
+            assert_eq!(list.as_deref(), Some(format!("List {many}").as_str()), "{group}");
+        }
+    }
+
+    #[test]
+    fn every_example_command_in_the_help_parses() {
+        use clap::CommandFactory;
+        fn help_texts(
+            command: &clap::Command,
+            path: &str,
+            texts: &mut Vec<(String, String)>,
+        ) {
+            let path = format!("{path} {}", command.get_name());
+            for text in [command.get_after_long_help(), command.get_long_about()]
+                .into_iter()
+                .flatten()
+            {
+                texts.push((path.clone(), text.to_string()));
+            }
+            for subcommand in command.get_subcommands() {
+                help_texts(subcommand, &path, texts);
+            }
+        }
+        let mut cli = Cli::command();
+        cli.build();
+        let mut texts = Vec::new();
+        help_texts(&cli, "", &mut texts);
+
+        let mut checked = 0;
+        for (path, text) in texts {
+            let mut lines: Vec<String> = Vec::new();
+            for line in text.lines() {
+                match lines.last_mut() {
+                    Some(last) if last.ends_with('\\') => {
+                        last.pop();
+                        last.push(' ');
+                        last.push_str(line.trim());
+                    }
+                    _ => lines.push(line.to_owned()),
+                }
+            }
+            for line in lines
+                .iter()
+                .filter(|line| line.starts_with("  "))
+            {
+                let Some(start) = line.find("fabric agent-gateway") else {
+                    continue;
+                };
+                let mut example = &line[start..];
+                if line[..start].ends_with('`') {
+                    example = example
+                        .split('`')
+                        .next()
+                        .unwrap_or(example);
+                }
+                // A line of an interactive shell session shows the prompt; what
+                // follows it is an Agent Gateway command typed without the prefix.
+                let shell_line;
+                if let Some(typed) = example.strip_prefix("fabric agent-gateway>") {
+                    if matches!(typed.trim(), "" | "exit" | "quit") {
+                        continue;
+                    }
+                    shell_line = format!("fabric agent-gateway {}", typed.trim());
+                    example = &shell_line;
+                }
+                let words: Vec<String> = shell_words::split(example)
+                    .unwrap_or_else(|error| panic!("{path}: cannot split `{example}`: {error}"))
+                    .into_iter()
+                    .take_while(|word| !matches!(word.as_str(), "|" | ">" | ">>" | "<"))
+                    .map(|word| {
+                        word.trim_end_matches(')')
+                            .to_owned()
+                    })
+                    .collect();
+                if let Err(error) = Cli::try_parse_from(&words) {
+                    panic!("{path}: example does not parse: {example}\n{error}");
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 50, "only {checked} examples were found");
+    }
+
+    #[test]
     fn tool_gate_preview_takes_repeatable_conditions() {
         let Command::Surfaces {
             command: SurfaceCommand::ToolGatePreview(args),
@@ -7049,29 +7867,88 @@ enum SecretCommand {
         #[arg(long)]
         tag: Option<String>,
     },
-    /// Get a secret by its id, secret_id or name, including its value.
+    /// Get a secret by its id, secret_id or name. The value is masked unless
+    /// --reveal is given.
     Get {
         /// The secret's id, secret_id or name. A secret_id or name matching more
         /// than one secret is refused; pass the id instead.
         secret: String,
     },
     /// Create a secret using flags or a complete JSON document.
+    ///
+    /// With no --file, give --name, --secret-id and a value through --value
+    /// or --value-stdin. Prefer --value-stdin: a value typed after --value
+    /// stays in shell history and shows in the process list.
+    ///
+    /// The secret_id must be unique and cannot be changed later. Other
+    /// configuration refers to the secret as $SECRET:<secret-id>.
+    #[command(after_long_help = SECRETS_CREATE_EXAMPLES)]
     Create(SecretCreateArgs),
     /// Update a secret from a JSON document.
+    ///
+    /// Fields the document leaves out keep their stored values, except
+    /// description, which is always replaced: leave it out and the stored
+    /// description is cleared, so restate it. The secret_id cannot be changed;
+    /// the gateway ignores it in the document.
+    ///
+    /// To change the value, set "update_value": true beside "value". The
+    /// gateway ignores "value" without it and still reports success, so the
+    /// CLI refuses a document that has "value" but no "update_value" key.
+    #[command(after_long_help = SECRETS_UPDATE_EXAMPLES)]
     Update {
         /// The secret's id, secret_id or name. A secret_id or name matching more
         /// than one secret is refused; pass the id instead.
         secret: String,
+        /// JSON document with the fields to change: name, description,
+        /// secret_type, tags, and value with update_value. Use '-' to read from
+        /// standard input.
         #[arg(short, long)]
         file: PathBuf,
     },
     /// Delete a secret by its id, secret_id or name.
+    ///
+    /// The secret is deleted immediately: there is no confirmation prompt and
+    /// no --yes flag. Check which secret a secret_id or name matches with
+    /// `fabric agent-gateway secrets get` first.
+    #[command(after_long_help = SECRETS_DELETE_EXAMPLES)]
     Delete {
         /// The secret's id, secret_id or name. A secret_id or name matching more
         /// than one secret is refused; pass the id instead.
         secret: String,
     },
 }
+
+/// Examples shown at the bottom of `secrets create --help`.
+const SECRETS_CREATE_EXAMPLES: &str = r#"Examples:
+  Read the value from a file, keeping it out of shell history:
+    fabric agent-gateway secrets create --name "Stripe live" \
+      --secret-id stripe-live --value-stdin < key.txt
+
+  Pipe the value in from an environment variable, with a description, type and
+  tags:
+    printf '%s' "$STRIPE_KEY" | fabric agent-gateway secrets create \
+      --name "Stripe live" --secret-id stripe-live --value-stdin \
+      --description "Billing API key" --type ApiKey --tag billing --tag stripe
+
+  Create from a complete JSON document:
+    fabric agent-gateway secrets create --file secret.json"#;
+
+/// Examples shown at the bottom of `secrets update --help`.
+const SECRETS_UPDATE_EXAMPLES: &str = r#"Examples:
+  Replace the value, restating the description so it is kept:
+    printf \
+      '{"value":"%s","update_value":true,"description":"Billing API key"}' \
+      "$NEW_KEY" | fabric agent-gateway secrets update stripe-live --file -
+
+  Change the tags and keep the value, restating the description:
+    echo '{"tags":["billing","prod"],"description":"Billing API key"}' | \
+      fabric agent-gateway secrets update stripe-live --file -"#;
+
+/// Examples shown at the bottom of `secrets delete --help`.
+const SECRETS_DELETE_EXAMPLES: &str = r#"Examples:
+  Check which secret a name matches, then delete it:
+    fabric agent-gateway secrets get "Stripe live"
+    fabric agent-gateway secrets delete "Stripe live""#;
 
 #[derive(Debug, Args)]
 struct SecretCreateArgs {
@@ -7081,24 +7958,27 @@ struct SecretCreateArgs {
     /// Machine-readable identifier used by $SECRET:<secret-id> references.
     #[arg(long, required_unless_present = "file")]
     secret_id: Option<String>,
-    /// Secret value, stored exactly as given including any whitespace.
+    /// Secret value, stored exactly as given including any whitespace. It
+    /// stays in shell history; prefer --value-stdin.
     #[arg(long, conflicts_with = "value_stdin")]
     value: Option<String>,
-    /// Read the secret value from standard input.
+    /// Read the secret value from standard input. One trailing line ending
+    /// is removed; use --file when a final newline matters, as in a PEM block.
     #[arg(long)]
     value_stdin: bool,
     /// What the secret is for.
     #[arg(long)]
     description: Option<String>,
     /// Secret type, as configured on the gateway. Omit for the gateway
-    /// default.
+    /// default, General.
     #[arg(long = "type")]
     secret_type: Option<String>,
     /// Tag to attach. Repeat for multiple tags.
     #[arg(long = "tag")]
     tags: Vec<String>,
-    /// Complete CreateSecretRequest JSON. Use '-' to read from standard
-    /// input. Other creation flags are ignored when set.
+    /// Complete JSON document with name, secret_id, value, description,
+    /// secret_type and tags. Use '-' to read from standard input. Other
+    /// creation flags are ignored when set.
     #[arg(short, long)]
     file: Option<PathBuf>,
 }
@@ -7108,13 +7988,52 @@ enum DelegationVaultCommand {
     /// List delegated credential grants.
     List,
     /// Get a grant by ID.
-    Get { id: String },
+    Get {
+        /// Grant ID, from the ID column of `fabric agent-gateway
+        /// delegation-vault list`.
+        id: String,
+    },
     /// Revoke a single grant by ID.
-    Revoke { id: String },
+    ///
+    /// The grant is revoked immediately: there is no confirmation prompt and
+    /// no --yes flag, and it cannot be undone. To revoke every grant a user
+    /// holds, use `revoke-user`. Revoking needs the delegation_vault.delete
+    /// permission (administrators by default) through a session or an
+    /// appliance-wide personal access token, not one created with
+    /// --resource-pattern.
+    #[command(after_long_help = DELEGATION_VAULT_REVOKE_EXAMPLES)]
+    Revoke {
+        /// Grant ID, from the ID column of `fabric agent-gateway
+        /// delegation-vault list`.
+        id: String,
+    },
     /// Revoke every grant held for one user identity hash (sha256:...).
+    ///
+    /// Revokes all of that user's grants at once, immediately and with no
+    /// confirmation prompt; it cannot be undone. Table output reports how many
+    /// grants were revoked; `--output json` prints {"revoked": N}.
     #[command(name = "revoke-user")]
-    RevokeUser { user_hash: String },
+    #[command(after_long_help = DELEGATION_VAULT_REVOKE_USER_EXAMPLES)]
+    RevokeUser {
+        /// The user's identity hash, as sha256:<hex>, from the
+        /// user_identity_hash field of `delegation-vault list --output json`.
+        user_hash: String,
+    },
 }
+
+/// Examples shown at the bottom of `delegation-vault revoke --help`.
+const DELEGATION_VAULT_REVOKE_EXAMPLES: &str = r#"Examples:
+  Find the grant's ID, then revoke it:
+    fabric agent-gateway delegation-vault list
+    fabric agent-gateway delegation-vault revoke <grant-id>"#;
+
+/// Examples shown at the bottom of `delegation-vault revoke-user --help`.
+const DELEGATION_VAULT_REVOKE_USER_EXAMPLES: &str = r#"Examples:
+  Show each grant's ID, agent and user hash, then revoke every grant one user
+  holds:
+    fabric agent-gateway delegation-vault list --output json | jq \
+      -r '.[] | [.id, .agent_did, .user_identity_hash] | @tsv'
+    fabric agent-gateway delegation-vault revoke-user sha256:<hex>"#;
 
 const CERTIFICATES_PATH: &str = "/v1/certificates";
 const SECRETS_PATH: &str = "/v1/secrets";
@@ -7178,6 +8097,79 @@ fn certificate_reference_help(about: &'static str) -> impl FnOnce(clap::Command)
                     .help("The certificate's id or name. A name shared by several certificates is refused; pass the id instead")
             })
     }
+}
+
+/// Rewrites the generic "entity" help of the shared `CrudCommand`
+/// subcommands with one command group's names, as
+/// [`certificate_reference_help`] does for certificates. `a_one` is the
+/// resource with its article, such as "an issuer", and `many` its plural.
+/// The help only: the commands send the same requests for every group.
+/// `update` says what the group's gateway route does with fields the
+/// document leaves out, which differs between resources.
+fn crud_help(
+    group: &'static str,
+    a_one: &'static str,
+    many: &'static str,
+    update: CrudUpdate,
+) -> impl FnMut(clap::Command) -> clap::Command {
+    let one = a_one
+        .split_once(' ')
+        .map_or(a_one, |(_, noun)| noun);
+    move |subcommand| {
+        let name = subcommand
+            .get_name()
+            .to_owned();
+        match name.as_str() {
+            "list" => subcommand.about(format!("List {many}")),
+            "get" => subcommand.about(format!("Get {a_one} by ID")).long_about(format!(
+                "Get {a_one} by ID.\n\n\
+                 The ID is the ID column of `fabric agent-gateway {group} list`. It is sent as given: a name is not looked up."
+            )),
+            "create" => subcommand
+                .about(format!("Create {a_one} from a JSON document"))
+                .long_about(format!(
+                    "Create {a_one} from a JSON document.\n\n\
+                     `fabric agent-gateway {group} get <ID> --output json` prints an existing {one}, which shows the fields the gateway stores. Use `--file -` to read the document from standard input."
+                )),
+            "update" => {
+                let behaviour = match update {
+                    CrudUpdate::Replaces => format!(
+                        "The document is sent as an HTTP PUT and replaces the whole {one}: a field it leaves out is cleared. Start from the current {one}:\n\n"
+                    ),
+                    CrudUpdate::ChangesSentFields => format!(
+                        "The document is sent as an HTTP PUT. The gateway changes only the fields it sets and keeps the rest. To see the current fields, start from the current {one}:\n\n"
+                    ),
+                    CrudUpdate::Custom(text) => {
+                        return subcommand.about(format!("Update {a_one} from a JSON document")).long_about(text);
+                    }
+                };
+                subcommand.about(format!("Update {a_one} from a JSON document")).long_about(format!(
+                    "Update {a_one} from a JSON document.\n\n\
+                     {behaviour}  \
+                     fabric agent-gateway {group} get <ID> \\\n    --output json > record.json\n  \
+                     fabric agent-gateway {group} update <ID> \\\n    --file record.json\n\n\
+                     Use `--file -` to read the document from standard input."
+                ))
+            }
+            "delete" => subcommand.about(format!("Delete {a_one} by ID")).long_about(format!(
+                "Delete {a_one} by ID.\n\n\
+                 The request is sent as soon as the command runs: there is no confirmation prompt and no --yes flag. The ID is sent as given: a name is not looked up."
+            )),
+            _ => subcommand,
+        }
+    }
+}
+
+/// What a shared-CRUD group's gateway route does with fields an `update`
+/// document leaves out, for [`crud_help`].
+#[derive(Clone, Copy)]
+enum CrudUpdate {
+    /// The record is replaced whole, so an omitted field is cleared.
+    Replaces,
+    /// Only the fields sent change; the rest are kept.
+    ChangesSentFields,
+    /// The group needs its own `update` long help.
+    Custom(&'static str),
 }
 
 /// Runs the certificates commands through the shared CRUD flow, except
@@ -9353,14 +10345,22 @@ enum UserCommand {
     List,
     /// Get a user by ID.
     ///
-    /// The ID is the user's UUID as shown by `list`, not the username.
     /// `integrations` is a reserved sibling route and returns the
     /// integration assignments rather than a user.
-    Get { user_id: String },
+    Get {
+        /// User's UUID, as `list` prints it, not the username.
+        user_id: String,
+    },
     /// Update a user's role, status, or profile from a JSON document.
     ///
-    /// Fields the document omits keep their current values.
+    /// Fields the document omits keep their current values. `role` is
+    /// `administrator`, `poweruser` or `user`, and `status` is `new`,
+    /// `approved` or `disabled`. Changing a user's role, or moving them out of
+    /// `approved`, ends their active sessions. The ID `integrations` is
+    /// refused: it is a reserved route, not a user.
+    #[command(after_long_help = USERS_UPDATE_EXAMPLES)]
     Update {
+        /// User's UUID, as `list` prints it.
         user_id: String,
         /// JSON document carrying any of `role`, `status`, `first_name`,
         /// `last_name`, `email`, `department`, `job_title`.
@@ -9368,8 +10368,30 @@ enum UserCommand {
         file: PathBuf,
     },
     /// Delete a user by ID.
-    Delete { user_id: String },
+    ///
+    /// The user is removed permanently and their active sessions end. It runs
+    /// at once, with no confirmation prompt. The gateway refuses to delete an
+    /// administrator or your own account.
+    Delete {
+        /// User's UUID, as `list` prints it, not the username.
+        user_id: String,
+    },
 }
+
+/// Examples shown at the bottom of `users update --help`.
+const USERS_UPDATE_EXAMPLES: &str = r#"Examples:
+  Approve a new user:
+    echo '{"status": "approved"}' | fabric agent-gateway users update \
+      <user-id> --file -
+
+  Make a user a power user and set their job title:
+    fabric agent-gateway users update <user-id> --file user.json
+  where user.json is:
+    {"role": "poweruser", "job_title": "Platform engineer"}
+
+  Disable a user, which also ends their sessions:
+    echo '{"status": "disabled"}' | fabric agent-gateway users update \
+      <user-id> --file -"#;
 
 #[derive(Debug, Subcommand)]
 enum IdentityCommand {
@@ -9377,16 +10399,21 @@ enum IdentityCommand {
     List,
     /// Get an identity by ID.
     ///
-    /// The ID is the identity's UUID as shown by `list`, not its DID.
     /// `integrations` is a reserved sibling route and returns the
     /// integration assignments rather than an identity.
     Get {
+        /// Identity's UUID, as `list` prints it, not its DID.
         id: String,
         /// Include the key pair, which carries the identity's private key.
         #[arg(long)]
         reveal: bool,
     },
     /// Create an identity, optionally from a JSON document.
+    ///
+    /// Without --file the gateway generates an Ed25519 key pair and uses a DID
+    /// path of `agents/<uuid>`. To bring your own keys, put them under
+    /// `key_pair` as JWKs, not PEM.
+    #[command(after_long_help = IDENTITIES_CREATE_EXAMPLES)]
     Create {
         /// JSON document `{did_path?, metadata?, key_pair?}`. Every field is
         /// optional; the gateway fills in whatever the document omits. A key
@@ -9396,26 +10423,44 @@ enum IdentityCommand {
         file: Option<PathBuf>,
     },
     /// Update an identity's DID document from a JSON document.
+    ///
+    /// A deactivated identity cannot be updated.
+    #[command(after_long_help = IDENTITIES_UPDATE_EXAMPLES)]
     Update {
         id: String,
-        /// JSON document `{did_document, update_keys?, ttl?}`. A bare DID
-        /// document is rejected: it belongs under `did_document`.
+        /// JSON document `{did_document, update_keys?, ttl?}`. The gateway
+        /// rejects a bare DID document with a 422: it belongs under
+        /// `did_document`.
         #[arg(short, long)]
         file: PathBuf,
     },
     /// Rotate an identity's signing keys.
     ///
-    /// Without --file the gateway generates the replacement key pair.
-    #[command(name = "rotate-keys")]
+    /// The new key takes over at once, with no confirmation prompt, and the
+    /// response carries its public key as `new_public_key`. Without --file the
+    /// gateway generates the new key pair. A deactivated identity cannot be
+    /// rotated.
+    #[command(name = "rotate-keys", after_long_help = IDENTITIES_ROTATE_KEYS_EXAMPLES)]
     RotateKeys {
         id: String,
         /// JSON document `{"new_key_pair": {public_key, private_key,
-        /// key_type?}}`. An unwrapped key pair is rejected, because the
-        /// gateway would ignore it and install one of its own.
+        /// key_type?}}`, both keys JWKs, not PEM. A document without
+        /// `new_key_pair` is rejected, because the gateway would ignore it and
+        /// install a key pair of its own.
         #[arg(short, long)]
         file: Option<PathBuf>,
     },
     /// Transfer an identity to a new controller.
+    ///
+    /// The transfer takes effect at once, with no confirmation prompt.
+    /// `new_controller` must be a DID. `current_owner_authorization` proves
+    /// control of the identity's current signing key: a compact JWS (alg
+    /// EdDSA, with a `kid` naming a verification method of this DID) whose
+    /// payload carries a fresh `iat` and the challenge
+    /// `transfer-ownership:<did>:<version-id>:<new-controller>`, where
+    /// <version-id> is the identity's latest `version_id` (see `history`). A
+    /// deactivated identity cannot be transferred.
+    #[command(after_long_help = IDENTITIES_TRANSFER_EXAMPLES)]
     Transfer {
         id: String,
         /// JSON document `{new_controller, current_owner_authorization,
@@ -9425,8 +10470,7 @@ enum IdentityCommand {
     },
     /// Show an identity's version history.
     History { id: String },
-    /// Read or write an identity's trust-score policy (minimum trust score
-    /// and component weights).
+    /// Read or write an identity's trust-score policy.
     ///
     /// The gateway stores this policy and returns it, but does not enforce it
     /// on requests. Unrelated to `fabric agent-gateway policies`, which manages the Rego
@@ -9438,9 +10482,68 @@ enum IdentityCommand {
     },
     /// Deactivate an identity.
     ///
-    /// The record is kept and stays readable; only its active flag is cleared.
+    /// This is the identity's delete route, and it runs at once with no
+    /// confirmation prompt. The gateway appends a deactivation entry to the DID
+    /// log and clears the identity's active flag. The record is kept and stays
+    /// readable, but a deactivated identity cannot be updated, rotated,
+    /// transferred or deactivated again.
     Deactivate { id: String },
 }
+
+/// Examples shown at the bottom of `identities create --help`.
+const IDENTITIES_CREATE_EXAMPLES: &str = r#"Examples:
+  Let the gateway generate the keys:
+    fabric agent-gateway identities create
+
+  Choose the DID path and bring your own Ed25519 key pair:
+    fabric agent-gateway identities create --file identity.json
+  where identity.json is:
+    {
+      "did_path": "agents/billing",
+      "key_pair": {
+        "public_key":  {"kty": "OKP", "crv": "Ed25519", "x": "<base64url>"},
+        "private_key": {"kty": "OKP", "crv": "Ed25519",
+                        "x": "<base64url>", "d": "<base64url>"},
+        "key_type": "Ed25519"
+      }
+    }"#;
+
+/// Examples shown at the bottom of `identities update --help`.
+const IDENTITIES_UPDATE_EXAMPLES: &str = r#"Examples:
+  Replace the DID document:
+    fabric agent-gateway identities update <id> --file identity-update.json
+  where identity-update.json wraps the complete new DID document:
+    {"did_document": {"id": "did:webvh:...", "verificationMethod": [...]}}"#;
+
+/// Examples shown at the bottom of `identities rotate-keys --help`.
+const IDENTITIES_ROTATE_KEYS_EXAMPLES: &str = r#"Examples:
+  Let the gateway generate the new key pair:
+    fabric agent-gateway identities rotate-keys <id>
+
+  Supply your own Ed25519 key pair:
+    fabric agent-gateway identities rotate-keys <id> --file rotate-keys.json
+  where rotate-keys.json is:
+    {
+      "new_key_pair": {
+        "public_key":  {"kty": "OKP", "crv": "Ed25519", "x": "<base64url>"},
+        "private_key": {"kty": "OKP", "crv": "Ed25519",
+                        "x": "<base64url>", "d": "<base64url>"}
+      }
+    }"#;
+
+/// Examples shown at the bottom of `identities transfer --help`.
+const IDENTITIES_TRANSFER_EXAMPLES: &str = r#"Examples:
+  Find the latest version_id to sign into the challenge:
+    fabric agent-gateway identities history <id> --output json
+
+  Transfer the identity:
+    fabric agent-gateway identities transfer <id> --file transfer.json
+  where transfer.json is:
+    {
+      "new_controller": "did:web:partner.example.com",
+      "current_owner_authorization": "<compact JWS>",
+      "transfer_reason": "Handed over to partner"
+    }"#;
 
 #[derive(Debug, Subcommand)]
 enum TrustPolicyCommand {
@@ -9450,21 +10553,35 @@ enum TrustPolicyCommand {
     /// never had a policy set, so a result does not prove one was configured.
     Get { id: String },
     /// Set an identity's trust-score policy from a JSON document.
+    ///
+    /// Send the document `trust-policy get <id> --output json` returns, edited:
+    /// the policy under `config`, holding `minTrustScore` (0.0 to 1.0) and,
+    /// for each of five components, a threshold, a weight and whether it is
+    /// required. The stored policy is replaced as a whole.
+    #[command(after_long_help = IDENTITIES_TRUST_POLICY_SET_EXAMPLES)]
     Set {
         id: String,
-        /// JSON document `{"config": {...}}`, wrapping the policy that
-        /// `trust-policy get` returns under `config`. A bare policy is
-        /// rejected.
+        /// JSON document `{"config": {...}}`. A bare policy, without the
+        /// `config` wrapper, is rejected before anything is sent.
         #[arg(short, long)]
         file: PathBuf,
     },
 }
 
+/// Examples shown at the bottom of `identities trust-policy set --help`.
+const IDENTITIES_TRUST_POLICY_SET_EXAMPLES: &str = r#"Examples:
+  Save the current policy, edit it, and send it back:
+    fabric agent-gateway identities trust-policy get <id> --output json > \
+      trust-policy.json
+    fabric agent-gateway identities trust-policy set <id> \
+      --file trust-policy.json"#;
+
 #[derive(Debug, Subcommand)]
 enum ApiKeyCommand {
     /// List API keys across every Agent Surface, or for one of them.
     List {
-        /// Agent Surface to list keys for. Omit to list every key.
+        /// ID of the Agent Surface to list keys for; a surface name is not
+        /// accepted. Omit to list every key.
         #[arg(long)]
         agent_id: Option<String>,
     },
@@ -9477,28 +10594,48 @@ enum ApiKeyCommand {
     },
     /// Create an API key for an Agent Surface.
     ///
-    /// A key cannot be edited afterwards: replace it with `rotate`.
+    /// The key's secret is printed once and never again: the gateway keeps
+    /// only its hash. In table mode the secret goes alone to standard output,
+    /// so `$(...)` captures just the secret, and the confirmation goes to
+    /// standard error. `--output json` prints the whole response, secret
+    /// included.
+    ///
+    /// A key cannot be edited afterwards: to change its client_id or labels,
+    /// create a new key and revoke or delete the old one.
+    #[command(after_long_help = API_KEYS_CREATE_EXAMPLES)]
     Create(ApiKeyCreateArgs),
     /// Revoke an API key without removing its record.
+    ///
+    /// The gateway stops accepting the key, and `list` keeps showing it with a
+    /// revoked status. A revoked key cannot be rotated; create a new key
+    /// instead. The command asks for confirmation first unless you pass --yes.
+    #[command(after_long_help = API_KEYS_REVOKE_EXAMPLES)]
     Revoke {
         /// Key's own id, as `list` prints it.
         key_id: String,
         #[command(flatten)]
         surface: ApiKeySurfaceArgs,
-        /// Actor recorded in the audit trail.
+        /// Name the gateway logs as having revoked the key.
         #[arg(long, default_value = "api")]
         actor: String,
         /// Skip the confirmation prompt. Required when running non-interactively.
         #[arg(short, long)]
         yes: bool,
     },
-    /// Rotate an API key: revoke the current secret and issue a new one.
+    /// Replace an API key's secret, keeping its id, client_id and labels.
+    ///
+    /// The current secret stops working immediately. The new secret is printed
+    /// once, the same way `create` prints it: alone on standard output in table
+    /// mode. A revoked key cannot be rotated. The command asks for confirmation
+    /// first unless you pass --yes.
+    #[command(after_long_help = API_KEYS_ROTATE_EXAMPLES)]
     Rotate {
         /// Key's own id, as `list` prints it.
         key_id: String,
         #[command(flatten)]
         surface: ApiKeySurfaceArgs,
-        /// Actor recorded in the audit trail.
+        /// Name the gateway logs for the rotation and stores as the key's
+        /// `issuer.actor`.
         #[arg(long, default_value = "api")]
         actor: String,
         /// Skip the confirmation prompt. Required when running non-interactively.
@@ -9506,6 +10643,12 @@ enum ApiKeyCommand {
         yes: bool,
     },
     /// Delete an API key.
+    ///
+    /// The key and its record are removed, so unlike `revoke` it no longer
+    /// shows in `list`. The command asks for confirmation first unless you pass
+    /// --yes. Pass --agent-id to skip looking up the key's surface, for example
+    /// when your token can delete keys but not list them.
+    #[command(after_long_help = API_KEYS_DELETE_EXAMPLES)]
     Delete {
         /// Key's own id, as `list` prints it.
         key_id: String,
@@ -9522,14 +10665,16 @@ enum ApiKeyCommand {
 /// looks the surface up first.
 #[derive(Debug, Args)]
 struct ApiKeySurfaceArgs {
-    /// Agent Surface the key belongs to. Omit to look it up by key id.
+    /// ID of the Agent Surface the key belongs to; a surface name is not
+    /// accepted. Omit to look it up by key id.
     #[arg(long)]
     agent_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct ApiKeyCreateArgs {
-    /// Agent Surface the key belongs to.
+    /// ID of the Agent Surface the key belongs to; a surface name is not
+    /// accepted (see `fabric agent-gateway surfaces list`).
     agent_id: String,
     /// External client identifier the key is issued to.
     #[arg(long, required_unless_present = "file")]
@@ -9543,22 +10688,74 @@ struct ApiKeyCreateArgs {
     file: Option<PathBuf>,
 }
 
+/// Examples shown at the bottom of `api-keys create --help`.
+const API_KEYS_CREATE_EXAMPLES: &str = r#"Examples:
+  Create a key and keep its secret in a shell variable:
+    KEY=$(fabric agent-gateway api-keys create <surface-id> \
+      --client-id billing --label team=ops)
+
+  Create a key from a document:
+    fabric agent-gateway api-keys create <surface-id> --file api-key.json
+  where api-key.json is:
+    {"client_id": "billing", "labels": {"team": "ops"}}"#;
+
+/// Examples shown at the bottom of `api-keys revoke --help`.
+const API_KEYS_REVOKE_EXAMPLES: &str = r#"Examples:
+  Revoke a key, confirming at the prompt:
+    fabric agent-gateway api-keys revoke <key-id>
+
+  Revoke from a script, naming who did it:
+    fabric agent-gateway api-keys revoke <key-id> --actor ops-team --yes"#;
+
+/// Examples shown at the bottom of `api-keys rotate --help`.
+const API_KEYS_ROTATE_EXAMPLES: &str = r#"Examples:
+  Rotate from a script and keep the new secret in a shell variable:
+    SECRET=$(fabric agent-gateway api-keys rotate <key-id> --yes)
+
+  Rotate, naming who did it:
+    fabric agent-gateway api-keys rotate <key-id> --actor ops-team"#;
+
+/// Examples shown at the bottom of `api-keys delete --help`.
+const API_KEYS_DELETE_EXAMPLES: &str = r#"Examples:
+  Delete a key from a script:
+    fabric agent-gateway api-keys delete <key-id> --yes
+
+  Name the key's surface to skip the lookup:
+    fabric agent-gateway api-keys delete <key-id> --agent-id <surface-id> --yes"#;
+
 #[derive(Debug, Subcommand)]
 enum TenantOwnershipCommand {
     /// Report what reassigning a resource would affect.
+    ///
+    /// Shows the resource's current tenant, whether it is system-owned (and
+    /// so cannot be reassigned), and its references: `incoming` from resources
+    /// that use it and `outgoing` to resources it uses. `set` refuses a move
+    /// that would make one of these references cross tenants, or that leaves
+    /// one pointing at a resource that no longer exists.
     Impact {
-        /// Resource family the gateway tracks ownership for. api-keys and
-        /// connection-points are rejected: they inherit ownership from their
-        /// parent resource.
+        /// Resource family the gateway tracks ownership for. `gateways` are
+        /// what `connections` manages, and `policy-definitions` what
+        /// `policies` manages. api-keys and connection-points are rejected:
+        /// they inherit ownership from their parent resource.
         kind: OwnershipKind,
+        /// ID of the resource. Names are not looked up.
         id: String,
     },
     /// Assign a resource to a tenant, or clear its tenant ownership.
+    ///
+    /// Pass exactly one of --tenant or --clear; with neither, nothing is sent.
+    /// The change applies at once, with no confirmation prompt. The gateway
+    /// blocks a move that would make one of the resource's references cross
+    /// tenants, and any move of a system-owned resource; the error then points
+    /// to `impact`, which lists the references.
+    #[command(after_long_help = TENANT_OWNERSHIP_SET_EXAMPLES)]
     Set {
-        /// Resource family the gateway tracks ownership for. api-keys and
-        /// connection-points are rejected: they inherit ownership from their
-        /// parent resource.
+        /// Resource family the gateway tracks ownership for. `gateways` are
+        /// what `connections` manages, and `policy-definitions` what
+        /// `policies` manages. api-keys and connection-points are rejected:
+        /// they inherit ownership from their parent resource.
         kind: OwnershipKind,
+        /// ID of the resource. Names are not looked up.
         id: String,
         /// Tenant to assign the resource to.
         #[arg(long, conflicts_with = "clear")]
@@ -9568,6 +10765,17 @@ enum TenantOwnershipCommand {
         clear: bool,
     },
 }
+
+/// Examples shown at the bottom of `tenant-ownership set --help`.
+const TENANT_OWNERSHIP_SET_EXAMPLES: &str = r#"Examples:
+  Check what moving a surface would cross, then move it to tenant acme:
+    fabric agent-gateway tenant-ownership impact surfaces <surface-id>
+    fabric agent-gateway tenant-ownership set surfaces <surface-id> \
+      --tenant acme
+
+  Make a policy definition globally owned again:
+    fabric agent-gateway tenant-ownership set policy-definitions <policy-id> \
+      --clear"#;
 
 /// The resource families that carry their own tenant ownership, mirroring the
 /// gateway's `ResourceKind` path names. `api-keys` and `connection-points` are
@@ -9643,9 +10851,46 @@ enum JwtStrategyCommand {
     #[command(flatten)]
     Crud(CrudCommand),
     /// Check that a JWKS URI is reachable and serves a parseable key set.
+    ///
+    /// The gateway fetches the URI and reports `valid` and `key_count`.
+    /// Nothing is saved. A URI that cannot be fetched or parsed exits non-zero
+    /// with the gateway's reason. Run this before pointing a strategy's
+    /// `jwks_source` at the URI.
     #[command(name = "validate-jwks-uri")]
-    ValidateJwksUri { uri: String },
+    ValidateJwksUri {
+        /// URI of the JSON Web Key Set, for example
+        /// https://idp.example.com/.well-known/jwks.json.
+        uri: String,
+    },
 }
+
+/// Examples shown at the bottom of `jwt-verification-strategies --help`.
+const JWT_VERIFICATION_STRATEGIES_EXAMPLES: &str = r#"Examples:
+  Check a remote key set, then create a strategy that uses it:
+    JWKS=https://idp.example.com/.well-known/jwks.json
+    fabric agent-gateway jwt-verification-strategies validate-jwks-uri "$JWKS"
+    fabric agent-gateway jwt-verification-strategies create --file strategy.json
+  where strategy.json is:
+    {
+      "name": "Partner IdP",
+      "expected_issuer": "https://idp.example.com/",
+      "jwks_source": {
+        "type": "remote",
+        "jwks_uri": "https://idp.example.com/.well-known/jwks.json"
+      }
+    }
+
+  Pin the keys in the document instead of fetching them:
+    "jwks_source": {
+      "type": "static",
+      "jwks": [{"kty": "RSA", "kid": "2026-09", "n": "...", "e": "AQAB"}]
+    }
+
+  Change a strategy: save it, edit it, send it back:
+    fabric agent-gateway jwt-verification-strategies get <id> --output json > \
+      strategy.json
+    fabric agent-gateway jwt-verification-strategies update <id> \
+      --file strategy.json"#;
 
 async fn run_users(
     client: &GatewayClient,
@@ -12458,32 +13703,33 @@ use crate::client::{REDACTED, RawAuth, clean_for_terminal, gateway_error};
 enum AuditCommand {
     /// List audit events, newest first.
     ///
-    /// An empty result is ambiguous: the gateway answers 200 with no events
-    /// when the audit log is genuinely empty, when its audit subsystem failed
-    /// to start, and when it cannot read the audit file or the file is not
-    /// valid UTF-8. It also drops any line of the file it cannot parse without
-    /// saying so.
+    /// The log records gateway traffic, such as delegation, policy decisions,
+    /// trust checks, VP injection and payments, but not admin API calls (except
+    /// revoking delegation tokens). Policy decisions, trust checks and VP
+    /// injection are recorded only while audit_enabled and their category are
+    /// both on.
     ///
-    /// The audit log records gateway traffic: delegation consent and tokens,
-    /// policy decisions, trust checks, VP injection, payments, and trace
-    /// terminations. Admin API calls, such as creating an identity, are not
-    /// audited, so they never appear here. The one exception is revoking
-    /// delegation tokens, which records token_revoked or user_tokens_revoked.
+    /// An empty result can also mean the gateway couldn't read its log. Callers'
+    /// email and name and each vp_jwt are redacted unless you pass --reveal.
     ///
-    /// The gateway settings gate three kinds of event, and only while
-    /// audit_enabled is on: audit_categories.policies records policy
-    /// decisions, audit_categories.trust_checks records trust checks, and
-    /// audit_categories.identity records VP-injection events, not changes to
-    /// identities. Every other event is recorded whatever those settings say.
-    ///
-    /// This is the whole audit log. Delegation events are a subset of it, so
-    /// there is no separate delegation-audit command; select them with
-    /// --category.
-    ///
-    /// The caller's email and name and the embedded Verifiable Presentation
-    /// JWT are replaced with a placeholder unless --reveal is passed.
+    /// See docs/OBSERVABILITY.md for details.
+    #[command(after_long_help = AUDIT_LIST_EXAMPLES)]
     List(AuditListArgs),
 }
+
+/// Examples shown at the bottom of `audit list --help`.
+const AUDIT_LIST_EXAMPLES: &str = r#"Examples:
+  Policy decisions and trust checks only:
+    fabric agent-gateway audit list --category policy_decision,trust_check
+
+  Requests denied at access points:
+    fabric agent-gateway audit list --flow access_point --decision deny
+
+  Events that mention "stripe" anywhere, second page of 50:
+    fabric agent-gateway audit list --filter stripe --limit 50 --page 2
+
+  Export the whole log as JSON (redacted; add --reveal for the raw values):
+    fabric agent-gateway audit list --all --output json > audit.json"#;
 
 #[derive(Debug, Args)]
 struct AuditListArgs {
@@ -12493,32 +13739,29 @@ struct AuditListArgs {
     /// Page to read, counting from 1.
     #[arg(long, default_value_t = 1, conflicts_with = "all")]
     page: usize,
-    /// Case-insensitive substring match. The gateway matches it against the
-    /// raw JSON of each event, so it also matches field names and the base64
-    /// body of an embedded JWT, not only the values shown in a row.
+    /// Case-insensitive substring, matched against each whole event as JSON,
+    /// so field names and the base64 body of an embedded JWT match too.
     #[arg(long)]
     filter: Option<String>,
     /// Comma-separated event categories, for example
     /// policy_decision,trust_check,consent_granted,token_injected,payment.
     #[arg(long)]
     category: Option<String>,
-    /// Restrict to policy decisions from this request flow. Setting this drops
-    /// every event that is not a policy decision.
+    /// Only policy decisions from this request flow; other events are dropped.
     #[arg(long, value_enum)]
     flow: Option<AuditFlow>,
-    /// Restrict to policy decisions at this scope. Setting this drops every
-    /// event that is not a policy decision.
+    /// Only policy decisions at this scope; other events are dropped.
     #[arg(long, value_enum)]
     scope: Option<AuditScope>,
-    /// Restrict to policy decisions with this outcome. Setting this drops
-    /// every event that is not a policy decision.
+    /// Only policy decisions with this outcome; other events are dropped.
     #[arg(long, value_enum)]
     decision: Option<AuditDecision>,
-    /// Read every page instead of one.
+    /// Read every page instead of one. With --output json the per-page
+    /// counters are dropped and total is kept.
     #[arg(long)]
     all: bool,
-    /// Print the caller's email and name and the full Verifiable Presentation
-    /// JWT instead of a placeholder.
+    /// Print the caller's email and name and the full vp_jwt of each event
+    /// instead of a placeholder.
     #[arg(long)]
     reveal: bool,
 }
@@ -12580,6 +13823,13 @@ impl AuditDecision {
 #[derive(Debug, Subcommand)]
 enum PaymentsCommand {
     /// List payment records from both stores, newest first.
+    ///
+    /// The gateway keeps x402 and MPP payments in separate stores. This reads
+    /// both and merges them into one table, or reads one with --store. If a
+    /// store cannot be read or is not enabled, the rows from the other are
+    /// still printed and a warning names it on standard error; the command
+    /// fails only when no store could be read.
+    #[command(after_long_help = PAYMENTS_LIST_EXAMPLES)]
     List(PaymentsListArgs),
     /// Get one payment record.
     ///
@@ -12587,6 +13837,8 @@ enum PaymentsCommand {
     /// credentials and the payer's signature. Those are replaced with a
     /// placeholder unless --reveal is passed.
     Get {
+        /// Payment record ID, from the ID column of `fabric agent-gateway
+        /// payments list`.
         id: String,
         /// Store to read. The default tries x402 and then MPP, because record
         /// IDs do not say which store they belong to.
@@ -12604,7 +13856,14 @@ enum PaymentsCommand {
         sync: bool,
     },
     /// Delete a finalised x402 transaction. MPP records cannot be deleted.
+    ///
+    /// Pass --yes to confirm: there is no prompt, and without --yes the command
+    /// refuses. The deletion cannot be undone. The gateway refuses a
+    /// transaction whose verification or settlement is still pending.
+    #[command(after_long_help = PAYMENTS_DELETE_EXAMPLES)]
     Delete {
+        /// x402 transaction ID, from the ID column of `fabric agent-gateway
+        /// payments list --store x402`.
         id: String,
         /// Confirm the deletion. Required; there is no prompt.
         #[arg(long)]
@@ -12612,16 +13871,34 @@ enum PaymentsCommand {
     },
 }
 
+/// Examples shown at the bottom of `payments list --help`.
+const PAYMENTS_LIST_EXAMPLES: &str = r#"Examples:
+  Verified x402 payments for one surface (pass the surface ID, not its name):
+    fabric agent-gateway payments list --store x402 --surface <surface-id> \
+      --status verified
+
+  Up to 100 records from each store as JSON, with created_at in Unix seconds:
+    fabric agent-gateway payments list --output json"#;
+
+/// Examples shown at the bottom of `payments delete --help`.
+const PAYMENTS_DELETE_EXAMPLES: &str = r#"Examples:
+  Check the record, then delete it:
+    fabric agent-gateway payments get <transaction-id> --store x402
+    fabric agent-gateway payments delete <transaction-id> --yes"#;
+
 #[derive(Debug, Args)]
 struct PaymentsListArgs {
     /// Store to read. The default reads both and merges them into one table.
     #[arg(long, value_enum, default_value_t = PaymentStore::All)]
     store: PaymentStore,
-    /// Only records for this Agent Surface.
+    /// Only records for the Agent Surface with this ID; a surface name is
+    /// not accepted.
     #[arg(long)]
     surface: Option<String>,
-    /// Only records with this status. MPP has no status query parameter, so
-    /// its records are filtered by the CLI after they are fetched.
+    /// Only records with this status, matched case-insensitively. x402
+    /// statuses are Pending, Verified, Failed and Timeout; MPP statuses are
+    /// verified, failed and challengeissued. MPP records are filtered by the
+    /// CLI after --limit is applied, so fewer than --limit may come back.
     #[arg(long)]
     status: Option<String>,
     /// Maximum records to read from each store.
@@ -12666,17 +13943,31 @@ enum MetricsCommand {
     Status,
     /// Fetch the Prometheus exposition.
     ///
-    /// When the gateway has Prometheus authentication enabled this route needs
-    /// HTTP Basic credentials in the same header the bearer token occupies, so
-    /// passing --username and --password sends those instead of the token.
+    /// When the gateway has Prometheus authentication on, pass --username and
+    /// --password; they are sent as HTTP Basic credentials instead of the
+    /// bearer token.
+    ///
+    /// On standard output, control characters are removed from the
+    /// exposition; a file named with --output-file gets it exactly as sent.
+    #[command(after_long_help = METRICS_SCRAPE_EXAMPLES)]
     Scrape(MetricsScrapeArgs),
     /// Check whether the gateway can reach an OTLP endpoint.
+    ///
+    /// The gateway only opens a TCP connection to the endpoint, with a
+    /// 5-second timeout, and sends no telemetry. The command exits non-zero
+    /// when the connection fails. The gateway refuses some URLs without
+    /// trying them, such as one whose scheme is not http or https, or a
+    /// loopback address.
     #[command(name = "test-endpoint")]
     TestEndpoint {
         /// OTLP endpoint to open a connection to, including the scheme.
         url: String,
     },
     /// Delete metrics older than the configured retention period.
+    ///
+    /// Pass --yes to confirm: there is no prompt, and without --yes the command
+    /// refuses. Deleted metrics cannot be recovered.
+    #[command(after_long_help = METRICS_TRUNCATE_EXAMPLES)]
     Truncate {
         /// Confirm the truncation. Required; there is no prompt.
         #[arg(long)]
@@ -12684,22 +13975,50 @@ enum MetricsCommand {
     },
 }
 
+/// Examples shown at the bottom of `metrics scrape --help`.
+const METRICS_SCRAPE_EXAMPLES: &str = r#"Examples:
+  Check the exposition with promtool:
+    fabric agent-gateway metrics scrape | promtool check metrics
+
+  With Prometheus authentication on, read the password without echoing it and
+  save to a file:
+    export FABRIC_METRICS_USERNAME=prometheus
+    read -rs FABRIC_METRICS_PASSWORD && export FABRIC_METRICS_PASSWORD
+    fabric agent-gateway metrics scrape --output-file metrics.txt"#;
+
+/// Examples shown at the bottom of `metrics truncate --help`.
+const METRICS_TRUNCATE_EXAMPLES: &str = r#"Examples:
+  Check the retention period, then delete older metrics:
+    fabric agent-gateway metrics config show
+    fabric agent-gateway metrics truncate --yes"#;
+
 #[derive(Debug, Subcommand)]
 enum MetricsConfigCommand {
     /// Show the metrics configuration.
     Show,
     /// Replace the whole metrics configuration from a JSON document.
     ///
-    /// This is a full replacement, not a patch, and optional settings are
-    /// dropped rather than defaulted when the document omits them — omitting
-    /// `opentelemetry.auth` switches collector export to unauthenticated. The
-    /// submitted document is therefore compared against the live one first and
-    /// refused if it would drop anything. Start from `fabric agent-gateway metrics config
-    /// show --output json`. The gateway reports success once the file is saved
-    /// even if re-applying it to the running collector failed, so read the
-    /// `message` in the response rather than `success` alone.
+    /// This is not a patch: leaving out `opentelemetry.auth` removes it, which
+    /// switches collector export to unauthenticated, and leaving out
+    /// `retention`, `advanced` or `opentelemetry.protocol` resets it to the
+    /// gateway's default. So the CLI first compares the document with the live
+    /// configuration and refuses one that would drop a stored setting.
+    ///
+    /// The gateway reports success once the file is saved, even if applying it
+    /// to the running collector failed, so read the `message` it returns.
+    #[command(after_long_help = METRICS_CONFIG_SET_EXAMPLES)]
     Set(MetricsFileArgs),
 }
+
+/// Examples shown at the bottom of `metrics config set --help`.
+const METRICS_CONFIG_SET_EXAMPLES: &str = r#"Examples:
+  Edit the live configuration and send it back whole:
+    fabric agent-gateway metrics config show --output json > metrics.json
+    fabric agent-gateway metrics config set --file metrics.json
+
+  Remove a stored setting on purpose, such as opentelemetry.auth, by skipping
+  the check:
+    fabric agent-gateway metrics config set --file metrics.json --force"#;
 
 /// The replacement metrics document, plus the override for the pre-flight
 /// check that refuses one dropping a stored setting.
@@ -12708,7 +14027,8 @@ struct MetricsFileArgs {
     /// JSON request body. Use '-' to read from standard input.
     #[arg(short, long)]
     file: PathBuf,
-    /// Submit the document even though the pre-flight check refuses it.
+    /// Skip the check against the live configuration, to remove a stored
+    /// setting on purpose.
     #[arg(long)]
     force: bool,
 }
@@ -12716,16 +14036,13 @@ struct MetricsFileArgs {
 #[derive(Debug, Args)]
 struct MetricsScrapeArgs {
     /// Prometheus Basic-auth user configured in the gateway's admin settings.
-    /// Has an environment fallback so that setting only the password variable
-    /// cannot turn an unauthenticated scrape into a usage error.
     #[arg(long, requires = "password", env = "FABRIC_METRICS_USERNAME")]
     username: Option<String>,
     /// Password for --username. Prefer FABRIC_METRICS_PASSWORD over passing it
     /// on the command line, where it lands in shell history.
     #[arg(long, requires = "username", env = "FABRIC_METRICS_PASSWORD", hide_env_values = true)]
     password: Option<String>,
-    /// Where to write the exposition. '-' is standard output. Named
-    /// --output-file because the global --output selects the display format.
+    /// Where to write the exposition. '-' is standard output.
     #[arg(long, default_value = "-")]
     output_file: PathBuf,
 }
@@ -12735,20 +14052,42 @@ enum LogsCommand {
     /// Download every log file as one ZIP archive.
     ///
     /// The gateway builds the whole archive in memory before sending it, so
-    /// this is expensive on a large log directory.
+    /// this is expensive on a large log directory. An existing file at
+    /// --output-file is overwritten without asking.
+    ///
+    /// There is no overall time limit: the download stops only if the gateway
+    /// sends nothing for 120 seconds.
+    #[command(after_long_help = LOGS_DOWNLOAD_EXAMPLES)]
     Download {
-        /// Where to write the archive. '-' is standard output. Named
-        /// --output-file because the global --output selects the display format.
+        /// Where to write the archive. '-' is standard output.
         #[arg(long, default_value = "logs.zip")]
         output_file: PathBuf,
     },
     /// Delete every rotated log file, keeping the current one.
+    ///
+    /// The gateway keeps agent-gateway.log and removes the rotated
+    /// agent-gateway*.log* files. Pass --yes to confirm: there is no prompt,
+    /// and without --yes the command refuses. Download the logs first if you
+    /// may need them.
+    #[command(after_long_help = LOGS_TRUNCATE_EXAMPLES)]
     Truncate {
         /// Confirm the deletion. Required; there is no prompt.
         #[arg(long)]
         yes: bool,
     },
 }
+
+/// Examples shown at the bottom of `logs download --help`.
+const LOGS_DOWNLOAD_EXAMPLES: &str = r#"Examples:
+  Save the archive under a dated name:
+    fabric agent-gateway logs download \
+      --output-file "gateway-logs-$(date +%F).zip""#;
+
+/// Examples shown at the bottom of `logs truncate --help`.
+const LOGS_TRUNCATE_EXAMPLES: &str = r#"Examples:
+  Keep a copy, then delete the rotated log files:
+    fabric agent-gateway logs download --output-file logs.zip
+    fabric agent-gateway logs truncate --yes"#;
 
 async fn run_audit(
     client: &GatewayClient,
