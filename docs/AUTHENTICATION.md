@@ -351,7 +351,7 @@ There is no separate refresh token. Once the session has been idle past the time
 - Every request waits at most 10 seconds to connect and gives up when no data arrives for 120 seconds.
 - Every call except `logs download` also ends after 5 minutes in total, so a gateway that sends one byte at a time can't hold the CLI. The log archive is only held to the 120 second limit, so a large download that keeps arriving isn't cut off.
 - Redirects are followed only within the same scheme, host, and port, so the token never goes to another host. The browser login's code exchange follows the same rules.
-- A plain `http://` host other than this machine, typed with `--host` (including on `login`), is refused unless you pass `--allow-http`, because the token would be sent unencrypted. With `--allow-http` the CLI warns on standard error. `--allow-http` is a flag only, with no environment variable.
+- A plain `http://` host other than this machine, typed with `--host` or set in `FABRIC_HOST` (including on `login`), is refused unless you pass `--allow-http`, because the token would be sent unencrypted. With `--allow-http` the CLI warns on standard error. `--allow-http` is a flag only, with no environment variable.
 - A saved connection that uses plain `http` to a remote host prints a warning once per host in a run.
 
 ## Related

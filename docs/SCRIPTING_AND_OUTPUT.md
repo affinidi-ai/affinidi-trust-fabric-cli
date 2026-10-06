@@ -98,6 +98,8 @@ Several resources share the same five commands:
 | **Replaces the whole record**: a field left out is cleared | authorities, STS clients, integrations, JWT verification strategies |
 | **Changes only the fields sent**: the rest are kept | connections, connection points, issuers, trust registries, mediators, MCP proxies, A2A proxies, credential providers, certificates |
 
+An issuer `update` must still include `name`: the gateway refuses a document without it, or with an empty one.
+
 > [!WARNING]
 > Connections and connection points accept only some fields on `update` and ignore the rest without an error:
 >
