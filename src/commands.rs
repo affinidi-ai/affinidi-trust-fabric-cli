@@ -61,7 +61,8 @@ struct AgentGatewayArgs {
     #[arg(long, global = true, env = "FABRIC_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
-    /// Allow a plain http:// host other than this machine, typed with --host.
+    /// Allow a plain http:// host other than this machine, typed with --host or
+    /// set in FABRIC_HOST.
     /// The token is then sent unencrypted, so only use this on a network you
     /// trust.
     #[arg(long, global = true)]
@@ -304,7 +305,7 @@ enum Command {
         command: PolicyCommand,
     },
     /// Manage issuers, the DID-carrying units that own surfaces.
-    #[command(mut_subcommands(crud_help("issuers", "an issuer", "issuers", CrudUpdate::ChangesSentFields)))]
+    #[command(mut_subcommands(crud_help("issuers", "an issuer", "issuers", CrudUpdate::Custom(ISSUERS_UPDATE_HELP))))]
     Issuers {
         #[command(subcommand)]
         command: CrudCommand,
@@ -1178,6 +1179,21 @@ enum SurfaceCommand {
     #[command(after_long_help = TOOL_GATE_PREVIEW_EXAMPLES)]
     ToolGatePreview(ToolGatePreviewArgs),
 }
+
+/// Long help for `issuers update`, which keeps omitted fields but always
+/// requires `name`.
+const ISSUERS_UPDATE_HELP: &str = r#"Update an issuer from a JSON document.
+
+The gateway changes only the fields the document sets and keeps the rest, but
+`name` is always required: a document without it, or with an empty one, is
+refused. Start from the current issuer:
+
+  fabric agent-gateway issuers get <ID> \
+    --output json > record.json
+  fabric agent-gateway issuers update <ID> \
+    --file record.json
+
+Use `--file -` to read the document from standard input."#;
 
 /// Long help for `connection-points update`. Its integration list is read
 /// under a different name than `get` prints, so a `get` round trip would
