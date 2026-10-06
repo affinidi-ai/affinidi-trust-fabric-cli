@@ -110,7 +110,7 @@ One Rust binary, `fabric`, built from [`src/`](src/) with [clap](https://docs.rs
 
 ## Contributing and support
 
-Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for the discuss-first workflow, required checks, and tests.
+Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for the discuss-first workflow, required checks, and tests. Participation is governed by the [Code of Conduct](CONTRIBUTING.md#code-of-conduct).
 
 For usage questions, use the [Affinidi support form](https://share.hsforms.com/1i-4HKZRXSsmENzXtPdIG4g8oa2v). For reproducible problems or feature requests, search or open a [GitHub issue](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/issues).
 

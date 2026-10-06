@@ -3,7 +3,7 @@
 Two test layers, what belongs in each, and how to run them.
 
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md) states the requirement: every change needs
-tests, and mocks and stubs are not used. This page says which layer to put a test in and
+tests, and the gateway is never mocked: tests run against a local HTTP server. This page says which layer to put a test in and
 which helpers to reuse.
 
 ## Layers
@@ -55,7 +55,7 @@ Async tests use `#[tokio::test]`.
 
 ### Local servers instead of mocks
 
-Nothing is mocked. A test that needs a gateway starts a real HTTP server on
+The gateway is never mocked. A test that needs a gateway starts a real HTTP server on
 `127.0.0.1:0`, points a `GatewayClient` or a saved connection at it, and asserts on what
 the server received. Each test module defines the servers it needs; copy the closest one
 rather than inventing a new shape.

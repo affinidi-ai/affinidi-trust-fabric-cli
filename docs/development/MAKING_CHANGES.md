@@ -223,7 +223,7 @@ which has one on the surface and one per transit point.
 | Field | Meaning |
 | --- | --- |
 | `key` | The name users type. Matched case-insensitively, like `aliases`. |
-| `Edge` | `ApMa` (access point to managed agent), `MaExternal` (managed agent to its target), or `MaTp` (managed agent to a transit point; a pointer without `{tp}` on this edge is the target leg, as in `trust-check`) |
+| `Edge` | `ApMa` (access point to managed agent), `MaExternal` (managed agent to external destinations, surface-wide), or `MaTp` (managed agent to a transit point; a pointer without `{tp}` on this edge is the target leg, as in `trust-check`) |
 | `Direction` | `Request` or `Response` |
 | Pointer | The JSON pointer on the surface document. `{tp}` stands for a transit point and is resolved from `--transit-point`. |
 | `ValueKind` | `Object` replaces the object at the pointer; `List` appends to a list. Both take their value from `--json` or `--file`. `PolicyRef` builds a `{ policy_definition_id, require_agent_context }` reference from `--policy-id`, or takes `--json` or `--file` like the others. |

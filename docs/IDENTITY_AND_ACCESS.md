@@ -54,7 +54,9 @@ fabric agent-gateway users get <user-id>
 fabric agent-gateway users update <user-id> --file user.json
 ```
 
-`update` changes only the fields the document contains. See [Request documents](#request-documents) for the accepted keys.
+`update` changes only the fields the document contains. `role` is `administrator`, `poweruser`, or `user`, and `status` is `new`, `approved`, or `disabled`. See [Request documents](#request-documents) for the accepted keys.
+
+Changing a user's role, or moving them out of `approved`, ends their active sessions.
 
 > [!CAUTION]
 > **`update` refuses the id `integrations`.** That path answers PUT by replacing the whole user-integration configuration, so any document sent there would clear every assignment and still report success. To rewrite the assignments deliberately, use `fabric agent-gateway api put /v1/users/integrations --file <file>`.
@@ -64,6 +66,11 @@ fabric agent-gateway users update <user-id> --file user.json
 ```sh
 fabric agent-gateway users delete <user-id>
 ```
+
+> [!CAUTION]
+> **The user is removed permanently and their active sessions end.** It runs at once, with no confirmation prompt.
+
+The gateway refuses to delete an administrator or your own account.
 
 ## Identities
 
@@ -112,7 +119,7 @@ fabric agent-gateway identities rotate-keys <id>
 fabric agent-gateway identities rotate-keys <id> --file rotate-keys.json
 ```
 
-Without `--file`, the gateway generates the new key pair. To supply your own, wrap it as `{"new_key_pair": {…}}` (see [Key pairs](#key-pairs)).
+The new key takes over at once, with no confirmation prompt, and the response carries its public key as `new_public_key`. Without `--file`, the gateway generates the new key pair. To supply your own, wrap it as `{"new_key_pair": {…}}` (see [Key pairs](#key-pairs)).
 
 > [!WARNING]
 > **Keep a supplied key pair inside its `new_key_pair` wrapper.** The CLI refuses a document with the key pair outside it, and prints a template of the document to send, with placeholder Ed25519 JWKs.
@@ -123,7 +130,7 @@ Without `--file`, the gateway generates the new key pair. To supply your own, wr
 fabric agent-gateway identities transfer <id> --file transfer.json
 ```
 
-The document requires `new_controller` and `current_owner_authorization`. See [Request documents](#request-documents).
+The transfer takes effect at once, with no confirmation prompt. The document requires `new_controller`, which must be a DID, and `current_owner_authorization`. See [Request documents](#request-documents).
 
 ### Read or set an identity's trust policy
 
@@ -137,6 +144,7 @@ fabric agent-gateway identities trust-policy set <id> --file trust-policy.json
 Good to know:
 
 - `set` refuses a bare policy before anything is sent.
+- `set` replaces the stored policy as a whole, so send every component, not only the ones you change.
 - `get` answers with the gateway's built-in defaults for an identity that has never had a policy set, so a result does not prove one was configured.
 
 > [!NOTE]
@@ -148,7 +156,7 @@ Good to know:
 fabric agent-gateway identities deactivate <id>
 ```
 
-`deactivate` is the delete route. It appends a deactivation entry to the DID log, clears the identity's active flag, and keeps the record, which stays readable afterwards. A deactivated identity cannot be updated, rotated, transferred, or deactivated again.
+`deactivate` is the delete route, and it runs at once with no confirmation prompt. It appends a deactivation entry to the DID log, clears the identity's active flag, and keeps the record, which stays readable afterwards. A deactivated identity cannot be updated, rotated, transferred, or deactivated again.
 
 ## API keys
 
@@ -248,7 +256,7 @@ Good to know:
 fabric agent-gateway tenant-ownership impact surfaces <surface-id>
 ```
 
-`impact` reports the references a reassignment would cross. A reassignment the gateway blocks comes back as a conflict from `set`, and `impact` lists the references behind it.
+`impact` reports the resource's current tenant, whether it is system-owned, and the references a reassignment would cross. The gateway blocks any move of a system-owned resource, and any move that would make a reference cross tenants: `set` reports these as a conflict, and `impact` lists the references behind it.
 
 ### Reassign or clear tenant ownership
 
@@ -267,6 +275,7 @@ fabric agent-gateway tenant-ownership set surfaces <surface-id> --clear
 
 Good to know:
 
+- `set` applies at once, with no confirmation prompt.
 - The resource kind is a fixed list that `--help` prints.
 - `api-keys` and `connection-points` appear in that list but are rejected, because their ownership follows their parent resource.
 
@@ -290,6 +299,8 @@ fabric agent-gateway jwt-verification-strategies delete <id>
 ```
 
 `list` prints `NAME  ID  ISSUER  UPDATED`. `update` replaces the strategy's `name`, `expected_issuer`, and `jwks_source`, so it takes the same document as `create`. It ignores `tenant_id` and keeps the strategy's current tenant: use `tenant-ownership set jwt-verification-strategies <id>` to change it. For the document and its `jwks_source` examples, see [Request documents](#request-documents).
+
+`delete` runs at once, with no confirmation prompt.
 
 ### Validate a JWKS URI
 

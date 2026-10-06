@@ -111,7 +111,7 @@ fabric agent-gateway settings reset --force
 `reset` is not a restore of the fields nobody set. It writes the built-in defaults over the whole document and prints the result as read back from the gateway.
 
 > [!CAUTION]
-> `reset` switches off two security controls. It clears:
+> `reset` switches off security controls. It clears:
 >
 > - `prometheus_auth_enabled`, and with it `prometheus_auth_username` and the stored password hash. `/v1/metrics/prometheus` stops checking credentials from that moment.
 > - `audit_enabled` and `audit_categories`. Audit logging stops without a further message.
@@ -177,7 +177,7 @@ fabric agent-gateway user-settings reset
 
 Good to know:
 
-- Unlike `settings reset`, `user-settings reset` needs no `--force`.
+- Unlike `settings reset`, `user-settings reset` needs no `--force` and runs without a prompt, so take a `show --overrides` copy first if you may want your overrides back.
 - A `show --overrides` taken beforehand restores your overrides through `set`.
 - One exception: a stored `feature_flags.terms` override is refused on restore, and it never took effect anyway. Delete it from the backup before restoring.
 
@@ -210,8 +210,8 @@ fabric agent-gateway terms deactivate
 | Command | What it does |
 | --- | --- |
 | `draft --file <json>` | Save the customer Terms of Use draft. `-` reads standard input |
-| `publish` | Publish the saved draft as a new version |
-| `deactivate` | Deactivate the published customer Terms of Use. Answers `204 No Content` (see [Empty responses print a confirmation line](#empty-responses-print-a-confirmation-line)) |
+| `publish` | Publish the saved draft as the current customer Terms of Use, without a prompt. The draft is used up, and a `version` that was already published is refused with `TERMS_INVALID` |
+| `deactivate` | Deactivate the published customer Terms of Use, without a prompt. Versions published so far are kept; to apply customer terms again, save and publish a draft with a new `version`. Answers `204 No Content` (see [Empty responses print a confirmation line](#empty-responses-print-a-confirmation-line)) |
 
 The `draft` document carries `version`, `title`, and `url`, plus an optional `requires_reconsent` that defaults to `false`.
 
@@ -237,10 +237,10 @@ fabric agent-gateway notifications welcome-template show
 fabric agent-gateway notifications welcome-template set --file template.json
 ```
 
-The `set` document carries `title` and `message`, and replaces the template every future user receives. `set` answers `204 No Content` (see [Empty responses print a confirmation line](#empty-responses-print-a-confirmation-line)).
+The `set` document carries `title` and `message`, and replaces the template the gateway sends to each user approved from now on, except administrators. `set` answers `204 No Content` (see [Empty responses print a confirmation line](#empty-responses-print-a-confirmation-line)).
 
 > [!NOTE]
-> `welcome-template set` changes what every future user receives, so treat it as an administrator task.
+> `welcome-template set` changes what every user approved from now on receives, so treat it as an administrator task.
 
 ### Send a welcome notification
 

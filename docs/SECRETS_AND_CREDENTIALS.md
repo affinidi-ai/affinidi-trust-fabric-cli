@@ -102,6 +102,7 @@ fabric agent-gateway certificates delete <id>
 Good to know:
 
 - `get`, `create`, and `update` mask the private key unless you pass `--reveal`. See [Values are masked in output](#values-are-masked-in-output).
+- `update` changes only the fields the document sets and keeps the rest.
 - `expires_at` must be a complete RFC 3339 timestamp, such as `2027-01-01T00:00:00Z`. A bare date is rejected.
 - Name a certificate by its `id` or its name (see [Refer to a record by name](#refer-to-a-record-by-name)). The `certificate_id` field in the response is a second UUID the gateway never looks certificates up by, so the CLI doesn't match it either.
 - `delete` runs immediately, with no confirmation prompt.
@@ -127,7 +128,9 @@ Good to know:
 
 - `revoke-user` takes a **user identity hash**, not a grant ID, and revokes every grant held for that user.
 - Revoking needs the `delegation_vault.delete` permission (administrators by default), through a session token or an appliance-wide personal access token. A token created with `--resource-pattern` can list grants but never revoke one, because pattern scoping doesn't cover the delegation vault.
-- Revokes run immediately, with no confirmation prompt.
+
+> [!CAUTION]
+> **Revokes run immediately, with no confirmation prompt, and cannot be undone.** The gateway deletes the grant. A grant a user delegated comes back only when that user completes the provider's OAuth flow again.
 
 ## How secrets and certificates behave
 

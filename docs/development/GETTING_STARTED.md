@@ -117,7 +117,7 @@ Where things are kept:
 
 | What | Where |
 | --- | --- |
-| Connection names and hosts | `fabric/config.toml` in your user configuration directory: `~/Library/Application Support/fabric/config.toml` on macOS, `$XDG_CONFIG_HOME/fabric/config.toml` (usually `~/.config`) on Linux |
+| Connection names and hosts | `fabric/config.toml` in your user configuration directory: `~/Library/Application Support/fabric/config.toml` on macOS, `$XDG_CONFIG_HOME/fabric/config.toml` (usually `~/.config`) on Linux, `%APPDATA%\fabric\config.toml` on Windows |
 | Tokens | The OS credential store, under the service name `affinidi-trust-fabric-cli` |
 
 To remove a connection and its token, run `fabric agent-gateway logout`, which also ends a
@@ -147,8 +147,8 @@ scan (`rust-scan`), and a coverage check with an 80% threshold (`coverage`). Pul
 repository secrets; it runs once the change reaches `main`.
 
 [`deny.toml`](../../deny.toml) allows exactly the licences Affinidi has approved. A
-dependency under any other licence needs Legal's approval before it is added to the list,
-so raise it in the pull request rather than adding an exception.
+dependency under any other licence needs a maintainer's approval before it is added to the
+list, so raise it in the pull request rather than adding an exception.
 
 ## Troubleshooting
 

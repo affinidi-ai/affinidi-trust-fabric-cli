@@ -140,7 +140,7 @@ A shorter list is a narrower view, not the same one, and it fails quietly. Askin
 The gateway keeps payment records in two independent stores, x402 and MPP, behind separate endpoints. The `payments` commands read both, which `fabric agent-gateway api` cannot do in one call.
 
 > [!NOTE]
-> On a gateway with no payment stores configured, these routes do not exist at all. The CLI reports this as "payments are not enabled on this gateway".
+> Each store's routes exist only when that store is configured. When no queried store is configured, the CLI reports "payments are not enabled on this gateway"; when only one is, `list` prints the other's rows and names the missing store in a warning on standard error.
 
 ### List payment records
 
@@ -220,7 +220,7 @@ fabric agent-gateway payments stats --sync
 fabric agent-gateway payments delete <transaction-id> --yes
 ```
 
-`payments delete` deletes a finalised x402 transaction. It requires `--yes`. See [Destructive commands require `--yes`](#destructive-commands-require---yes).
+`payments delete` deletes a finalised x402 transaction. It cannot be undone, and requires `--yes`. See [Destructive commands require `--yes`](#destructive-commands-require---yes).
 
 Good to know:
 
@@ -310,7 +310,7 @@ fabric agent-gateway metrics truncate --yes
 fabric agent-gateway logs download --output-file logs.zip
 ```
 
-`download` retrieves every log file as one ZIP archive. `--output-file` defaults to `logs.zip`; `-` writes to standard output. See [File output and display format are separate](#file-output-and-display-format-are-separate).
+`download` retrieves every log file as one ZIP archive. `--output-file` defaults to `logs.zip`, and an existing file there is overwritten without asking; `-` writes to standard output. See [File output and display format are separate](#file-output-and-display-format-are-separate).
 
 > [!NOTE]
 > The gateway builds the whole archive in memory before sending it, so this is expensive on a large log directory.

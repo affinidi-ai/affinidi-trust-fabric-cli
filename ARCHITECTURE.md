@@ -34,7 +34,7 @@ The CLI keeps two pieces of local state, and keeps them apart.
 
 | State | Where | Notes |
 | --- | --- | --- |
-| Connections | `fabric/config.toml` under the user configuration directory (`dirs::config_dir`), so `~/Library/Application Support/fabric/config.toml` on macOS and `$XDG_CONFIG_HOME/fabric/config.toml` on Linux | `Config` holds the `current` connection name and a map of named `Connection`s, each just a `host`. On Unix the file is written owner-only (`0600`). |
+| Connections | `fabric/config.toml` under the user configuration directory (`dirs::config_dir`), so `~/Library/Application Support/fabric/config.toml` on macOS, `$XDG_CONFIG_HOME/fabric/config.toml` on Linux, and `%APPDATA%\fabric\config.toml` on Windows | `Config` holds the `current` connection name and a map of named `Connection`s, each just a `host`. On Unix the file is written owner-only (`0600`). |
 | Tokens | The OS credential store, through the `keyring` crate: macOS Keychain, Windows Credential Manager, or Linux Secret Service | The service name is `affinidi-trust-fabric-cli`. The account is the connection name. The host the token was issued for is kept beside it under `<name>#bound-host`. |
 
 Because the bound host shares the account namespace, `login` refuses a connection name

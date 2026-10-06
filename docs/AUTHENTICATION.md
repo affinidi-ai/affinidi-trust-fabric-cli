@@ -150,6 +150,7 @@ Good to know:
 
 - A browser login is the browser's own gateway session, so `logout` signs you out of the browser as well.
 - For a personal access token, `logout` asks whether to revoke it, naming its token ID, while it still holds the token. Pass `--revoke-token` to revoke it without asking (for scripts).
+- Without `--connection`, `logout` removes the current connection. Another saved connection, if any, becomes current (the first by name), so the next command may go to a different gateway.
 
 > [!WARNING]
 > Without a terminal and without `--revoke-token`, a personal access token **stays valid on the gateway**. `logout` prints how to revoke it later with [`tokens revoke`](#revoke-a-token).
@@ -172,6 +173,9 @@ fabric agent-gateway whoami --output json
 For a personal access token it also shows the token's ID and name and the scopes the token was granted. The name is left out when the token lacks `access_tokens.view`. A session login holds its whole role and shows no token or scopes.
 
 Use `whoami` to check whether a stored session is still valid (see [Sessions stay alive while you use them](#sessions-stay-alive-while-you-use-them)).
+
+> [!WARNING]
+> `whoami` exits `0` even when the gateway rejects the token. In a script, check the `authenticated` field instead, for example `fabric agent-gateway whoami --output json | jq -e .authenticated`.
 
 ## Personal access tokens
 
@@ -201,7 +205,7 @@ fabric agent-gateway tokens get <token-id>
 fabric agent-gateway tokens scopes
 ```
 
-`scopes` lists the scopes you can grant a new token, one per line. It is based on your own role and, when you are logged in with a scoped personal access token, narrowed to that token's scopes.
+`scopes` lists the scopes your role holds, which you can give a new token, one per line. The list comes from your role only. When you are signed in with a scoped personal access token, a new token can get only scopes that token also holds.
 
 ### Create a token
 
@@ -270,6 +274,9 @@ fabric agent-gateway tokens revoke <token-id> --yes
 
 When standard input isn't a terminal the prompt could never be answered, so `revoke` without `--yes` fails there and sends nothing.
 
+> [!CAUTION]
+> A revoke can't be undone. If this CLI is logged in with the token you revoke, that saved connection stops working too.
+
 ### Rotate a token
 
 ```sh
@@ -295,6 +302,7 @@ Non-secret connection metadata, such as profile names, hosts, and the current pr
 | --- | --- |
 | macOS | `~/Library/Application Support/fabric/config.toml` |
 | Linux | Normally `~/.config/fabric/config.toml` |
+| Windows | `%APPDATA%\fabric\config.toml` |
 
 Existing plaintext-token configurations are migrated to the OS credential store and scrubbed automatically on the next CLI invocation.
 
@@ -321,7 +329,7 @@ A saved token is only sent to the host it was saved for. `--host` with a differe
 
 ### `--host` and `--token` last for one command
 
-The global `--host` and `--token` options are temporary overrides for a single command. Use `login` when the settings should be remembered.
+The global `--host` and `--token` options, and `FABRIC_HOST` and `FABRIC_TOKEN`, are temporary overrides for a single command. They override a saved connection rather than replace one: with no saved connection, a command fails with `no gateway connection configured`. Run `login` first, including in CI.
 
 ### Keep tokens out of shell history
 
@@ -343,6 +351,7 @@ There is no separate refresh token. Once the session has been idle past the time
 - Every request waits at most 10 seconds to connect and gives up when no data arrives for 120 seconds.
 - Every call except `logs download` also ends after 5 minutes in total, so a gateway that sends one byte at a time can't hold the CLI. The log archive is only held to the 120 second limit, so a large download that keeps arriving isn't cut off.
 - Redirects are followed only within the same scheme, host, and port, so the token never goes to another host. The browser login's code exchange follows the same rules.
+- A plain `http://` host other than this machine, typed with `--host` (including on `login`), is refused unless you pass `--allow-http`, because the token would be sent unencrypted. With `--allow-http` the CLI warns on standard error. `--allow-http` is a flag only, with no environment variable.
 - A saved connection that uses plain `http` to a remote host prints a warning once per host in a run.
 
 ## Related

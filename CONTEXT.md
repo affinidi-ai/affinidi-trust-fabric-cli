@@ -10,7 +10,7 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 | --- | --- |
 | **Appliance** | A Trust Fabric product the CLI manages. Commands take the shape `fabric <appliance> <command>`. Agent Gateway, under `agent-gateway`, is the only appliance today. |
 | **Command group** | The second word of a command, such as `surfaces` or `secrets`, naming the kind of resource or area it works on. |
-| **Shared CRUD commands** | The `list`, `get`, `create`, `update`, and `delete` commands that several groups share, such as `issuers`, `mediators`, and `connections`. `update` replaces the whole record from a JSON document. |
+| **Shared CRUD commands** | The `list`, `get`, `create`, `update`, and `delete` commands that several groups share, such as `issuers`, `mediators`, and `connections`. `update` sends a JSON document; depending on the resource, the gateway replaces the whole record or changes only the fields sent (see [Manage other resources](docs/SCRIPTING_AND_OUTPUT.md#manage-other-resources)). |
 | **Interactive shell** | `fabric agent-gateway shell`, which reads Agent Gateway commands without the `fabric agent-gateway` prefix and parses them exactly as one-shot commands. |
 
 ## Connections and credentials

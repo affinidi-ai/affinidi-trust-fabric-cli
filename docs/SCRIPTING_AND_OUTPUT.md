@@ -31,10 +31,9 @@ Output is a table by default. Add `--output json` (or `-o json`) to any command,
 
 Good to know:
 
-- `--output json` prints what the gateway returned for lists, creates, updates, and deletes, with three exceptions: masked fields stay masked unless you pass `--reveal`, `audit list` is redacted unless you pass `--reveal`, and `payments list` prints summary rows merged from every payment store.
+- `--output json` prints what the gateway returned for lists, creates, updates, and deletes, with these exceptions: masked fields stay masked unless you pass `--reveal`, `audit list` is redacted unless you pass `--reveal`, `payments list` prints summary rows merged from every payment store, and `identities list` prints the list without the gateway's `count` wrapper.
 - Most deletes get an empty body back, which prints as `null`.
 - `get` returns the record as JSON in both modes, with secret values and private keys masked unless you pass `--reveal`. `list` returns full JSON with `--output json`.
-- One exception: `identities list` prints the list without the gateway's `count` wrapper.
 - Yes or no fields print `true` or `false` in JSON (`yes` or `no` in a table).
 
 ## Capture a new ID or secret
@@ -81,13 +80,39 @@ Several resources share the same five commands:
 
 | Command | What it does |
 | --- | --- |
-| `list` | List entities |
-| `get <id>` | Get an entity by ID |
-| `create --file <json>` | Create an entity from a JSON document |
-| `update <id> --file <json>` | Replace an entity from a complete JSON document |
-| `delete <id>` | Delete an entity by ID |
+| `list` | List the records |
+| `get <id>` | Get a record by ID |
+| `create --file <json>` | Create a record from a JSON document |
+| `update <id> --file <json>` | Update a record from a JSON document (see below) |
+| `delete <id>` | Delete a record by ID |
 
-`--file -` reads the document from standard input.
+`--file -` reads the document from standard input. The ID is sent as given: these commands don't look up names, except `certificates`, which also accepts a certificate's name.
+
+> [!CAUTION]
+> `delete` runs as soon as the command runs. There is no confirmation prompt and no `--yes` flag.
+
+`update` sends the document as an HTTP `PUT`. What happens to fields the document leaves out depends on the resource:
+
+| Behaviour | Resources |
+| --- | --- |
+| **Replaces the whole record**: a field left out is cleared | authorities, STS clients, integrations, JWT verification strategies |
+| **Changes only the fields sent**: the rest are kept | connections, connection points, issuers, trust registries, mediators, MCP proxies, A2A proxies, credential providers, certificates |
+
+> [!WARNING]
+> Connections and connection points accept only some fields on `update` and ignore the rest without an error:
+>
+> - A connection takes only `name`, `description`, and `status`. Its DID can't change.
+> - A connection point takes `name`, `description`, `enabled`, and its integration list, which `update` reads as `integration_integrations` although `get` prints it as `integrations`.
+
+A JWT verification strategy keeps its tenant on `update`; change it with `tenant-ownership set`.
+
+Either way, the safest way to update is to start from the current record:
+
+```sh
+fabric agent-gateway issuers get <id> --output json > record.json
+# edit record.json
+fabric agent-gateway issuers update <id> --file record.json
+```
 
 These shared commands cover connections, connection points, Issuers, Authorities, Trust Registries, Mediators, MCP and A2A Proxies, STS clients, credential providers, certificates, integrations, and JWT verification strategies. For anything else, use [`api`](#call-an-endpoint-with-no-dedicated-command).
 
@@ -175,6 +200,9 @@ The gateway's own wording tells a role that lacks the permission apart from a pe
 | `FABRIC_PAT` | `login --pat` | Supplies the personal access token. Read only when `--pat` is given |
 | `FABRIC_METRICS_USERNAME`, `FABRIC_METRICS_PASSWORD` | `metrics scrape` | HTTP Basic credentials for the Prometheus route. Set both or neither |
 
+> [!IMPORTANT]
+> `FABRIC_HOST`, `FABRIC_TOKEN`, `--host`, and `--token` override a **saved connection**; they don't replace one. With no saved connection, a command fails with `no gateway connection configured`. In CI, sign in first, for example `printf '%s' "$PAT" | fabric agent-gateway login --host <URL> --pat --token-stdin`, then run commands.
+
 A saved connection's host and token live in the configuration file and the OS credential store, described in [Authentication](AUTHENTICATION.md#tokens-live-in-the-os-credential-store).
 
 ## Exit codes
@@ -185,6 +213,8 @@ A saved connection's host and token live in the configuration file and the OS cr
 | `1` | The command failed. The reason is printed on standard error, starting with `error:` |
 | `2` | The arguments were invalid, for example an unknown flag or a missing required value |
 | `3` | A `--dry-run` could only run the checks on this machine, because the gateway's checks could not run. Nothing was saved |
+
+`whoami` exits `0` even when the token is rejected; read its `authenticated` field (see [Check who you are signed in as](AUTHENTICATION.md#check-who-you-are-signed-in-as)).
 
 ## Related
 

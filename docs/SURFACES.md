@@ -21,7 +21,13 @@ Create and edit Agent Surfaces, add and remove features and transit points, and 
 | [`surfaces add-transit-point <surface>`](#add-a-transit-point) | Add a transit point from an alias and endpoint |
 | [`surfaces remove-transit-point <surface> <point>`](#remove-a-transit-point) | Remove a transit point by alias or id |
 | [`surfaces tool-gate-preview`](#preview-tool-gates) | Show which tools a set of MCP tool gates would allow or deny |
+| [`policies list`](#list-and-read-policies) | List policy definitions in a table |
+| [`policies get <policy-id>`](#list-and-read-policies) | Show one policy definition, including its Rego source |
 | [`policies create`](#create-a-policy-to-attach) | Create a policy that a surface can enforce |
+| [`policies update <policy-id> --file <json>`](#replace-a-policy-from-a-file) | Replace the whole policy definition |
+| [`policies impact <policy-id>`](#check-where-a-policy-is-used) | Show how many surfaces and gateways use a policy |
+| [`policies delete <policy-id>`](#delete-a-policy) | Delete a policy definition |
+| [`policies versions <policy-id>`](#list-a-policys-versions) | List the saved versions of a policy |
 
 All commands start with `fabric agent-gateway`. Every surface edit follows the same rules for lookup by name, local checks, permissions, and concurrent changes: see [How surface edits behave](#how-surface-edits-behave).
 
@@ -214,7 +220,7 @@ Good to know:
 
 When an enabled variant changes what the gateway serves, the `Notes` section says which variant and features, for example `The default variant 'blue' sets policy; this table reads only the surface itself.`
 
-- **A complete variant** replaces whole the blocks it has (target, access point, identity slots, outbound credentials, and transit points when its `transit` block has `points`). It gets one note naming those blocks and any feature it sets. Every feature that can sit in those blocks is marked, on or off, because the ones it leaves out are off for the gateway.
+- **A complete variant** replaces each block it has in full (target, access point, identity slots, outbound credentials, and transit points when its `transit` block has `points`). It gets one note naming those blocks and any feature it sets. Every feature that can sit in those blocks is marked, on or off, because the ones it leaves out are off for the gateway.
 - **A variant that isn't complete and has transit points** gets a note that transit point features may not match, on the features that can sit on a transit point, because its transit point changes aren't itemized.
 - A `null` in a variant that isn't complete means it keeps the surface's value, so it isn't noted.
 
@@ -263,7 +269,7 @@ The surface ID or name and the feature are positional, in that order. The place 
 
 | Flag | Meaning |
 | --- | --- |
-| `--policy-id` | Configuration shortcut for policy features: the policy definition id |
+| `--policy-id` | Configuration shortcut for policy features: the policy definition id. Ignored when `--json` or `--file` is given |
 | `--json` | Configuration as inline JSON |
 | `--file` | Configuration from a JSON file (`-` reads standard input) |
 | `--response` | Use the response place instead of the request place |
@@ -287,7 +293,7 @@ fabric agent-gateway surfaces remove-feature <id> rate-limit
 fabric agent-gateway surfaces remove-feature <id> policy --response
 ```
 
-`remove-feature` finds the place from the feature name, the same way as `add-feature`, and takes the same `--edge`, `--response`, `--transit-point`, and `--dry-run` flags. [`surfaces features <surface>`](#list-features) shows the flags needed for each place.
+`remove-feature` finds the place from the feature name, the same way as `add-feature`, and takes the same `--edge`, `--response`, `--transit-point`, and `--dry-run` flags. [`surfaces features <surface>`](#list-features) shows the flags needed for each place. A feature that isn't set at that place is refused.
 
 Like `add-feature`, it fetches the surface and sends only the part it changes as a JSON Merge Patch. Table output prints `Updated surface '<id>'`; `--output json` returns the updated surface.
 
@@ -352,6 +358,15 @@ Good to know:
 
 ## Policies
 
+### List and read policies
+
+```sh
+fabric agent-gateway policies list
+fabric agent-gateway policies get allow-sales --output json
+```
+
+`list` prints the columns `NAME  ID  DESCRIPTION  ENABLED  VERSION  UPDATED`, or `No policies yet.` when there are none. `get` takes the policy's ID. In its JSON, the Rego source is the `policy` field, as a string.
+
 ### Create a policy to attach
 
 ```sh
@@ -359,15 +374,65 @@ fabric agent-gateway policies create --id allow-sales --name "Allow sales" --pol
 fabric agent-gateway surfaces add-feature <id> policy --policy-id allow-sales --edge ap-ma
 ```
 
-`policies create` reads the file as Rego source, not a JSON document, and sends it as the policy's `policy` field. The new policy is enabled as soon as it is created. To enforce it on a surface, attach it with [`add-feature … policy --policy-id <id>`](#add-a-feature).
+`policies create` reads the file as Rego source, not a JSON document, and sends it as the policy's `policy` field. The file must declare `package surface.policy`, or `package gateway.policy` with `--policy-type gateway`; the gateway refuses any other package. The new policy is enabled as soon as it is created. To enforce it on a surface, attach it with [`add-feature … policy --policy-id <id>`](#add-a-feature).
 
 | Flag | Meaning |
 | --- | --- |
 | `--id` | ID that surfaces and other commands use to refer to the policy |
 | `--name` | Human-readable name |
 | `--description` | What the policy is for. Defaults to empty |
-| `--policy-type` | `agent-surface` (default) or `gateway` |
+| `--policy-type` | `agent-surface` (default) or `gateway`. It can't be changed after the policy is created |
 | `--policy-file` | File holding the policy's Rego source |
+
+### Replace a policy from a file
+
+```sh
+fabric agent-gateway policies get allow-sales --output json > allow-sales.json
+# edit allow-sales.json, then:
+fabric agent-gateway policies update allow-sales --file allow-sales.json
+```
+
+`update` sends the file as the complete policy definition (`-` reads standard input). Table output prints `Updated policy '<id>'`.
+
+> [!WARNING]
+> **The document replaces the whole stored definition.** Start from the output of `policies get <policy-id> --output json` so no field is lost.
+
+Good to know:
+
+- The document's `id` must match the policy ID you pass, and its `policy_type` can't change. The gateway refuses either mismatch.
+- A document without `enabled` turns a disabled policy back on, because the gateway reads a missing `enabled` as `true`.
+
+### Check where a policy is used
+
+```sh
+fabric agent-gateway policies impact allow-sales
+```
+
+`impact` reports how many surfaces and gateways reference the policy, out of how many in total, and whether it is enforced appliance-wide, with the planes that enforce it. Nothing is changed.
+
+### Delete a policy
+
+```sh
+fabric agent-gateway policies impact allow-sales
+fabric agent-gateway policies delete allow-sales
+```
+
+Table output confirms with `Deleted policy '<id>'`.
+
+> [!CAUTION]
+> The definition is deleted as soon as the command runs; there is no confirmation prompt. The gateway doesn't check whether surfaces or gateways still use it, so run [`policies impact`](#check-where-a-policy-is-used) first.
+
+Good to know:
+
+- The gateway also removes the policy from the appliance-wide assignments before deleting it.
+
+### List a policy's versions
+
+```sh
+fabric agent-gateway policies versions allow-sales
+```
+
+`versions` lists the saved versions newest first, with the columns `VERSION  HASH  CREATED  BY  NOTE`, or `No versions yet.` when there are none.
 
 ## How surface edits behave
 
