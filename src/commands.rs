@@ -181,15 +181,15 @@ enum Command {
     Login(LoginArgs),
     /// Sign out and remove a saved gateway connection.
     ///
-    /// Removes the connection's name, host, and token from this machine. Without
-    /// --connection it removes the current connection, and the first remaining
-    /// connection by name becomes current, so the next command may go to a
+    /// Removes the connection's name, host, and token from this machine.
+    /// Without --connection it removes the current connection, and the first
+    /// remaining one by name becomes current, so the next command may go to a
     /// different gateway.
     ///
-    /// A browser login's session is also ended on the gateway, if reachable,
-    /// which signs you out of the browser too. A personal access token stays
-    /// valid unless you revoke it: you are asked in a terminal, or pass
-    /// --revoke-token. Otherwise it is kept, and logout prints how to revoke it.
+    /// A browser login's session also ends on the gateway, if reachable,
+    /// signing you out of the browser too. A personal access token stays valid
+    /// unless you revoke it: you're asked in a terminal, or pass --revoke-token;
+    /// otherwise logout prints how to revoke it.
     ///
     /// See docs/AUTHENTICATION.md for details.
     #[command(after_long_help = LOGOUT_EXAMPLES)]
@@ -271,7 +271,12 @@ enum Command {
     /// exposed surfaces. `update` changes only the name, description and status;
     /// the DID cannot change. These commands call the gateway's `/v1/gateways`
     /// routes.
-    #[command(mut_subcommands(crud_help("connections", "a connection", "connections")))]
+    #[command(mut_subcommands(crud_help(
+        "connections",
+        "a connection",
+        "connections",
+        CrudUpdate::ChangesSentFields
+    )))]
     Connections {
         #[command(subcommand)]
         command: CrudCommand,
@@ -283,7 +288,12 @@ enum Command {
     /// integration list. It takes that list as `integration_integrations`,
     /// although `get` prints it as `integrations`; other fields are ignored.
     #[command(name = "connection-points")]
-    #[command(mut_subcommands(crud_help("connection-points", "a connection point", "connection points")))]
+    #[command(mut_subcommands(crud_help(
+        "connection-points",
+        "a connection point",
+        "connection points",
+        CrudUpdate::Custom(CONNECTION_POINTS_UPDATE_HELP)
+    )))]
     ConnectionPoints {
         #[command(subcommand)]
         command: CrudCommand,
@@ -294,7 +304,7 @@ enum Command {
         command: PolicyCommand,
     },
     /// Manage issuers, the DID-carrying units that own surfaces.
-    #[command(mut_subcommands(crud_help("issuers", "an issuer", "issuers")))]
+    #[command(mut_subcommands(crud_help("issuers", "an issuer", "issuers", CrudUpdate::ChangesSentFields)))]
     Issuers {
         #[command(subcommand)]
         command: CrudCommand,
@@ -304,20 +314,25 @@ enum Command {
     /// An authority is operator-supplied metadata about an external DID that
     /// policies and Trust Check templates can refer to. It holds no keys, and
     /// its DID cannot be changed after it is created.
-    #[command(mut_subcommands(crud_help("authorities", "an authority", "authorities")))]
+    #[command(mut_subcommands(crud_help("authorities", "an authority", "authorities", CrudUpdate::Replaces)))]
     Authorities {
         #[command(subcommand)]
         command: CrudCommand,
     },
     /// Manage the trust registries this gateway connects to for Trust Checks.
     #[command(name = "trust-registries")]
-    #[command(mut_subcommands(crud_help("trust-registries", "a trust registry", "trust registries")))]
+    #[command(mut_subcommands(crud_help(
+        "trust-registries",
+        "a trust registry",
+        "trust registries",
+        CrudUpdate::ChangesSentFields
+    )))]
     TrustRegistries {
         #[command(subcommand)]
         command: CrudCommand,
     },
     /// Manage DIDComm mediator records.
-    #[command(mut_subcommands(crud_help("mediators", "a mediator", "mediators")))]
+    #[command(mut_subcommands(crud_help("mediators", "a mediator", "mediators", CrudUpdate::ChangesSentFields)))]
     Mediators {
         #[command(subcommand)]
         command: CrudCommand,
@@ -325,7 +340,12 @@ enum Command {
     /// Manage MCP proxies, the services a surface Target can route MCP traffic
     /// through.
     #[command(name = "mcp-proxies")]
-    #[command(mut_subcommands(crud_help("mcp-proxies", "an MCP proxy", "MCP proxies")))]
+    #[command(mut_subcommands(crud_help(
+        "mcp-proxies",
+        "an MCP proxy",
+        "MCP proxies",
+        CrudUpdate::ChangesSentFields
+    )))]
     McpProxies {
         #[command(subcommand)]
         command: CrudCommand,
@@ -333,7 +353,12 @@ enum Command {
     /// Manage A2A proxies, which expose a managed agent that does not speak A2A
     /// as an A2A endpoint.
     #[command(name = "a2a-proxies")]
-    #[command(mut_subcommands(crud_help("a2a-proxies", "an A2A proxy", "A2A proxies")))]
+    #[command(mut_subcommands(crud_help(
+        "a2a-proxies",
+        "an A2A proxy",
+        "A2A proxies",
+        CrudUpdate::ChangesSentFields
+    )))]
     A2aProxies {
         #[command(subcommand)]
         command: CrudCommand,
@@ -346,7 +371,7 @@ enum Command {
     /// `client_secret_ref` names the secret by `secret_id`, and the value lives
     /// in `fabric agent-gateway secrets`.
     #[command(name = "sts-clients")]
-    #[command(mut_subcommands(crud_help("sts-clients", "an STS client", "STS clients")))]
+    #[command(mut_subcommands(crud_help("sts-clients", "an STS client", "STS clients", CrudUpdate::Replaces)))]
     StsClients {
         #[command(subcommand)]
         command: CrudCommand,
@@ -359,7 +384,12 @@ enum Command {
     /// `client_secret_secret_ref` and `api_key_secret_ref` fields name them by
     /// `secret_id`, and the values live in `fabric agent-gateway secrets`.
     #[command(name = "credential-providers")]
-    #[command(mut_subcommands(crud_help("credential-providers", "a credential provider", "credential providers")))]
+    #[command(mut_subcommands(crud_help(
+        "credential-providers",
+        "a credential provider",
+        "credential providers",
+        CrudUpdate::ChangesSentFields
+    )))]
     CredentialProviders {
         #[command(subcommand)]
         command: CrudCommand,
@@ -416,7 +446,7 @@ enum Command {
     /// variables its message can use, its connection settings, and the message
     /// content with ${VARIABLE} placeholders. The types and categories on offer
     /// come from the gateway's configuration.
-    #[command(mut_subcommands(crud_help("integrations", "an integration", "integrations")))]
+    #[command(mut_subcommands(crud_help("integrations", "an integration", "integrations", CrudUpdate::Replaces)))]
     Integrations {
         #[command(subcommand)]
         command: CrudCommand,
@@ -462,7 +492,8 @@ enum Command {
         mut_subcommands(crud_help(
             "jwt-verification-strategies",
             "a JWT verification strategy",
-            "JWT verification strategies"
+            "JWT verification strategies",
+            CrudUpdate::Custom(JWT_VERIFICATION_STRATEGIES_UPDATE_HELP)
         ))
     )]
     JwtVerificationStrategies {
@@ -1025,15 +1056,16 @@ enum SurfaceCommand {
     Create(SurfaceCreateArgs),
     /// Update an Agent Surface's fields, or replace it from a JSON document.
     ///
-    /// --set, --unset, --add and --remove go to the gateway as one merge
-    /// patch: fields they do not name keep their values, an object you set is
-    /// merged into the existing one, and a list you set replaces the whole
-    /// list. --file replaces the whole surface instead.
+    /// --set, --unset, --add and --remove send one merge patch: fields they
+    /// don't name keep their values, objects are merged, and a list you set is
+    /// replaced whole. --file replaces the whole surface, checking only the
+    /// file.
     ///
-    /// The surface is read first and the edit is checked for its required
-    /// fields. --add and --remove, including a tool pattern picked by its gate
-    /// in square brackets, send the whole list they change, so a change someone
-    /// else makes to that list between the read and the write is overwritten.
+    /// The other flags read the surface first and check the result; without
+    /// surfaces.view, --set and --unset are sent unchecked, with a warning.
+    /// --add and --remove send the whole list they change, overwriting any
+    /// change someone else made to it meanwhile.
+    ///
     /// See docs/SURFACES.md for details.
     #[command(after_long_help = SURFACES_UPDATE_EXAMPLES)]
     #[command(group(ArgGroup::new("change").required(true).multiple(true).args(["file", "set", "unset", "add", "remove"])))]
@@ -1095,16 +1127,15 @@ enum SurfaceCommand {
     },
     /// Add a feature to an Agent Surface.
     ///
-    /// Run `fabric agent-gateway surfaces features` for the feature names. The
-    /// configuration comes from --json or --file, or for a policy feature from
-    /// --policy-id. An object feature replaces what was there, and a list
-    /// feature, such as trust-check, gets the new item appended.
+    /// Feature names come from `fabric agent-gateway surfaces features`.
+    /// Configure it with --json or --file, or --policy-id for a policy. An
+    /// object feature replaces what was there; a list feature, such as
+    /// trust-check, gets the new item appended.
     ///
-    /// Where the feature goes is worked out from its name. A feature with one
-    /// place uses it; otherwise the request place is used unless you add
-    /// --response, and --transit-point picks one transit point. A feature on a
-    /// transit point sends the whole transit.points list, so a change someone
-    /// else makes to that list between the read and the write is overwritten.
+    /// The place is worked out from the name: the request place unless you add
+    /// --response, or one transit point with --transit-point. A transit-point
+    /// feature sends the whole transit.points list, overwriting any change
+    /// someone else made to it meanwhile.
     #[command(after_long_help = SURFACES_ADD_FEATURE_EXAMPLES)]
     AddFeature(AddFeatureArgs),
     /// Remove a feature from an Agent Surface.
@@ -1120,9 +1151,9 @@ enum SurfaceCommand {
     ///
     /// The point is appended to the surface's transit points and takes the
     /// protocol of the surface's access point, so on a didcomm surface the
-    /// gateway refuses it. An alias the surface already uses is refused. The CLI sends the surface's whole transit.points list,
-    /// so a change someone else makes to that list between the read and the
-    /// write is overwritten.
+    /// gateway refuses it. An alias the surface already uses is refused. The
+    /// CLI sends the whole transit.points list, so a change someone else makes
+    /// to it between the read and the write is overwritten.
     #[command(after_long_help = SURFACES_ADD_TRANSIT_POINT_EXAMPLES)]
     AddTransitPoint(AddTransitPointArgs),
     /// Remove a transit point from an Agent Surface by its alias or id.
@@ -1135,20 +1166,49 @@ enum SurfaceCommand {
     RemoveTransitPoint(RemoveTransitPointArgs),
     /// Preview which tools a set of MCP tool gates would allow or deny.
     ///
-    /// The gates come from a saved surface (only its own
-    /// `target.mcp_tool_gating`, not its variants or transit points) or from
-    /// --gates-file, which reads nothing from the gateway. Nothing is saved.
+    /// The gates come from a saved surface's own `target.mcp_tool_gating` (not
+    /// its variants or transit points) or from --gates-file. Nothing is saved.
     ///
-    /// Only the gateway can evaluate a gate's condition policy, so say what you
-    /// know with --condition; each other condition is tried both ways (at most
-    /// 3). A condition whose policy is missing or disabled keeps a block gate
-    /// on and an allow gate off, which the preview cannot detect.
+    /// Pin what you know about the caller with --condition; other conditions
+    /// are tried both ways (at most 3). A missing or disabled condition policy
+    /// keeps a block gate on and an allow gate off, which the preview can't
+    /// detect.
     ///
-    /// A pattern matches anywhere in a tool name unless anchored with ^; wrap
-    /// alternatives as ^(?:a|b). See docs/SURFACES.md for details.
+    /// See docs/SURFACES.md for pattern rules and details.
     #[command(after_long_help = TOOL_GATE_PREVIEW_EXAMPLES)]
     ToolGatePreview(ToolGatePreviewArgs),
 }
+
+/// Long help for `connection-points update`. Its integration list is read
+/// under a different name than `get` prints, so a `get` round trip would
+/// silently drop an integration edit.
+const CONNECTION_POINTS_UPDATE_HELP: &str = r#"Update a connection point from a JSON document.
+
+The gateway changes only name, description, enabled, and the integration list,
+and ignores other fields. It reads the integration list as
+`integration_integrations`, not as the `integrations` field that `get` prints,
+so send only the fields you change rather than editing `get` output:
+
+  echo '{"description": "EU partners", "enabled": true}' | \
+    fabric agent-gateway connection-points update <ID> --file -
+
+Use `--file -` to read the document from standard input."#;
+
+/// Long help for `jwt-verification-strategies update`, which always replaces
+/// the strategy rather than following the shared CRUD wording.
+const JWT_VERIFICATION_STRATEGIES_UPDATE_HELP: &str = r#"Update a JWT verification strategy from a JSON document.
+
+The document replaces the strategy's name, expected_issuer and jwks_source, so
+send all three. tenant_id is ignored and the strategy keeps its tenant; change
+it with `fabric agent-gateway tenant-ownership set jwt-verification-strategies
+<ID>`. Start from the current strategy:
+
+  fabric agent-gateway jwt-verification-strategies get <ID> \
+    --output json > record.json
+  fabric agent-gateway jwt-verification-strategies update <ID> \
+    --file record.json
+
+Use `--file -` to read the document from standard input."#;
 
 /// Examples shown at the bottom of `tool-gate-preview --help`.
 const TOOL_GATE_PREVIEW_EXAMPLES: &str = r#"Examples:
@@ -1468,7 +1528,7 @@ enum AccessTokenCommand {
     ///
     /// Give at least one --scope (or a `scopes` list in --file), or --full-role
     /// for your whole role. The token expires after 90 days unless you set
-    /// --expires-at, at most 10 years ahead; it can't be made to never expire.
+    /// --expires-at, at most 3650 days ahead; it can't be made to never expire.
     ///
     /// The secret is shown only once. In table output it is printed alone on
     /// standard output, so `PAT=$(...)` captures it; with --output json the
@@ -6719,6 +6779,128 @@ mod gateway_config_tests {
     }
 
     #[test]
+    fn every_shared_crud_group_names_its_own_resource() {
+        use clap::CommandFactory;
+        let groups = [
+            ("connections", "connections"),
+            ("connection-points", "connection points"),
+            ("issuers", "issuers"),
+            ("authorities", "authorities"),
+            ("trust-registries", "trust registries"),
+            ("mediators", "mediators"),
+            ("mcp-proxies", "MCP proxies"),
+            ("a2a-proxies", "A2A proxies"),
+            ("sts-clients", "STS clients"),
+            ("credential-providers", "credential providers"),
+            ("integrations", "integrations"),
+            ("jwt-verification-strategies", "JWT verification strategies"),
+        ];
+        let mut cli = Cli::command();
+        cli.build();
+        let gateway = cli
+            .find_subcommand("agent-gateway")
+            .expect("agent-gateway");
+        for (group, many) in groups {
+            let command = gateway
+                .find_subcommand(group)
+                .unwrap_or_else(|| panic!("group {group}"));
+            for name in ["list", "get", "create", "update", "delete"] {
+                let about = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("{group} {name}"))
+                    .get_about()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                assert!(!about.contains("entit"), "{group} {name} kept the generic help: {about}");
+            }
+            let list = command
+                .find_subcommand("list")
+                .and_then(clap::Command::get_about)
+                .map(ToString::to_string);
+            assert_eq!(list.as_deref(), Some(format!("List {many}").as_str()), "{group}");
+        }
+    }
+
+    #[test]
+    fn every_example_command_in_the_help_parses() {
+        use clap::CommandFactory;
+        fn help_texts(
+            command: &clap::Command,
+            path: &str,
+            texts: &mut Vec<(String, String)>,
+        ) {
+            let path = format!("{path} {}", command.get_name());
+            for text in [command.get_after_long_help(), command.get_long_about()]
+                .into_iter()
+                .flatten()
+            {
+                texts.push((path.clone(), text.to_string()));
+            }
+            for subcommand in command.get_subcommands() {
+                help_texts(subcommand, &path, texts);
+            }
+        }
+        let mut cli = Cli::command();
+        cli.build();
+        let mut texts = Vec::new();
+        help_texts(&cli, "", &mut texts);
+
+        let mut checked = 0;
+        for (path, text) in texts {
+            let mut lines: Vec<String> = Vec::new();
+            for line in text.lines() {
+                match lines.last_mut() {
+                    Some(last) if last.ends_with('\\') => {
+                        last.pop();
+                        last.push(' ');
+                        last.push_str(line.trim());
+                    }
+                    _ => lines.push(line.to_owned()),
+                }
+            }
+            for line in lines
+                .iter()
+                .filter(|line| line.starts_with("  "))
+            {
+                let Some(start) = line.find("fabric agent-gateway") else {
+                    continue;
+                };
+                let mut example = &line[start..];
+                if line[..start].ends_with('`') {
+                    example = example
+                        .split('`')
+                        .next()
+                        .unwrap_or(example);
+                }
+                // A line of an interactive shell session shows the prompt; what
+                // follows it is an Agent Gateway command typed without the prefix.
+                let shell_line;
+                if let Some(typed) = example.strip_prefix("fabric agent-gateway>") {
+                    if matches!(typed.trim(), "" | "exit" | "quit") {
+                        continue;
+                    }
+                    shell_line = format!("fabric agent-gateway {}", typed.trim());
+                    example = &shell_line;
+                }
+                let words: Vec<String> = shell_words::split(example)
+                    .unwrap_or_else(|error| panic!("{path}: cannot split `{example}`: {error}"))
+                    .into_iter()
+                    .take_while(|word| !matches!(word.as_str(), "|" | ">" | ">>" | "<"))
+                    .map(|word| {
+                        word.trim_end_matches(')')
+                            .to_owned()
+                    })
+                    .collect();
+                if let Err(error) = Cli::try_parse_from(&words) {
+                    panic!("{path}: example does not parse: {example}\n{error}");
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 50, "only {checked} examples were found");
+    }
+
+    #[test]
     fn tool_gate_preview_takes_repeatable_conditions() {
         let Command::Surfaces {
             command: SurfaceCommand::ToolGatePreview(args),
@@ -7906,10 +8088,13 @@ fn certificate_reference_help(about: &'static str) -> impl FnOnce(clap::Command)
 /// [`certificate_reference_help`] does for certificates. `a_one` is the
 /// resource with its article, such as "an issuer", and `many` its plural.
 /// The help only: the commands send the same requests for every group.
+/// `update` says what the group's gateway route does with fields the
+/// document leaves out, which differs between resources.
 fn crud_help(
     group: &'static str,
     a_one: &'static str,
     many: &'static str,
+    update: CrudUpdate,
 ) -> impl FnMut(clap::Command) -> clap::Command {
     let one = a_one
         .split_once(' ')
@@ -7930,15 +8115,26 @@ fn crud_help(
                     "Create {a_one} from a JSON document.\n\n\
                      `fabric agent-gateway {group} get <ID> --output json` prints an existing {one}, which shows the fields the gateway stores. Use `--file -` to read the document from standard input."
                 )),
-            "update" => subcommand
-                .about(format!("Update {a_one} from a JSON document"))
-                .long_about(format!(
+            "update" => {
+                let behaviour = match update {
+                    CrudUpdate::Replaces => format!(
+                        "The document is sent as an HTTP PUT and replaces the whole {one}: a field it leaves out is cleared. Start from the current {one}:\n\n"
+                    ),
+                    CrudUpdate::ChangesSentFields => format!(
+                        "The document is sent as an HTTP PUT. The gateway changes only the fields it sets and keeps the rest. To see the current fields, start from the current {one}:\n\n"
+                    ),
+                    CrudUpdate::Custom(text) => {
+                        return subcommand.about(format!("Update {a_one} from a JSON document")).long_about(text);
+                    }
+                };
+                subcommand.about(format!("Update {a_one} from a JSON document")).long_about(format!(
                     "Update {a_one} from a JSON document.\n\n\
-                     The document is sent as an HTTP PUT. Depending on the resource, the gateway either replaces the whole {one}, clearing any field the document leaves out, or changes only the fields the document sets and keeps the rest. Either way, start from the current {one}:\n\n  \
+                     {behaviour}  \
                      fabric agent-gateway {group} get <ID> \\\n    --output json > record.json\n  \
                      fabric agent-gateway {group} update <ID> \\\n    --file record.json\n\n\
                      Use `--file -` to read the document from standard input."
-                )),
+                ))
+            }
             "delete" => subcommand.about(format!("Delete {a_one} by ID")).long_about(format!(
                 "Delete {a_one} by ID.\n\n\
                  The request is sent as soon as the command runs: there is no confirmation prompt and no --yes flag. The ID is sent as given: a name is not looked up."
@@ -7946,6 +8142,18 @@ fn crud_help(
             _ => subcommand,
         }
     }
+}
+
+/// What a shared-CRUD group's gateway route does with fields an `update`
+/// document leaves out, for [`crud_help`].
+#[derive(Clone, Copy)]
+enum CrudUpdate {
+    /// The record is replaced whole, so an omitted field is cleared.
+    Replaces,
+    /// Only the fields sent change; the rest are kept.
+    ChangesSentFields,
+    /// The group needs its own `update` long help.
+    Custom(&'static str),
 }
 
 /// Runs the certificates commands through the shared CRUD flow, except
@@ -13479,15 +13687,14 @@ use crate::client::{REDACTED, RawAuth, clean_for_terminal, gateway_error};
 enum AuditCommand {
     /// List audit events, newest first.
     ///
-    /// The log records gateway traffic: delegation consent and tokens, policy
-    /// decisions, trust checks, VP injection, payments and trace terminations.
-    /// Admin API calls are not recorded, except revoking delegation tokens.
-    /// Policy decisions, trust checks and VP injection are recorded only while
-    /// audit_enabled and their audit_categories setting are both on.
+    /// The log records gateway traffic, such as delegation, policy decisions,
+    /// trust checks, VP injection and payments, but not admin API calls (except
+    /// revoking delegation tokens). Policy decisions, trust checks and VP
+    /// injection are recorded only while audit_enabled and their category are
+    /// both on.
     ///
-    /// An empty result can also mean the gateway could not read its audit log.
-    /// The caller's email and name and each event's vp_jwt are replaced with a
-    /// placeholder unless --reveal is passed, in an --all export too.
+    /// An empty result can also mean the gateway couldn't read its log. Callers'
+    /// email and name and each vp_jwt are redacted unless you pass --reveal.
     ///
     /// See docs/OBSERVABILITY.md for details.
     #[command(after_long_help = AUDIT_LIST_EXAMPLES)]
