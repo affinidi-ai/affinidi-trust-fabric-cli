@@ -3,6 +3,32 @@
 version = 4
 
 [[package]]
+name = "affinidi-trust-fabric-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "dirs",
+ "keyring",
+ "open",
+ "rand 0.9.5",
+ "regex",
+ "regex-syntax",
+ "reqwest",
+ "rpassword",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shell-words",
+ "tempfile",
+ "tokio",
+ "toml",
+ "url",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -403,32 +429,6 @@ name = "error-code"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
-
-[[package]]
-name = "fabric-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "dirs",
- "keyring",
- "open",
- "rand 0.9.5",
- "regex",
- "regex-syntax",
- "reqwest",
- "rpassword",
- "rustyline",
- "serde",
- "serde_json",
- "sha2",
- "shell-words",
- "tempfile",
- "tokio",
- "toml",
- "url",
-]
 
 [[package]]
 name = "fastrand"

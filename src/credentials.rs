@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-const SERVICE_NAME: &str = "affinidi-fabric-cli";
+const SERVICE_NAME: &str = "affinidi-trust-fabric-cli";
 
 pub trait CredentialStore {
     fn get_token(
