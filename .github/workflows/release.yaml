@@ -1,0 +1,30 @@
+name: release
+
+# Pushing a tag `v<version>` that matches the version in Cargo.toml builds the
+# Linux binaries and publishes them to the GitHub Release for that tag.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Every job gets read-only access unless it asks for more below.
+permissions:
+  contents: read
+
+# Shared workflows are pinned to a commit so a change upstream can't run here
+# until someone bumps the pin. Inside the shared workflow only the final
+# publish job uses the write access granted here; the build and smoke test
+# jobs are read-only. No secrets are passed; publishing uses the job token.
+jobs:
+  linux-binaries:
+    # Points at the pipeline-rust branch until release-binaries.yaml is merged
+    # there, so the pin rule above does not hold yet.
+    # TODO pin to commit after pipeline-rust merge
+    uses: affinidi/pipeline-rust/.github/workflows/release-binaries.yaml@release-binaries
+    permissions:
+      contents: write
+    with:
+      binary: fabric
+      toolchain: '1.96.0'
+      # The README promises glibc 2.34; the build fails if a binary needs newer.
+      max-glibc: '2.34'

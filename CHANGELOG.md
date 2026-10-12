@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `whoami` shows details of the personal access token in use.
 - With no saved connection selected, `FABRIC_HOST` and `FABRIC_TOKEN` (or `--host` and `--token`) together run any gateway command without `login` and without the OS credential store, so the CLI works on a Linux server with no desktop session.
 - `whoami` shows the gateway's version as `gateway_version`.
+- Prebuilt Linux binaries for x86_64 and aarch64, with a `SHA256SUMS` file, attached to each GitHub release.
 
 ### Changed
 
