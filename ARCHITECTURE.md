@@ -143,7 +143,8 @@ delete that line from `config.toml`, and set `FABRIC_HOST` too.
 | --- | --- | --- |
 | Connect timeout | 10 s | `CONNECT_TIMEOUT` |
 | Inactivity (read) timeout | 120 s | `READ_TIMEOUT` |
-| Whole-request timeout | 300 s, on every call except the log archive download | `TOTAL_TIMEOUT` |
+| Whole-request timeout | 300 s, on every call except the log archive download and the version request | `TOTAL_TIMEOUT` |
+| Version request timeout | 10 s, on the gateway version request `whoami` makes | `VERSION_TIMEOUT` |
 | Redirects | At most 5, and only to the same origin; any other redirect is not followed and the 3xx is reported | `MAX_REDIRECTS`, `same_origin_redirects` |
 | User agent | `affinidi-trust-fabric-cli/<version>` | `build_http_client` |
 
@@ -162,6 +163,7 @@ The request methods are:
 | `request_bytes` | Non-JSON success bodies, such as the Prometheus exposition; bearer or HTTP Basic (`RawAuth`) |
 | `download_bytes` | The log archive, with only the inactivity timeout applied |
 | `check_auth`, `check_pat_auth`, `end_session` | Login validation and logout |
+| `gateway_version` | The gateway's version from the public `/v1/version` route, sent without the token and held to `VERSION_TIMEOUT` (10 s). An answer over `MAX_VERSION_BODY_BYTES` (4 KiB) is refused; from the version text only ASCII letters, digits, `.`, `-` and `+` are kept, cut to 64 characters. A non-200 answer keeps its status for `response_status`, so `whoami` can stay quiet on a 404 and warn on anything else |
 
 A non-success status becomes a `GatewayStatusError` built by `gateway_error`. It picks
 the reason out of the known error body shapes (`message`, or `error` with `details`),

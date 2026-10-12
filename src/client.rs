@@ -33,12 +33,26 @@ pub(crate) const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// port, so the token never goes anywhere the user did not point the CLI at.
 const MAX_REDIRECTS: usize = 5;
 
+/// How long the whole version request may take. The version is a small extra
+/// on `whoami`, so a gateway that is slow to give it must not hold the command
+/// for the full [`TOTAL_TIMEOUT`].
+pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most characters of the gateway's version the CLI keeps. A version is a
+/// short label such as `1.0.0`, so a longer answer is cut.
+pub(crate) const MAX_VERSION_CHARS: usize = 64;
+
+/// Largest version answer the CLI reads. The answer is a tiny JSON object, so
+/// anything bigger is refused before it is held in memory.
+pub(crate) const MAX_VERSION_BODY_BYTES: usize = 4 * 1024;
+
 #[derive(Clone)]
 pub struct GatewayClient {
     host: String,
     token: String,
     http: reqwest::Client,
     total_timeout: Duration,
+    version_timeout: Duration,
 }
 
 impl GatewayClient {
@@ -51,6 +65,7 @@ impl GatewayClient {
             token: token.into(),
             http: build_http_client()?,
             total_timeout: TOTAL_TIMEOUT,
+            version_timeout: VERSION_TIMEOUT,
         })
     }
 
@@ -97,6 +112,67 @@ impl GatewayClient {
                  gateway is healthy"
             ),
         }
+    }
+
+    /// The version the gateway reports at `/v1/version`. The route is public,
+    /// so no token is sent, and the request is held to [`VERSION_TIMEOUT`].
+    /// The answer is read up to [`MAX_VERSION_BODY_BYTES`]; from the version
+    /// text only ASCII letters, digits, `.`, `-` and `+` are kept, cut to
+    /// [`MAX_VERSION_CHARS`]. Fails when the request times out or does not
+    /// complete, the gateway answers anything but 200 (with the status kept
+    /// for [`response_status`]), the answer is too large or not JSON, or
+    /// `version` is missing, not text, or empty once filtered.
+    pub async fn gateway_version(&self) -> Result<String> {
+        let url = self.url("/v1/version")?;
+        let read_error = |error: reqwest::Error, action: &str| {
+            if error.is_timeout() {
+                anyhow::anyhow!("the gateway version request timed out after {:?}", self.version_timeout)
+            } else {
+                anyhow::Error::new(error).context(format!("{action} {url}"))
+            }
+        };
+        let mut response = self
+            .http
+            .get(&url)
+            .timeout(self.version_timeout)
+            .send()
+            .await
+            .map_err(|error| read_error(error, "request"))?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            return Err(status_error(status, format!("gateway answered {status}")));
+        }
+        let too_large = || anyhow::anyhow!("gateway version answer too large (over {MAX_VERSION_BODY_BYTES} bytes)");
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_VERSION_BODY_BYTES as u64)
+        {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| read_error(error, "read the version answer from"))?
+        {
+            if body.len() + chunk.len() > MAX_VERSION_BODY_BYTES {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body: Value = serde_json::from_slice(&body).context("gateway version answer is not JSON")?;
+        let version: String = body
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+            .take(MAX_VERSION_CHARS)
+            .collect();
+        if version.is_empty() {
+            bail!("gateway version answer has no version text");
+        }
+        Ok(version)
     }
 
     /// End the session behind a session token on the gateway, so a copy of it
@@ -901,6 +977,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_version_reads_the_version_text() {
+        let host = one_shot_body_server("HTTP/1.1 200 OK", "application/json", r#"{"version":"1.0.0"}"#).await;
+        let client = GatewayClient::new(host, "agpat_valid").expect("client");
+
+        let version = client
+            .gateway_version()
+            .await
+            .expect("version");
+
+        assert_eq!(version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn gateway_version_asks_the_public_route_without_the_token() {
+        let (host, request) = capturing_server().await;
+        let client = GatewayClient::new(host, "agpat_secret").expect("client");
+
+        let _ = client.gateway_version().await;
+
+        let request = request
+            .await
+            .expect("request");
+        assert!(request.starts_with("GET /api/v1/version HTTP/1.1"), "{request}");
+        assert!(!request.contains("agpat_secret"), "{request}");
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("authorization:"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_version_fails_on_a_gateway_without_the_route() {
+        let host = one_shot_server_with_body("HTTP/1.1 404 Not Found", r#"{"error":"not found"}"#).await;
+        let client = GatewayClient::new(host, "").expect("client");
+
+        let error = client
+            .gateway_version()
+            .await
+            .expect_err("a 404 has no version");
+
+        assert_eq!(response_status(&error), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn gateway_version_fails_on_an_answer_without_version_text() {
+        for body in
+            ["<html>not json</html>", r#"{"version":7}"#, r#"{"version":null}"#, "{}", r#"{"version":" \u001b "}"#]
+        {
+            let host = one_shot_body_server("HTTP/1.1 200 OK", "application/json", body).await;
+            let client = GatewayClient::new(host, "").expect("client");
+
+            client
+                .gateway_version()
+                .await
+                .expect_err(body);
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_version_keeps_only_version_characters_and_is_cut_to_the_cap() {
+        let unsafe_body = r#"{"version":"1.0\u001b[2J\u202e\n-beta\u0007"}"#;
+        let host = one_shot_body_server("HTTP/1.1 200 OK", "application/json", unsafe_body).await;
+        let client = GatewayClient::new(host, "").expect("client");
+        let long_body: &'static str = Box::leak(format!(r#"{{"version":"{}"}}"#, "9".repeat(500)).into_boxed_str());
+        let long_host = one_shot_body_server("HTTP/1.1 200 OK", "application/json", long_body).await;
+        let long_client = GatewayClient::new(long_host, "").expect("client");
+
+        let version = client
+            .gateway_version()
+            .await
+            .expect("version");
+        let long_version = long_client
+            .gateway_version()
+            .await
+            .expect("version");
+
+        assert_eq!(version, "1.02J-beta");
+        assert_eq!(long_version, "9".repeat(MAX_VERSION_CHARS));
+    }
+
+    #[tokio::test]
+    async fn gateway_version_drops_invisible_characters() {
+        let host =
+            one_shot_body_server("HTTP/1.1 200 OK", "application/json", r#"{"version":"\ufeff1.0\u200b.0 "}"#).await;
+        let client = GatewayClient::new(host, "").expect("client");
+
+        let version = client
+            .gateway_version()
+            .await
+            .expect("version");
+
+        assert_eq!(version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn gateway_version_refuses_an_answer_over_the_size_cap() {
+        let body = format!(r#"{{"version":"1.0.0","pad":"{}"}}"#, "x".repeat(MAX_VERSION_BODY_BYTES));
+        let with_length =
+            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+        let without_length = format!("HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n{body}");
+        for response in [with_length, without_length] {
+            let client = GatewayClient::new(raw_response_server(response).await, "").expect("client");
+
+            let error = client
+                .gateway_version()
+                .await
+                .expect_err("an oversized answer is refused");
+
+            assert!(format!("{error:#}").contains("gateway version answer too large"), "{error:#}");
+        }
+    }
+
+    /// Starts a one-shot HTTP server that writes `response` exactly as given,
+    /// then closes, and returns its base URL.
+    async fn raw_response_server(response: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener
+            .local_addr()
+            .expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(response.as_bytes())
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
     async fn basic_credentials_replace_the_bearer_token() {
         let (host, request) = capturing_server().await;
         let client = GatewayClient::new(host, "agpat_secret").expect("client");
@@ -1011,6 +1224,41 @@ mod tests {
             Ok(result) => assert!(result.is_err(), "the call should have failed"),
             Err(_) => panic!("the call was not cut off by the total timeout"),
         }
+    }
+
+    #[tokio::test]
+    async fn the_version_timeout_cuts_off_a_gateway_that_never_answers() {
+        let mut client = GatewayClient::new(silent_server().await, "").expect("client");
+        client.version_timeout = Duration::from_millis(300);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), client.gateway_version()).await;
+
+        let error = outcome
+            .expect("the version request was not cut off by its timeout")
+            .expect_err("a silent gateway has no version");
+        assert_eq!(response_status(&error), None);
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn the_version_timeout_cuts_off_a_version_answer_that_drips_in() {
+        let mut client = GatewayClient::new(dripping_server().await, "").expect("client");
+        client.version_timeout = Duration::from_millis(300);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), client.gateway_version()).await;
+
+        let error = outcome
+            .expect("the version request was not cut off by its timeout")
+            .expect_err("a dripping gateway has no version in time");
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    }
+
+    #[test]
+    fn the_version_timeout_is_shorter_than_the_total_timeout() {
+        let client = GatewayClient::new("http://127.0.0.1:1", "").expect("client");
+
+        assert_eq!(client.version_timeout, VERSION_TIMEOUT);
+        assert!(VERSION_TIMEOUT < TOTAL_TIMEOUT);
     }
 
     #[tokio::test]

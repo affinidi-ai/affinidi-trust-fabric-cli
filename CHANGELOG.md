@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `surfaces add-transit-point` and `surfaces remove-transit-point`.
 - `whoami` shows details of the personal access token in use.
 - With no saved connection selected, `FABRIC_HOST` and `FABRIC_TOKEN` (or `--host` and `--token`) together run any gateway command without `login` and without the OS credential store, so the CLI works on a Linux server with no desktop session.
+- `whoami` shows the gateway's version as `gateway_version`.
 
 ### Changed
 
