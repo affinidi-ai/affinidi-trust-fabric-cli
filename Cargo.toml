@@ -16,7 +16,10 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 dirs = "6"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# On Linux, the pure Rust Secret Service client, so the binary does not link
+# libdbus. Its runtime is async-io, not tokio: keyring's blocking calls would
+# otherwise start a tokio runtime inside the CLI's own and panic.
+keyring = { version = "3", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 open = "5"
 rand = "0.9"
 regex = "1"
@@ -31,6 +34,12 @@ shell-words = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml = "0.9"
 url = "2"
+
+# Both already pulled in by keyring; named here only to tell a Secret Service
+# that can't be reached over D-Bus apart from other Secret Service errors.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = "4"
+zbus = { version = "4", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

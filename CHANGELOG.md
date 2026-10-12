@@ -14,11 +14,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `surfaces features`, which shows the features a surface has and how to remove them.
 - `surfaces add-transit-point` and `surfaces remove-transit-point`.
 - `whoami` shows details of the personal access token in use.
+- With no saved connection selected, `FABRIC_HOST` and `FABRIC_TOKEN` (or `--host` and `--token`) together run any gateway command without `login` and without the OS credential store, so the CLI works on a Linux server with no desktop session.
 
 ### Changed
 
 - Every list prints as one table and every delete as one line.
 - `surfaces create` output is clearer.
+- With a saved connection selected, a command given both `FABRIC_HOST` and `FABRIC_TOKEN` (or `--host` and `--token`) no longer opens the OS credential store either, and `whoami` reports `token_stored: false` for a token given that way.
+- On Linux the binary no longer links the system `libdbus` library, and a Secret Service that can't be reached over D-Bus gives an error that suggests `FABRIC_HOST` and `FABRIC_TOKEN`.
 
 ### Fixed
 

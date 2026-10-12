@@ -85,8 +85,10 @@ instead of `OsCredentialStore`.
 | `MemoryCredentials` | `config.rs` tests, `tests` in `commands.rs` | A `HashMap` behind a `Mutex`. Bound hosts work through the trait's default methods. |
 | `MemoryStore` | `credentials.rs` tests | The same, for the trait's own tests |
 | `NoCredentials` | `gateway_config_tests` in `commands.rs` | Holds nothing, and every write fails. For commands that pass `--token`. |
+| `UnreachableKeyring` | `tests` in `commands.rs` | Panics on any use, for commands given both a host and a token, which must never open the credential store |
 | `UnwritableCredentials` | `tests` in `commands.rs` | Wraps `MemoryCredentials`, but `set_token` fails, for the path where a bound host cannot be recorded |
 | `FailingCredentials` | `config.rs` tests | Writes fail, for legacy token migration |
+| `NoSecretService` | `config.rs` tests, Linux only | Every call fails as the Secret Service client does with no D-Bus session, for the migration hint |
 
 The one test that does use the real keyring, `os_keyring_round_trip` in
 `credentials.rs`, is marked `#[ignore]` so it never runs by default.

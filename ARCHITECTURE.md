@@ -35,7 +35,7 @@ The CLI keeps two pieces of local state, and keeps them apart.
 | State | Where | Notes |
 | --- | --- | --- |
 | Connections | `fabric/config.toml` under the user configuration directory (`dirs::config_dir`), so `~/Library/Application Support/fabric/config.toml` on macOS, `$XDG_CONFIG_HOME/fabric/config.toml` on Linux, and `%APPDATA%\fabric\config.toml` on Windows | `Config` holds the `current` connection name and a map of named `Connection`s, each just a `host`. On Unix the file is written owner-only (`0600`). |
-| Tokens | The OS credential store, through the `keyring` crate: macOS Keychain, Windows Credential Manager, or Linux Secret Service | The service name is `affinidi-trust-fabric-cli`. The account is the connection name. The host the token was issued for is kept beside it under `<name>#bound-host`. |
+| Tokens | The OS credential store, through the `keyring` crate: macOS Keychain, Windows Credential Manager, or Linux Secret Service (over D-Bus with the pure Rust `zbus` client, so the binary does not link `libdbus`) | The service name is `affinidi-trust-fabric-cli`. The account is the connection name. The host the token was issued for is kept beside it under `<name>#bound-host`. |
 
 Because the bound host shares the account namespace, `login` refuses a connection name
 containing `#`, and `Config::hash_name_warnings` warns about any such name already saved.
@@ -99,25 +99,40 @@ shared `CrudCommand`.
 
 `run` calls `dispatch`, which first tries `run_offline` for commands that need no
 connection at all (today, `surfaces tool-gate-preview --gates-file`). Otherwise it
-opens the real `OsCredentialStore`, loads `Config`, and calls `dispatch_with`, which
-takes the config and a `&impl CredentialStore` as arguments so tests can supply both.
+creates the real `OsCredentialStore`, loads `Config`, migrates any plaintext legacy
+tokens into the credential store, and calls `dispatch_with`, which takes the config and
+a `&impl CredentialStore` as arguments so tests can supply both. The migration is
+skipped when `skips_the_credential_store` says the command was given both a host and a
+token and is not `login`, `logout` or `config`, because such a command never reads the
+credential store, so a server with no desktop session never reaches the keyring.
 
 `dispatch_with` first handles the commands that do not take the shared path below
 (`login`, `logout`, `config`, `whoami`, and the feature list with no surface). For every
-other command it:
+other command, and for `whoami`, `command_target` picks the host and token:
 
-1. Resolves the connection with `Config::resolve`: the `--connection` value, else the
-   `current` one.
-2. Picks the host with `command_host`: a `--host` value (typed or from `FABRIC_HOST`) goes through
+1. With no `--connection` and no `current` connection, and both a `--host` and a
+   `--token` (typed or from `FABRIC_HOST` and `FABRIC_TOKEN`), it uses those two as they
+   are, after `normalize_user_host`, and never touches the credential store.
+2. Otherwise it resolves the connection with `Config::resolve`: the `--connection`
+   value, else the `current` one.
+3. It picks the host with `command_host`: a `--host` value goes through
    `normalize_user_host`, which refuses plain `http://` to a non-loopback host unless
    `--allow-http` is set; otherwise the saved host is used, with a warning (once per
    host per process) if it is plain `http://` to a remote machine.
-3. Picks the token: `--token` if given; otherwise `check_token_host` confirms the host
+4. It picks the token: `--token` if given, without opening the credential store; otherwise `check_token_host` confirms the host
    matches the connection's bound host, and the token is read from the credential store.
    A mismatch is refused unless `--allow-host-override` was typed. For a connection
    saved before bound hosts existed, the saved host is recorded as the bound host on
    first use.
-4. Builds a `GatewayClient` for that host and token.
+
+The command then builds a `GatewayClient` for that host and token. On Linux, `dispatch`
+passes any error from `dispatch_with` through `add_no_keyring_hint`, which adds a hint
+naming `FABRIC_HOST` and `FABRIC_TOKEN` when a Secret Service call failed because there
+is no D-Bus session or the message bus answered `ServiceUnknown`. A running keyring that
+refuses a call gets no hint. The legacy token migration runs before `dispatch_with` and
+reruns on every command that may use the store, so it adds its own hint through
+`add_no_keyring_migration_hint`: copy the plaintext `token` value into `FABRIC_TOKEN`,
+delete that line from `config.toml`, and set `FABRIC_HOST` too.
 
 ### The HTTP client
 

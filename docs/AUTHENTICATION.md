@@ -44,7 +44,7 @@ The captured token is validated with `/api/auth/check`, then stored in the OS cr
 
 ### Sign in with a token you already have
 
-For automation or headless environments, supply the token manually instead of using the browser:
+For automation, or a machine with no browser, supply the token manually instead of using the browser. `login` still saves the token in the OS credential store; on a Linux server with no desktop session, which has none, [run without a saved connection](#run-without-a-saved-connection) instead.
 
 ```sh
 fabric agent-gateway login --host https://gateway.example.com --paste          # prompt to paste a token
@@ -166,7 +166,7 @@ fabric agent-gateway whoami --output json
 
 `whoami` shows:
 
-- the current connection and host, and whether a token is stored;
+- the connection and host in use, and whether the token was read from the OS credential store (`token_stored`), which is `false` for a token given with `--token` or `FABRIC_TOKEN`;
 - checked live against the gateway, whether that token is still accepted;
 - the signed-in username, role, email, user ID, and name.
 
@@ -296,6 +296,10 @@ These rules apply to `login`, `logout`, `whoami`, and every command that talks t
 
 Tokens are stored in the operating system credential store: macOS Keychain, Windows Credential Manager, or Linux Secret Service. Bearer tokens are never written to the CLI configuration file.
 
+On Linux the CLI reaches the Secret Service over the D-Bus session bus, which a server with no desktop session does not have. There, any command that needs the credential store, such as `login`, `logout`, or `config remove`, fails with an error that suggests `FABRIC_HOST` and `FABRIC_TOKEN`; see [Run without a saved connection](#run-without-a-saved-connection).
+
+If the configuration file still holds a plaintext token from an older version, the CLI can't move it into the store there either, and the error says so instead. The error names the connection whose token could not be moved and that connection's saved host, which may not be the current connection. Copy that connection's `token` value into `FABRIC_TOKEN`, set `FABRIC_HOST` to the host the error shows, and delete that `token` line from the file. If more than one connection still holds a token, the next command names the next one.
+
 Non-secret connection metadata, such as profile names, hosts, and the current profile, stays in the user configuration directory:
 
 | OS | Configuration file |
@@ -304,7 +308,7 @@ Non-secret connection metadata, such as profile names, hosts, and the current pr
 | Linux | Normally `~/.config/fabric/config.toml` |
 | Windows | `%APPDATA%\fabric\config.toml` |
 
-Existing plaintext-token configurations are migrated to the OS credential store and scrubbed automatically on the next CLI invocation.
+A configuration from an older version that still holds plaintext tokens is migrated to the OS credential store and scrubbed on the next command that may use the store. A command given both a host and a token never opens the store, so it leaves the file as it is; `login`, `logout`, and `config` always migrate.
 
 <details>
 <summary>How credential-store entries are named</summary>
@@ -329,7 +333,26 @@ A saved token is only sent to the host it was saved for. `--host` with a differe
 
 ### `--host` and `--token` last for one command
 
-The global `--host` and `--token` options, and `FABRIC_HOST` and `FABRIC_TOKEN`, are temporary overrides for a single command. They override a saved connection rather than replace one: with no saved connection, a command fails with `no gateway connection configured`. Run `login` first, including in CI.
+The global `--host` and `--token` options, and `FABRIC_HOST` and `FABRIC_TOKEN`, apply to a single command and are never saved.
+
+- With a saved connection selected, by `--connection`, `FABRIC_CONNECTION`, or the current connection, they override that connection's host or token for this command. A command given both never opens the OS credential store.
+- With no saved connection selected, a command needs both of them, as described below. With only one, it fails with `no gateway connection configured`, which says to run `login` or set both.
+
+### Run without a saved connection
+
+With no saved connection selected, a command given both a host and a token sends that token to that host and never opens the OS credential store. This is how to use the CLI on a Linux server with no desktop session, in a container, or in CI, without running `login`:
+
+```sh
+export FABRIC_HOST=https://gateway.example.com
+export FABRIC_TOKEN="$PAT"
+fabric agent-gateway whoami
+fabric agent-gateway surfaces list --output json
+```
+
+- `whoami` shows no `connection` line, because none is used.
+- `--connection` (or `FABRIC_CONNECTION`) naming a connection that isn't saved still fails, so a typo can't send the token somewhere unexpected.
+- `login`, `logout`, and `config` work on saved connections, so they still need the credential store.
+- The usual host checks apply: plain `http://` to a host other than this machine needs `--allow-http`, and the CLI prints a note naming the host when both values come from the environment.
 
 ### Keep tokens out of shell history
 
