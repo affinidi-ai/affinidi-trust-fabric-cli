@@ -167,8 +167,11 @@ fabric agent-gateway whoami --output json
 `whoami` shows:
 
 - the connection and host in use, and whether the token was read from the OS credential store (`token_stored`), which is `false` for a token given with `--token` or `FABRIC_TOKEN`;
+- the gateway's version (`gateway_version`);
 - checked live against the gateway, whether that token is still accepted;
 - the signed-in username, role, email, user ID, and name.
+
+The gateway gives its version without a token, so `whoami` asks for it even before you log in. When the version can't be read, it shows `unknown` in the table and `null` in JSON, and `whoami` still succeeds. An older gateway without the version route is skipped quietly. Any other failure, such as a network error, a server error, or an answer with no version, also prints a warning on standard error.
 
 For a personal access token it also shows the token's ID and name and the scopes the token was granted. The name is left out when the token lacks `access_tokens.view`. A session login holds its whole role and shows no token or scopes.
 
@@ -372,7 +375,7 @@ There is no separate refresh token. Once the session has been idle past the time
 ### Requests time out and stay on one host
 
 - Every request waits at most 10 seconds to connect and gives up when no data arrives for 120 seconds.
-- Every call except `logs download` also ends after 5 minutes in total, so a gateway that sends one byte at a time can't hold the CLI. The log archive is only held to the 120 second limit, so a large download that keeps arriving isn't cut off.
+- Every call except `logs download` also ends after 5 minutes in total, so a gateway that sends one byte at a time can't hold the CLI. The log archive is only held to the 120 second limit, so a large download that keeps arriving isn't cut off. The gateway version request that `whoami` makes ends after 10 seconds.
 - Redirects are followed only within the same scheme, host, and port, so the token never goes to another host. The browser login's code exchange follows the same rules.
 - A plain `http://` host other than this machine, typed with `--host` or set in `FABRIC_HOST` (including on `login`), is refused unless you pass `--allow-http`, because the token would be sent unencrypted. With `--allow-http` the CLI warns on standard error. `--allow-http` is a flag only, with no environment variable.
 - A saved connection that uses plain `http` to a remote host prints a warning once per host in a run.

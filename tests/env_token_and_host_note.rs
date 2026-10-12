@@ -1,49 +1,23 @@
 //! Runs the built `fabric` binary with the token and host set in the
 //! environment and checks the note printed on standard error.
 
-use std::process::{Command, Output};
+mod common;
 
-use tempfile::TempDir;
+use std::process::Output;
+
+use common::fabric_with_saved_host;
 
 const ENV_HOST: &str = "http://127.0.0.1:1";
 const SAVED_HOST: &str = "http://127.0.0.1:2";
 const TOKEN: &str = "secret-token-value";
 
-/// Runs `fabric agent-gateway <args>` with a saved connection and exactly the
-/// environment variables in `environment`.
+/// Runs `fabric agent-gateway <args>` with a saved connection to
+/// `SAVED_HOST` and exactly the environment variables in `environment`.
 fn fabric(
     args: &[&str],
     environment: &[(&str, &str)],
 ) -> Output {
-    let home = TempDir::new().expect("temp dir");
-    for directory in [
-        home.path()
-            .join("Library/Application Support/fabric"),
-        home.path().join("xdg/fabric"),
-    ] {
-        std::fs::create_dir_all(&directory).expect("config directory");
-        std::fs::write(
-            directory.join("config.toml"),
-            format!("current = \"test\"\n\n[connections.test]\nhost = \"{SAVED_HOST}\"\n"),
-        )
-        .expect("config file");
-    }
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fabric"));
-    command
-        .arg("agent-gateway")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path().join("xdg"))
-        .env_remove("FABRIC_TOKEN")
-        .env_remove("FABRIC_HOST")
-        .env_remove("FABRIC_CONNECTION");
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-    command
-        .output()
-        .expect("run fabric")
+    fabric_with_saved_host(SAVED_HOST, args, environment)
 }
 
 fn stderr(output: &Output) -> String {
