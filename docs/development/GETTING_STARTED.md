@@ -19,8 +19,7 @@ At the end of this guide you will have:
 | --- | --- |
 | Git | Used to clone and work with the repository |
 | Rust `1.85.0` or newer | The minimum version, declared as `rust-version` in [`Cargo.toml`](../../Cargo.toml). The crate uses the 2024 edition. Install with [rustup](https://rustup.rs). |
-| An OS credential store | macOS Keychain, Windows Credential Manager, or Linux Secret Service. Tokens are stored there, never in a file. |
-| Linux only: D-Bus development files and `pkg-config` | The Secret Service backend links the system `libdbus` through the `libdbus-sys` crate, which finds it with `pkg-config`. On Debian or Ubuntu that is `libdbus-1-dev` and `pkg-config`. |
+| An OS credential store | macOS Keychain, Windows Credential Manager, or Linux Secret Service. Tokens are stored there, never in a file. On Linux the CLI talks to the Secret Service over D-Bus with a pure Rust client, so building needs no system D-Bus library. |
 | `make` | Optional. The [`Makefile`](../../Makefile) wraps the build and the macOS codesign step. |
 | A macOS codesigning identity | Optional, macOS only. See [Codesigning on macOS](#codesigning-on-macos). |
 | [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) | Optional. Needed to run the licence and advisory check locally. |

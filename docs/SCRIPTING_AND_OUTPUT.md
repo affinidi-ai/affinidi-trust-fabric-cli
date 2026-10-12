@@ -203,7 +203,7 @@ The gateway's own wording tells a role that lacks the permission apart from a pe
 | `FABRIC_METRICS_USERNAME`, `FABRIC_METRICS_PASSWORD` | `metrics scrape` | HTTP Basic credentials for the Prometheus route. Set both or neither |
 
 > [!IMPORTANT]
-> `FABRIC_HOST`, `FABRIC_TOKEN`, `--host`, and `--token` override a **saved connection**; they don't replace one. With no saved connection, a command fails with `no gateway connection configured`. In CI, sign in first, for example `printf '%s' "$PAT" | fabric agent-gateway login --host <URL> --pat --token-stdin`, then run commands.
+> With a saved connection selected, `FABRIC_HOST`, `FABRIC_TOKEN`, `--host`, and `--token` override its host or token for one command. With no saved connection selected, set **both** `FABRIC_HOST` and `FABRIC_TOKEN` and every command runs without `login` and without the OS credential store, which suits CI and Linux servers with no desktop session. With only one of them, a command fails with `no gateway connection configured`. See [Run without a saved connection](AUTHENTICATION.md#run-without-a-saved-connection).
 
 A saved connection's host and token live in the configuration file and the OS credential store, described in [Authentication](AUTHENTICATION.md#tokens-live-in-the-os-credential-store).
 

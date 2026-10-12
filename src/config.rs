@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::credentials::CredentialStore;
+use crate::credentials::{CredentialStore, add_no_keyring_migration_hint};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -49,7 +49,10 @@ impl Config {
         let name = name
             .or(self.current.as_deref())
             .ok_or_else(|| {
-                anyhow::anyhow!("no gateway connection configured; run `fabric agent-gateway login --host <URL>`")
+                anyhow::anyhow!(
+                    "no gateway connection configured; run `fabric agent-gateway login --host <URL>`, or set both \
+                     FABRIC_HOST and FABRIC_TOKEN"
+                )
             })?;
         let (stored_name, connection) = self
             .connections
@@ -101,28 +104,31 @@ impl Config {
         credentials: &impl CredentialStore,
         path: &std::path::Path,
     ) -> Result<()> {
-        let legacy: Vec<(String, String)> = self
+        let legacy: Vec<(String, String, String)> = self
             .connections
             .iter()
             .filter_map(|(name, connection)| {
                 connection
                     .legacy_token
                     .clone()
-                    .map(|token| (name.clone(), token))
+                    .map(|token| {
+                        let host = normalize_host(&connection.host).unwrap_or_else(|_| connection.host.clone());
+                        (name.clone(), token, host)
+                    })
             })
             .collect();
         if legacy.is_empty() {
             return Ok(());
         }
-        for (name, token) in &legacy {
+        for (name, token, host) in &legacy {
             credentials
                 .set_token(name, token)
-                .with_context(|| format!("migrate connection '{name}' token to OS keyring"))?;
-            if let Some(connection) = self.connections.get(name) {
-                credentials
-                    .set_bound_host(name, &normalize_host(&connection.host).unwrap_or_else(|_| connection.host.clone()))
-                    .with_context(|| format!("record the host of connection '{name}' in OS keyring"))?;
-            }
+                .with_context(|| format!("migrate connection '{name}' token to OS keyring"))
+                .map_err(|error| add_no_keyring_migration_hint(error, path, name, host))?;
+            credentials
+                .set_bound_host(name, host)
+                .with_context(|| format!("record the host of connection '{name}' in OS keyring"))
+                .map_err(|error| add_no_keyring_migration_hint(error, path, name, host))?;
         }
         for connection in self.connections.values_mut() {
             connection.legacy_token = None;
@@ -416,6 +422,68 @@ token = "only-copy"
                 .unwrap()
                 .contains("only-copy")
         );
+    }
+
+    /// A credential store on a Linux machine with no D-Bus session, where
+    /// every keyring call fails the way the Secret Service client reports it.
+    #[cfg(target_os = "linux")]
+    struct NoSecretService;
+
+    #[cfg(target_os = "linux")]
+    impl CredentialStore for NoSecretService {
+        fn get_token(
+            &self,
+            _connection: &str,
+        ) -> Result<Option<String>> {
+            Err(keyring::Error::PlatformFailure(Box::new(secret_service::Error::Unavailable)).into())
+        }
+
+        fn set_token(
+            &self,
+            _connection: &str,
+            _token: &str,
+        ) -> Result<()> {
+            Err(keyring::Error::PlatformFailure(Box::new(secret_service::Error::Unavailable)).into())
+        }
+
+        fn delete_token(
+            &self,
+            _connection: &str,
+        ) -> Result<()> {
+            Err(keyring::Error::PlatformFailure(Box::new(secret_service::Error::Unavailable)).into())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_migration_with_no_reachable_keyring_names_the_connection_and_host_to_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"current = "local"
+
+[connections.local]
+host = "https://local.example"
+
+[connections.prod]
+host = "prod.example/"
+token = "prod-only-copy"
+"#,
+        )
+        .unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+
+        let error = config
+            .migrate_legacy_tokens_to(&NoSecretService, &path)
+            .expect_err("the keyring can't be reached");
+
+        let text = format!("{error:#}");
+        assert!(text.contains(&format!("plaintext token of connection 'prod' saved in {}", path.display())), "{text}");
+        assert!(text.contains("set FABRIC_HOST to https://prod.example,"), "{text}");
+        assert!(text.contains("delete that `token` line from the file"), "{text}");
+        assert!(!text.contains("local.example"), "{text}");
+        assert!(!text.contains("prod-only-copy"), "{text}");
     }
 
     #[test]

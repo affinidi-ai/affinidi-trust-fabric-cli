@@ -67,7 +67,7 @@ cargo install --git https://github.com/affinidi-ai/affinidi-trust-fabric-cli
 fabric --version
 ```
 
-There are no prebuilt binaries yet. To upgrade later, run the same command with `--force`. Tokens are stored in the macOS Keychain, Windows Credential Manager, or Linux Secret Service.
+There are no prebuilt binaries yet. To upgrade later, run the same command with `--force`. Tokens are stored in the macOS Keychain, Windows Credential Manager, or Linux Secret Service. On a Linux server with no desktop session, where there is no Secret Service to reach, skip `login` and set `FABRIC_HOST` and `FABRIC_TOKEN` for each command instead (see [Run without a saved connection](docs/AUTHENTICATION.md#run-without-a-saved-connection)).
 
 > [!NOTE]
 > On macOS, "Always Allow" on the Keychain prompt lasts until you reinstall, because an unsigned binary is identified by its content. Building from source with `make build` signs the binary, if your Keychain has a codesigning identity, so the choice survives rebuilds.

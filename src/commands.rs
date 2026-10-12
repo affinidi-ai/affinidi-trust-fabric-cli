@@ -15,7 +15,7 @@ use crate::{
         sanitize_multiline, sanitize_whole,
     },
     config::{Config, Connection, normalize_host, normalize_user_host, saved_host_http_warning},
-    credentials::{CredentialStore, OsCredentialStore},
+    credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
     features, surface_patch, surface_validate,
     tables::{self, Layout, Scope, table_cell},
     tool_gate_preview::{self, Conditions, Gating, Preview, ToolPreview, Verdict},
@@ -51,13 +51,17 @@ struct AgentGatewayArgs {
     #[arg(short, long, global = true, env = "FABRIC_CONNECTION")]
     connection: Option<String>,
 
-    /// Override the configured gateway host for this command.
+    /// Gateway host for this command. Overrides the host of the selected saved
+    /// connection; with no saved connection, set it together with --token to
+    /// run a command without `login`.
     #[arg(long, global = true, env = "FABRIC_HOST")]
     host: Option<String>,
 
-    /// Override the configured bearer token for this command. Prefer the
-    /// FABRIC_TOKEN environment variable, since a value typed here stays in
-    /// shell history and shows in the process list.
+    /// Bearer token for this command. Overrides the token of the selected
+    /// saved connection; with no saved connection, set it together with --host
+    /// to run a command without `login`. Prefer the FABRIC_TOKEN environment
+    /// variable, since a value typed here stays in shell history and shows in
+    /// the process list.
     #[arg(long, global = true, env = "FABRIC_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
@@ -252,10 +256,11 @@ enum Command {
     /// Show the current login session and connected gateway.
     ///
     /// Checks the token live with the gateway and shows the connection, host,
-    /// whether a token is stored (`token_stored`) and accepted
-    /// (`authenticated`), and the signed-in user. For a personal access token it
-    /// also shows the token's ID, name, and scopes. A failed check is shown as
-    /// `error`.
+    /// whether the token was read from the OS credential store
+    /// (`token_stored`, false for one given with --token or FABRIC_TOKEN),
+    /// whether the gateway accepts it (`authenticated`), and the signed-in
+    /// user. For a personal access token it also shows the token's ID, name,
+    /// and scopes. A failed check is shown as `error`.
     ///
     /// The command exits 0 even when the token is rejected, so scripts should
     /// read `authenticated`.
@@ -1923,8 +1928,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
     for warning in new_hash_name_warnings(&config) {
         eprintln!("{warning}");
     }
-    config.migrate_legacy_tokens(&credentials)?;
-    dispatch_with(cli, config, &credentials).await
+    if !skips_the_credential_store(&cli) {
+        config.migrate_legacy_tokens(&credentials)?;
+    }
+    dispatch_with(cli, config, &credentials)
+        .await
+        .map_err(add_no_keyring_hint)
 }
 
 /// Runs a command that needs the gateway, with the saved `config` and the
@@ -1968,17 +1977,30 @@ async fn dispatch_with(
             command: SurfaceCommand::Features { surface_id: None },
         } => write_features(cli.output, &mut io::stdout()).context("print the features"),
         command => {
-            let (connection_name, saved) = config.resolve(cli.connection.as_deref())?;
-            let host = command_host(saved, cli.host.as_deref(), cli.allow_http)?;
-            let token = match cli.token {
-                Some(token) => token,
-                None => {
-                    check_token_host(credentials, connection_name, saved, &host, cli.allow_host_override)?;
-                    credentials
-                        .get_token(connection_name)?
-                        .with_context(|| format!("no token stored for connection '{connection_name}'; run `fabric agent-gateway login --connection {connection_name} --host {host}`"))?
-                }
-            };
+            let target = command_target(
+                &config,
+                credentials,
+                cli.connection.as_deref(),
+                cli.host.as_deref(),
+                HostFlags {
+                    allow_http: cli.allow_http,
+                    allow_host_override: cli.allow_host_override,
+                },
+                cli.token.as_deref(),
+            )?;
+            let host = target.host;
+            let token = target
+                .token
+                .with_context(|| {
+                    let name = target
+                        .connection
+                        .as_deref()
+                        .unwrap_or(DEFAULT_CONNECTION);
+                    format!(
+                        "no token stored for connection '{name}'; run `fabric agent-gateway login --connection \
+                         {name} --host {host}`"
+                    )
+                })?;
             let client = GatewayClient::new(host, token)?;
             if let Command::AccessTokens { command } = command {
                 return run_access_tokens(&client, command, cli.output).await;
@@ -2136,6 +2158,88 @@ fn first_http_warning_for(host: &str) -> bool {
         })
         .unwrap_or_else(|| host.to_lowercase());
     first_warning_for(format!("http:{key}"))
+}
+
+/// Whether this run never reads or writes the credential store: a command
+/// other than `login`, `logout` and `config` that was given both a host and a
+/// token (see [`given_host_and_token`]). It sends the given token to the given
+/// host, whether or not a saved connection is selected, so it also works on a
+/// server with no desktop session to reach the OS keyring.
+fn skips_the_credential_store(cli: &AgentGatewayArgs) -> bool {
+    !matches!(cli.command, Command::Login(_) | Command::Logout(_) | Command::Config { .. })
+        && given_host_and_token(cli.host.as_deref(), cli.token.as_deref()).is_some()
+}
+
+/// The host and token given for this run (`--host`/FABRIC_HOST and
+/// `--token`/FABRIC_TOKEN), when both were.
+fn given_host_and_token<'a>(
+    host: Option<&'a str>,
+    token: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    host.zip(token)
+}
+
+/// Whether neither `connection` nor the configuration's current connection
+/// names a saved connection to use.
+fn no_saved_connection_selected(
+    config: &Config,
+    connection: Option<&str>,
+) -> bool {
+    connection.is_none() && config.current.is_none()
+}
+
+/// The gateway a command talks to and the token it sends there.
+struct CommandTarget {
+    /// The saved connection used, or `None` when the run uses only the host
+    /// and token it was given.
+    connection: Option<String>,
+    host: String,
+    token: Option<String>,
+    /// Whether `token` was read from the credential store, rather than given
+    /// with `--token`/FABRIC_TOKEN.
+    token_stored: bool,
+}
+
+/// Works out where a command goes and with which token. With no saved
+/// connection selected and both a host and a token given, those two are used
+/// as they are and the credential store is never touched. Otherwise the
+/// selected saved connection supplies whatever was not given, and a saved
+/// token is only sent to the host it was saved for (see [`check_token_host`]).
+fn command_target(
+    config: &Config,
+    credentials: &impl CredentialStore,
+    connection: Option<&str>,
+    host_override: Option<&str>,
+    flags: HostFlags,
+    token_override: Option<&str>,
+) -> Result<CommandTarget> {
+    if no_saved_connection_selected(config, connection)
+        && let Some((host, token)) = given_host_and_token(host_override, token_override)
+    {
+        return Ok(CommandTarget {
+            connection: None,
+            host: normalize_user_host(host, flags.allow_http)?,
+            token: Some(token.to_owned()),
+            token_stored: false,
+        });
+    }
+    let (name, saved) = config.resolve(connection)?;
+    let host = command_host(saved, host_override, flags.allow_http)?;
+    let (token, token_stored) = match token_override {
+        Some(token) => (Some(token.to_owned()), false),
+        None => {
+            check_token_host(credentials, name, saved, &host, flags.allow_host_override)?;
+            let token = credentials.get_token(name)?;
+            let stored = token.is_some();
+            (token, stored)
+        }
+    };
+    Ok(CommandTarget {
+        connection: Some(name.to_owned()),
+        host,
+        token,
+        token_stored,
+    })
 }
 
 /// The host a command talks to: the typed `--host` when there is one, else the
@@ -2418,8 +2522,9 @@ async fn whoami(
     Ok(())
 }
 
-/// Resolve the active connection, its host, and the identity behind the
-/// stored token (validated live against the gateway), as a JSON object.
+/// The connection and host a command would use, whether its token came from
+/// the credential store, and the identity behind that token as the gateway
+/// reports it live, as a JSON object.
 async fn whoami_info(
     config: &Config,
     credentials: &impl CredentialStore,
@@ -2428,21 +2533,17 @@ async fn whoami_info(
     flags: HostFlags,
     token_override: Option<&str>,
 ) -> Result<Value> {
-    let (name, saved) = config.resolve(connection)?;
-    let host = command_host(saved, host_override, flags.allow_http)?;
-    let token = match token_override {
-        Some(token) => Some(token.to_owned()),
-        None => {
-            check_token_host(credentials, name, saved, &host, flags.allow_host_override)?;
-            credentials.get_token(name)?
-        }
-    };
-    let name = name.to_owned();
+    let CommandTarget {
+        connection: name,
+        host,
+        token,
+        token_stored,
+    } = command_target(config, credentials, connection, host_override, flags, token_override)?;
 
     let mut info = json!({
         "connection": name,
         "host": host,
-        "token_stored": token.is_some(),
+        "token_stored": token_stored,
         "authenticated": false,
     });
     let fields = info
@@ -2610,7 +2711,10 @@ fn info_table_lines(value: &Value) -> Vec<String> {
     };
     let mut lines = Vec::new();
     for key in ORDER {
-        if let Some(field) = object.get(*key) {
+        if let Some(field) = object
+            .get(*key)
+            .filter(|field| !field.is_null())
+        {
             let rendered = match field {
                 Value::String(text) => tables::flatten_capped(text),
                 Value::Array(items) => items
@@ -16864,7 +16968,21 @@ mod tests {
             .await
             .expect("whoami_info should succeed");
 
+        assert_eq!(info["token_stored"], json!(true));
         assert_eq!(info["authenticated"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_a_typed_token_for_a_saved_connection_as_not_stored() {
+        let host = one_shot_server("HTTP/1.1 200 OK", "{}").await;
+        let config = config_with_connection("local", &host);
+
+        let info = whoami_info(&config, &UnreachableKeyring, None, None, HostFlags::default(), Some("agpat_typed"))
+            .await
+            .expect("whoami_info should succeed");
+
+        assert_eq!(info["connection"], json!("local"));
+        assert_eq!(info["token_stored"], json!(false));
     }
 
     #[tokio::test]
@@ -17200,6 +17318,198 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A credential store that fails the test if it is used at all, standing in
+    /// for an OS keyring that a server with no desktop session cannot reach.
+    struct UnreachableKeyring;
+
+    impl CredentialStore for UnreachableKeyring {
+        fn get_token(
+            &self,
+            connection: &str,
+        ) -> Result<Option<String>> {
+            panic!("the keyring was read for connection '{connection}'")
+        }
+
+        fn set_token(
+            &self,
+            connection: &str,
+            _token: &str,
+        ) -> Result<()> {
+            panic!("the keyring was written for connection '{connection}'")
+        }
+
+        fn delete_token(
+            &self,
+            connection: &str,
+        ) -> Result<()> {
+            panic!("the keyring was cleared for connection '{connection}'")
+        }
+    }
+
+    const GIVEN_TOKEN: &str = "agpat_given";
+
+    #[tokio::test]
+    async fn whoami_with_a_host_and_token_and_no_saved_connection_skips_the_keyring() {
+        let (host, requests) = recording_server(vec![OK_EMPTY, OK_EMPTY, OK_EMPTY]).await;
+
+        let info = whoami_info(
+            &Config::default(),
+            &UnreachableKeyring,
+            None,
+            Some(&host),
+            HostFlags::default(),
+            Some(GIVEN_TOKEN),
+        )
+        .await
+        .expect("whoami should run with only a host and a token");
+
+        assert_eq!(info["connection"], Value::Null);
+        assert_eq!(info["host"], json!(host));
+        assert_eq!(info["token_stored"], json!(false));
+        assert_eq!(info["authenticated"], json!(true));
+        assert!(
+            requests.lock().unwrap()[0]
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {GIVEN_TOKEN}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_command_with_a_host_and_token_and_no_saved_connection_skips_the_keyring() {
+        let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+
+        dispatch_with(
+            gateway_args(&["--host", &host, "--token", GIVEN_TOKEN, "api", "get", "/v1/gateways"]),
+            Config::default(),
+            &UnreachableKeyring,
+        )
+        .await
+        .expect("the command should run with only a host and a token");
+
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].starts_with("GET /api/v1/gateways "), "{}", requests[0]);
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {GIVEN_TOKEN}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_and_token_do_not_stand_in_for_a_named_connection_that_is_not_saved() {
+        let error = dispatch_with(
+            gateway_args(&[
+                "--connection",
+                "missing",
+                "--host",
+                "http://127.0.0.1:9",
+                "--token",
+                GIVEN_TOKEN,
+                "api",
+                "get",
+                "/v1/gateways",
+            ]),
+            Config::default(),
+            &UnreachableKeyring,
+        )
+        .await
+        .expect_err("a named connection must exist");
+
+        assert!(
+            error
+                .to_string()
+                .contains("'missing' does not exist"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_without_a_token_and_no_saved_connection_asks_for_a_login_or_both_variables() {
+        let error = dispatch_with(
+            gateway_args(&["--host", "http://127.0.0.1:9", "api", "get", "/v1/gateways"]),
+            Config::default(),
+            &UnreachableKeyring,
+        )
+        .await
+        .expect_err("there is no token to send");
+
+        let text = error.to_string();
+        assert!(text.contains("no gateway connection configured"), "{text}");
+        assert!(text.contains("login --host <URL>`, or set both FABRIC_HOST and FABRIC_TOKEN"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_given_host_and_token_override_a_saved_connection_without_the_keyring() {
+        let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+
+        dispatch_with(
+            gateway_args(&["--host", &host, "--token", GIVEN_TOKEN, "api", "get", "/v1/gateways"]),
+            config_with_connection("default", "https://gateway.example.com"),
+            &UnreachableKeyring,
+        )
+        .await
+        .expect("the command should run on the given host and token");
+
+        assert!(
+            requests.lock().unwrap()[0]
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {GIVEN_TOKEN}"))
+        );
+    }
+
+    #[test]
+    fn a_given_plain_http_remote_host_needs_allow_http_without_a_saved_connection() {
+        let target = |allow_http| {
+            command_target(
+                &Config::default(),
+                &UnreachableKeyring,
+                None,
+                Some("http://gateway.example.com"),
+                HostFlags {
+                    allow_http,
+                    allow_host_override: false,
+                },
+                Some(GIVEN_TOKEN),
+            )
+        };
+
+        let error = target(false)
+            .err()
+            .expect("plain http to a remote host must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("--allow-http"),
+            "{error}"
+        );
+        let allowed = target(true).expect("--allow-http accepts the plain http host");
+        assert_eq!(allowed.host, "http://gateway.example.com");
+        assert!(allowed.connection.is_none());
+    }
+
+    #[test]
+    fn only_gateway_commands_given_a_host_and_token_skip_the_credential_store() {
+        let host_and_token = ["--host", "https://gateway.example.com", "--token", GIVEN_TOKEN];
+        let with = |extra: &[&str]| {
+            gateway_args(
+                &host_and_token
+                    .iter()
+                    .chain(extra)
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert!(skips_the_credential_store(&with(&["whoami"])));
+        assert!(skips_the_credential_store(&with(&["surfaces", "list"])));
+        assert!(skips_the_credential_store(&with(&["--connection", "prod", "whoami"])));
+        assert!(!skips_the_credential_store(&with(&["login", "--pat"])));
+        assert!(!skips_the_credential_store(&with(&["logout"])));
+        assert!(!skips_the_credential_store(&with(&["config", "list"])));
+        assert!(!skips_the_credential_store(&gateway_args(&["--host", "https://gateway.example.com", "whoami"])));
+        assert!(!skips_the_credential_store(&gateway_args(&["--token", GIVEN_TOKEN, "whoami"])));
     }
 
     #[tokio::test]
@@ -17841,6 +18151,13 @@ mod tests {
                 .any(|c| matches!(c, '\r' | '\u{202e}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_whoami_table_leaves_out_a_null_connection() {
+        let info = json!({"connection": null, "host": "https://gateway.example.com", "token_stored": false});
+
+        assert_eq!(info_table_lines(&info), ["host: https://gateway.example.com", "token_stored: false"]);
     }
 
     #[test]
