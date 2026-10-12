@@ -2713,7 +2713,7 @@ fn info_table_lines(value: &Value) -> Vec<String> {
     for key in ORDER {
         if let Some(field) = object
             .get(*key)
-            .filter(|field| !field.is_null())
+            .filter(|field| *key != "connection" || !field.is_null())
         {
             let rendered = match field {
                 Value::String(text) => tables::flatten_capped(text),
