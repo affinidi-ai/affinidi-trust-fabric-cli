@@ -39,6 +39,22 @@ Run the local checks and make sure CI passes:
 
 CI also runs a dependency audit, a security scan, and a coverage check that requires at least 80% coverage. Pull requests from forks don't run the security scan, because forks don't receive repository secrets; it runs once the change reaches `main`.
 
+## Releasing
+
+A release publishes prebuilt Linux binaries and a `SHA256SUMS` file to a GitHub Release. To cut version `<version>`:
+
+1. In a pull request, set `version` in [`Cargo.toml`](Cargo.toml) to `<version>`, run `cargo check` so `Cargo.lock` picks it up, and in [`CHANGELOG.md`](CHANGELOG.md) rename `## [Unreleased]` to `## [<version>] - YYYY-MM-DD` with the release date, then add a new empty `## [Unreleased]` heading above it.
+2. Merge the pull request.
+3. A repository admin tags the merge commit of that pull request and pushes the tag, which starts the release. Use the merge commit's SHA from the pull request page, so a later commit on `main` is not tagged by mistake:
+
+   ```sh
+   git fetch origin main
+   git tag v<version> <merge-commit-sha>
+   git push origin v<version>
+   ```
+
+The tag must be `v` followed by the exact version in `Cargo.toml`, or the release build fails before publishing anything.
+
 ## Code of Conduct
 
 ### Our Pledge

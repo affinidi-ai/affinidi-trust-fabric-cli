@@ -60,6 +60,52 @@ You need access to a running Agent Gateway: its address, such as `https://gatewa
 
 ### Install
 
+Tokens are stored in the macOS Keychain, Windows Credential Manager, or Linux Secret Service. A Linux server with no desktop session has no Secret Service, so there you skip `login` and set `FABRIC_HOST` and `FABRIC_TOKEN` for each command instead (see [Run without a saved connection](docs/AUTHENTICATION.md#run-without-a-saved-connection)).
+
+#### Linux
+
+Each [release](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/releases) has prebuilt binaries for x86_64 and aarch64. They need glibc 2.34 or newer (Debian 12, Ubuntu 22.04, RHEL 9 and later) and the system root certificates from the `ca-certificates` package. Every gateway command loads them, even for a plain `http://` host, and without them fails with `No CA certificates were loaded from the system`. The install steps also need `curl` and `sudo`. In a root shell, leave out `sudo`. On Debian or Ubuntu:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+```
+
+If you installed `fabric` with Cargo before, run `cargo uninstall affinidi-trust-fabric-cli` first, then open a new terminal or run `hash -r`. Otherwise the old copy in `~/.cargo/bin` comes first on your `PATH` and keeps running instead of the new one.
+
+Then download the archive for your machine from the latest release, check it, and put `fabric` on your `PATH`. Any failed step stops the rest, so nothing is installed unless `sha256sum` prints `OK` for the archive:
+
+```sh
+(
+  set -eu
+  ARCH="$(uname -m)"
+  case "${ARCH}" in
+    x86_64 | aarch64) ;;
+    *) echo "No prebuilt binary for ${ARCH}; install with Cargo instead" >&2; exit 1 ;;
+  esac
+  REPO=https://github.com/affinidi-ai/affinidi-trust-fabric-cli
+  VERSION="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "${REPO}/releases/latest" | sed -n 's|.*/releases/tag/v||p')"
+  test -n "${VERSION}" || { echo "Could not find the latest release" >&2; exit 1; }
+  TARGET="${ARCH}-unknown-linux-gnu"
+  BASE="${REPO}/releases/download/v${VERSION}"
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "${TMP}"' EXIT
+  cd "${TMP}"
+
+  curl -fLO "${BASE}/fabric-${VERSION}-${TARGET}.tar.gz"
+  curl -fLO "${BASE}/SHA256SUMS"
+  sha256sum -c --ignore-missing SHA256SUMS
+
+  tar -xzf "fabric-${VERSION}-${TARGET}.tar.gz"
+  sudo install -m 0755 "fabric-${VERSION}-${TARGET}/fabric" /usr/local/bin/fabric
+  /usr/local/bin/fabric --version
+)
+```
+
+To upgrade later, run the same steps again.
+
+#### macOS, Windows, or from source
+
 Install with Cargo, using Rust 1.85 or newer from [rustup](https://rustup.rs):
 
 ```sh
@@ -67,7 +113,7 @@ cargo install --git https://github.com/affinidi-ai/affinidi-trust-fabric-cli
 fabric --version
 ```
 
-There are no prebuilt binaries yet. To upgrade later, run the same command with `--force`. Tokens are stored in the macOS Keychain, Windows Credential Manager, or Linux Secret Service. On a Linux server with no desktop session, where there is no Secret Service to reach, skip `login` and set `FABRIC_HOST` and `FABRIC_TOKEN` for each command instead (see [Run without a saved connection](docs/AUTHENTICATION.md#run-without-a-saved-connection)).
+To upgrade later, run the same command with `--force`.
 
 > [!NOTE]
 > On macOS, "Always Allow" on the Keychain prompt lasts until you reinstall, because an unsigned binary is identified by its content. Building from source with `make build` signs the binary, if your Keychain has a codesigning identity, so the choice survives rebuilds.
