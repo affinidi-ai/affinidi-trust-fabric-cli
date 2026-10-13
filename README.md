@@ -64,7 +64,7 @@ Tokens are stored in the macOS Keychain, Windows Credential Manager, or Linux Se
 
 #### Linux
 
-Each [release](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/releases) has prebuilt binaries for x86_64 and aarch64. They need glibc 2.34 or newer (Debian 12, Ubuntu 22.04, RHEL 9 and later) and the system root certificates from the `ca-certificates` package, which the CLI uses to check the gateway's HTTPS certificate. The install steps also need `curl` and `sudo`. In a root shell, leave out `sudo`. On Debian or Ubuntu:
+Each [release](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/releases) has prebuilt binaries for x86_64 and aarch64. They need glibc 2.34 or newer (Debian 12, Ubuntu 22.04, RHEL 9 and later) and the system root certificates from the `ca-certificates` package. Every gateway command loads them, even for a plain `http://` host, and without them fails with `No CA certificates were loaded from the system`. The install steps also need `curl` and `sudo`. In a root shell, leave out `sudo`. On Debian or Ubuntu:
 
 ```sh
 sudo apt-get update
