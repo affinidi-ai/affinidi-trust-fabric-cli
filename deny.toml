@@ -2,8 +2,8 @@
 all-features = true
 # Only the platforms the CLI ships for. `webpki-root-certs` (CDLA-Permissive-2.0,
 # not on the approved list) is only pulled in for wasm32 builds, which the CLI
-# never targets. There is no release pipeline yet, so whoever adds one or a new
-# build target (for example Windows ARM or musl Linux) must update this list.
+# never targets. Whoever adds a release build target (for example Windows ARM
+# or musl Linux) must update this list.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
