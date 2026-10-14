@@ -40,7 +40,7 @@ generated="$(gh api "${generate_args[@]}" --jq .body)"
 
 # GitHub lists each person whose first pull request is in the release as
 # `* @<user> made their first contribution in <url>`. Each becomes
-# `- @<user> in [#<number>](<url>)`, and GitHub shows the people mentioned as
+# `- @<user> joined with [#<number>](<url>)`, and GitHub shows the people mentioned as
 # avatars under the notes. Bots show up as `@name[bot]` or `@app/name` and are
 # dropped, as is any line whose user or pull request link looks unexpected.
 pull_url="${GITHUB_SERVER_URL:-https://github.com}/${GH_REPO}/pull/"
@@ -52,7 +52,7 @@ new_contributors="$(
         index($2, pull_url) == 1 &&
         substr($2, length(pull_url) + 1) ~ /^[0-9]+$/ &&
         !seen[tolower($1)]++ {
-          printf "- @%s in [#%s](%s)\n", $1, substr($2, length(pull_url) + 1), $2
+          printf "- @%s joined with [#%s](%s)\n", $1, substr($2, length(pull_url) + 1), $2
         }
       '
 )"
@@ -62,7 +62,7 @@ trap 'rm -f "${notes_file}"' EXIT
 {
   printf '%s\n' "${section}"
   if [ -n "${new_contributors}" ]; then
-    printf '\n### 🎉 First-time contributors\n\n%s\n' "${new_contributors}"
+    printf '\n### 🙌 New contributors\n\n%s\n' "${new_contributors}"
   fi
   if [ -n "${previous_tag}" ]; then
     printf '\n**Full changelog**: %s/%s/compare/%s...%s\n' \

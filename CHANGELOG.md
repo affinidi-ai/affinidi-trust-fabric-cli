@@ -4,7 +4,7 @@ All notable changes to Affinidi Trust Fabric CLI are documented in this file. En
 
 ## [0.1.0] - 2026-10-13
 
-### Added
+### ✨ New
 
 - `fabric agent-gateway` commands for managing Affinidi Agent Gateway, including login, connection profiles, surfaces, identity and access resources, secrets and certificates, observability, and gateway configuration.
 - An interactive shell, `fabric agent-gateway shell`.
