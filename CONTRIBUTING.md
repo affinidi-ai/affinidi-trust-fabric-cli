@@ -63,7 +63,7 @@ If `main` has moved on by the time the checks pass on a commit, that run release
 
 A repository admin sets these up once, before the release bot's secrets are added. Until both secrets are set, the `version` workflow passes with a notice and releases nothing.
 
-1. A `release` environment that only `main` can deploy to, holding the release bot app's ID as `RELEASE_BOT_APP_ID` and its private key as `RELEASE_BOT_PRIVATE_KEY`, both as secrets. If it doesn't exist yet, the first run of the `version` workflow creates it with no branch limit, so set it up first.
+1. A `main` environment that only `main` can deploy to, holding the release bot app's ID as `RELEASE_BOT_APP_ID` and its private key as `RELEASE_BOT_PRIVATE_KEY`, both as secrets. If it doesn't exist yet, the first run of the `version` workflow creates it with no branch limit, so set it up first.
 2. The release bot app as a bypass actor on the `release-tags` tag ruleset, so it can push `v*` tags.
 3. Rebase merging and merge commits turned off, so squash merging is the only merge method.
 
