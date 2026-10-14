@@ -30,8 +30,8 @@ jobs:
       max-glibc: '2.34'
 
   # The shared workflow publishes the release with notes GitHub generates. This
-  # replaces them with the version's CHANGELOG.md section and the pull request
-  # authors. See scripts/release-notes.sh.
+  # replaces them with the version's CHANGELOG.md section and the people whose
+  # first pull request is in it. See scripts/release-notes.sh.
   release-notes:
     needs: [linux-binaries]
     runs-on: ubuntu-24.04
