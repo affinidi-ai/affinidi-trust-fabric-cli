@@ -73,3 +73,18 @@ jobs:
       rustflags: '-D warnings'
       coverage: 80
       useRedis: false
+
+  # The release scripts only run on main after a merge, so they are checked
+  # here first. shellcheck comes with the runner image.
+  release-scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      - name: Test the release scripts
+        run: scripts/test-release-scripts.sh

@@ -1,0 +1,17 @@
+{
+  "name": "affinidi-trust-fabric-cli-release",
+  "private": true,
+  "description": "semantic-release and its plugins, run by .github/workflows/version.yaml",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "^22.22.2 || >=24.15.0"
+  },
+  "devDependencies": {
+    "@semantic-release/changelog": "7.0.0",
+    "@semantic-release/commit-analyzer": "13.0.1",
+    "@semantic-release/exec": "7.1.0",
+    "@semantic-release/release-notes-generator": "14.1.1",
+    "conventional-changelog-conventionalcommits": "9.3.1",
+    "semantic-release": "25.0.9"
+  }
+}

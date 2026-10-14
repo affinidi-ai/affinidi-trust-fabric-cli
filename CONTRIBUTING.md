@@ -17,7 +17,7 @@ For building, signing, and running the source, see [`docs/development/GETTING_ST
 4. Use clear, unambiguous names; avoid single letters and abbreviations.
 5. Never print, log, or put tokens or secrets in error messages.
 6. Treat help text as documentation. A new or changed command needs an accurate one-line summary, and an explanation and examples when it takes a JSON document, can't be undone, or has flags that interact.
-7. Keep docs in sync with code in the same change (see [`docs/README.md`](docs/README.md)), and add user-facing changes to the `Unreleased` section of [`CHANGELOG.md`](CHANGELOG.md).
+7. Keep docs in sync with code in the same change (see [`docs/README.md`](docs/README.md)). Don't edit [`CHANGELOG.md`](CHANGELOG.md); it is written from pull request titles when a release is made (see [Releasing](#releasing)).
 
 ## Commits
 
@@ -26,7 +26,7 @@ Commits:
 - **must follow [Conventional Commits](https://www.conventionalcommits.org)**: `feat:`, `fix:`, `docs:`, `chore:`, `test:`, `refactor:`, and so on, followed by a summary. The repository rejects other commit messages.
 - **should be signed** with a key GitHub can verify. See GitHub's guide to [signing commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
 
-Pull requests should be squash-merged, so the pull request title becomes the commit on `main`; write it in the same format.
+Pull requests are squash-merged, the only merge method the repository allows, so the pull request title becomes the commit on `main`; write it in the same format.
 
 ## Before Opening A Pull Request
 
@@ -36,24 +36,36 @@ Run the local checks and make sure CI passes:
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
 4. If you added or changed a dependency: `cargo deny check`
+5. If you changed the release scripts in `scripts/`: `shellcheck scripts/*.sh` and `scripts/test-release-scripts.sh`
 
 CI also runs a dependency audit, a security scan, and a coverage check that requires at least 80% coverage. Pull requests from forks don't run the security scan, because forks don't receive repository secrets; it runs once the change reaches `main`.
 
 ## Releasing
 
-A release publishes prebuilt Linux binaries and a `SHA256SUMS` file to a GitHub Release. To cut version `<version>`:
+Releases are automatic. Once the [`checks`](.github/workflows/checks.yaml) workflow passes on a merge to `main`, the [`version`](.github/workflows/version.yaml) workflow reads the titles of the commits merged since the last release, so the pull request title decides what gets released:
 
-1. In a pull request, set `version` in [`Cargo.toml`](Cargo.toml) to `<version>`, run `cargo check` so `Cargo.lock` picks it up, and in [`CHANGELOG.md`](CHANGELOG.md) rename `## [Unreleased]` to `## [<version>] - YYYY-MM-DD` with the release date, then add a new empty `## [Unreleased]` heading above it.
-2. Merge the pull request.
-3. A repository admin tags the merge commit of that pull request and pushes the tag, which starts the release. Use the merge commit's SHA from the pull request page, so a later commit on `main` is not tagged by mistake:
+| Pull request title | Release |
+| --- | --- |
+| `fix: ...`, `perf: ...` or `revert: ...` | Patch, for example `0.2.0` to `0.2.1` |
+| `feat: ...` | Minor, for example `0.2.1` to `0.3.0` |
+| `feat!: ...`, `fix!: ...`, or `BREAKING CHANGE:` in the commit body | Breaking. A minor release, for example `0.3.0` to `0.4.0`, until the rule that keeps breaking changes minor is removed from [`release.config.mjs`](.github/release/release.config.mjs); removing it is how `1.0.0` is made |
+| `docs:`, `chore:`, `ci:`, `build:`, `refactor:`, `style:`, `test:` | Nothing on its own; it goes out with the next release |
 
-   ```sh
-   git fetch origin main
-   git tag v<version> <merge-commit-sha>
-   git push origin v<version>
-   ```
+The release notes list `feat` under New, `fix`, `perf` and `revert` under Fixes, and breaking changes first. A fix with the `security` or `deps` scope, such as `fix(security): ...` or `fix(deps): update quinn-proto`, is listed under Security. Write the title for someone reading the release notes, because it is copied there word for word.
 
-The tag must be `v` followed by the exact version in `Cargo.toml`, or the release build fails before publishing anything.
+When a release is due, the release bot sets the new version in `Cargo.toml` and `Cargo.lock`, adds the release notes to the top of [`CHANGELOG.md`](CHANGELOG.md), and commits that to `main` as `chore: release vX.Y.Z` through the GitHub API, so GitHub signs the commit and shows it as verified. It then pushes the tag `vX.Y.Z` on that commit. The tag starts the [`release`](.github/workflows/release.yaml) workflow, which builds the Linux binaries, publishes them with a `SHA256SUMS` file to a GitHub Release, and sets the release notes from `CHANGELOG.md` along with the authors of the pull requests in it.
+
+Never edit `CHANGELOG.md`, the version in `Cargo.toml`, or the `v*` tags by hand. The first run of the workflow, before any `v*` tag exists, tags the version already in `Cargo.toml` (`v0.1.0`) at the commit that added its `CHANGELOG.md` section, then releases anything merged after it in the same run.
+
+If `main` has moved on by the time the checks pass on a commit, that run releases nothing, and the newer commit releases both once its own checks pass. To retry a failed release, run the `version` workflow by hand on `main`. If the release commit `chore: release vX.Y.Z` reached `main` but its tag didn't, that run first tags the release commit, so the version isn't made twice.
+
+### Release setup
+
+A repository admin sets these up once, before the release bot's secrets are added. Until both secrets are set, the `version` workflow passes with a notice and releases nothing.
+
+1. A `release` environment that only `main` can deploy to, holding the release bot app's ID as `RELEASE_BOT_APP_ID` and its private key as `RELEASE_BOT_PRIVATE_KEY`, both as secrets. If it doesn't exist yet, the first run of the `version` workflow creates it with no branch limit, so set it up first.
+2. The release bot app as a bypass actor on the `release-tags` tag ruleset, so it can push `v*` tags.
+3. Rebase merging and merge commits turned off, so squash merging is the only merge method.
 
 ## Code of Conduct
 

@@ -1,7 +1,9 @@
 name: release
 
 # Pushing a tag `v<version>` that matches the version in Cargo.toml builds the
-# Linux binaries and publishes them to the GitHub Release for that tag.
+# Linux binaries and publishes them to the GitHub Release for that tag, then
+# sets the release notes from CHANGELOG.md. The version workflow pushes these
+# tags; see CONTRIBUTING.md.
 on:
   push:
     tags:
@@ -14,7 +16,8 @@ permissions:
 # Shared workflows are pinned to a commit so a change upstream can't run here
 # until someone bumps the pin. Inside the shared workflow only the final
 # publish job uses the write access granted here; the build and smoke test
-# jobs are read-only. No secrets are passed; publishing uses the job token.
+# jobs are read-only. No secrets are passed; publishing and the release notes
+# use the job token.
 jobs:
   linux-binaries:
     uses: affinidi/pipeline-rust/.github/workflows/release-binaries.yaml@237d0d51571063085ea12573e4c5c7b1dc4a76c3
@@ -25,3 +28,25 @@ jobs:
       toolchain: '1.96.0'
       # The README promises glibc 2.34; the build fails if a binary needs newer.
       max-glibc: '2.34'
+
+  # The shared workflow publishes the release with notes GitHub generates. This
+  # replaces them with the version's CHANGELOG.md section and the pull request
+  # authors. See scripts/release-notes.sh.
+  release-notes:
+    needs: [linux-binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # The full history and tags are needed to find the previous release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: scripts/release-notes.sh "${TAG}"
