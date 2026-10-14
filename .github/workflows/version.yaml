@@ -3,9 +3,10 @@ name: version
 # Once the checks workflow passes on a push to main, works out whether the
 # commits since the last `v*` tag make a release, from their conventional
 # commit titles. If they do, the release bot commits `chore: release v<version>`
-# to main with the new version in Cargo.toml and Cargo.lock and the notes in
-# CHANGELOG.md, then pushes the tag `v<version>`, which starts the release
-# workflow. See scripts/release.sh. Run it by hand to retry a failed release.
+# to main through the GitHub API, which signs it, with the new version in
+# Cargo.toml and Cargo.lock and the notes in CHANGELOG.md. It then pushes the
+# tag `v<version>` on that commit, which starts the release workflow. See
+# scripts/release.sh. Run it by hand to retry a failed release.
 on:
   workflow_run:
     workflows:

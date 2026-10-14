@@ -1,10 +1,12 @@
 // semantic-release settings, used by scripts/release.sh.
 //
 // The next version comes from the conventional commit titles on `main` since
-// the last `v*` tag. The release commit sets that version in Cargo.toml and
-// Cargo.lock, adds the release notes to CHANGELOG.md, and is tagged
-// `v<version>`. The tag starts .github/workflows/release.yaml, which builds and
-// publishes the binaries.
+// the last `v*` tag. The changelog plugin adds the release notes to
+// CHANGELOG.md, scripts/set-version.sh sets the version in Cargo.toml and
+// Cargo.lock, and scripts/commit-release.sh commits the three files to `main`
+// through the GitHub API, so GitHub signs the release commit. semantic-release
+// then tags that commit `v<version>` and pushes the tag, which starts
+// .github/workflows/release.yaml to build and publish the binaries.
 import createPreset from "conventional-changelog-conventionalcommits";
 
 // Order matters twice: a commit goes to the first entry that matches its type
@@ -74,16 +76,17 @@ export default {
       },
     ],
     ["@semantic-release/changelog", { changelogFile: "CHANGELOG.md", changelogTitle }],
-    ["@semantic-release/exec", { prepareCmd: "scripts/set-version.sh ${nextRelease.version}" }],
     [
-      "@semantic-release/git",
+      "@semantic-release/exec",
       {
-        assets: ["CHANGELOG.md", "Cargo.toml", "Cargo.lock"],
-        // The version workflow skips the bot's commits that start with
-        // `chore: release v`, and scripts/release.sh finds an untagged release
-        // commit by this message, so change all three together. The message
-        // must also pass the repository's conventional commit rule.
-        message: "chore: release v${nextRelease.version}",
+        // scripts/commit-release.sh commits as `chore: release v<version>`.
+        // The version workflow skips the bot's commits that start with that,
+        // and scripts/release.sh finds an untagged release commit by it, so
+        // change all three together. When this command ends, semantic-release
+        // tags the commit HEAD points to, which commit-release.sh has moved to
+        // the new commit.
+        prepareCmd:
+          "scripts/set-version.sh ${nextRelease.version} && scripts/commit-release.sh ${branch.name} ${nextRelease.version}",
       },
     ],
   ],

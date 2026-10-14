@@ -8,12 +8,14 @@
 # - No `v*` tag is reachable yet: the version already in Cargo.toml is tagged
 #   at the commit that added its section to CHANGELOG.md, so later commits are
 #   left for semantic-release to release.
-# - A `chore: release vX.Y.Z` commit from the bot has no tag, because the tag
-#   push failed after the commit reached `main`: that commit is tagged, so
+# - A `chore: release vX.Y.Z` commit from the bot has no tag, because the run
+#   failed after the commit reached `main`: that commit is tagged, so
 #   semantic-release doesn't try to make vX.Y.Z again.
 # semantic-release then works out the next version from the commit titles
-# since the last tag, commits `chore: release v<version>` and pushes the tag.
-# Every tag push starts .github/workflows/release.yaml.
+# since the last tag, has scripts/commit-release.sh commit
+# `chore: release v<version>` to `main` through the GitHub API, which signs it,
+# and pushes the tag on that commit. Every tag push starts
+# .github/workflows/release.yaml.
 set -euo pipefail
 
 : "${GH_TOKEN:?GH_TOKEN must hold the release bot token}"
@@ -22,11 +24,11 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${root}"
 
-# Commits and tags are made as the app's bot user, so GitHub shows them as the
-# bot's. They are pushed with git, so they aren't signed and GitHub doesn't
-# mark them verified; a rule that requires signed commits on `main` needs the
-# app as a bypass actor. semantic-release sets its own author unless these
-# variables are set, so git config alone isn't enough.
+# GitHub makes the release commit as the app's bot user, whose noreply email is
+# how an untagged release commit is found below. The tags this script makes and
+# semantic-release's git notes are made locally with the same name and email,
+# so they show as the bot's too. semantic-release sets its own author unless
+# these variables are set, so git config alone isn't enough.
 if ! [[ "${APP_SLUG}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
   echo "error: unexpected app slug '${APP_SLUG}'" >&2
   exit 1

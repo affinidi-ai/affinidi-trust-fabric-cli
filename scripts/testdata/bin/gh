@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Stands in for `gh api graphql --input <file> --jq <expr>` in
+# scripts/test-release-scripts.sh. It copies the request to FAKE_GH_REQUEST and
+# does what createCommitOnBranch does to the bare repository FAKE_GH_ORIGIN:
+# commits the files on top of expectedHeadOid, refusing if the branch has
+# moved on, and prints the new commit's id.
+set -euo pipefail
+
+if [ "$#" -ne 6 ] || [ "$1 $2 $3 $5" != "api graphql --input --jq" ]; then
+  echo "fake gh: unexpected arguments: $*" >&2
+  exit 2
+fi
+: "${FAKE_GH_REQUEST:?}" "${FAKE_GH_ORIGIN:?}"
+request="$4"
+cp "${request}" "${FAKE_GH_REQUEST}"
+
+input() {
+  jq --raw-output ".variables.input | $1" "${request}"
+}
+branch="$(input .branch.branchName)"
+clone="$(mktemp -d)"
+trap 'rm -rf "${clone}"' EXIT
+git clone --quiet --branch "${branch}" "${FAKE_GH_ORIGIN}" "${clone}"
+if [ "$(git -C "${clone}" rev-parse HEAD)" != "$(input .expectedHeadOid)" ]; then
+  echo "fake gh: expectedHeadOid doesn't match the head of ${branch}" >&2
+  exit 1
+fi
+count="$(input '.fileChanges.additions | length')"
+for ((i = 0; i < count; i++)); do
+  path="$(input ".fileChanges.additions[${i}].path")"
+  input ".fileChanges.additions[${i}].contents" | base64 --decode > "${clone}/${path}"
+done
+git -C "${clone}" commit --quiet --all --message "$(input .message.headline)"
+git -C "${clone}" push --quiet origin "HEAD:refs/heads/${branch}"
+git -C "${clone}" rev-parse HEAD
