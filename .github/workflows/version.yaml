@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     # The release bot's secrets live in this environment, which only main can
     # use, so a workflow on another branch can't get the bot's token.
-    environment: release
+    environment: main
     steps:
       # Until the release bot's secrets are set, the run passes with a notice
       # instead of failing every merge.
@@ -55,7 +55,7 @@ jobs:
           if [ "${HAS_SECRETS}" = "true" ]; then
             echo "ready=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "::notice::RELEASE_BOT_APP_ID and RELEASE_BOT_PRIVATE_KEY aren't set in the release environment, so nothing is released"
+            echo "::notice::RELEASE_BOT_APP_ID and RELEASE_BOT_PRIVATE_KEY aren't set in the main environment, so nothing is released"
           fi
 
       # A tag pushed with the job token wouldn't start the release workflow, so
