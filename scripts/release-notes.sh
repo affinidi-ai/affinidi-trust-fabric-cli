@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Replaces the notes of a published GitHub Release with that version's section
 # of CHANGELOG.md without its heading, followed by the people whose first pull
-# request is in it and a link to all changes since the previous release.
+# request is in it and a link to all changes since the previous release, or to
+# every commit up to the tag for the first release.
 # Takes the tag, for example `scripts/release-notes.sh v0.2.0`, and needs
 # GH_TOKEN and GH_REPO. Run by .github/workflows/release.yaml in a full clone,
 # so the tags and history are there.
@@ -40,9 +41,10 @@ generated="$(gh api "${generate_args[@]}" --jq .body)"
 
 # GitHub lists each person whose first pull request is in the release as
 # `* @<user> made their first contribution in <url>`. Each becomes
-# `- @<user> joined with [#<number>](<url>)`, and GitHub shows the people mentioned as
-# avatars under the notes. Bots show up as `@name[bot]` or `@app/name` and are
-# dropped, as is any line whose user or pull request link looks unexpected.
+# `- @<user> made their first pull request in [#<number>](<url>)`, and GitHub
+# shows the people mentioned as avatars under the notes. Bots show up as
+# `@name[bot]` or `@app/name` and are dropped, as is any line whose user or
+# pull request link looks unexpected.
 pull_url="${GITHUB_SERVER_URL:-https://github.com}/${GH_REPO}/pull/"
 new_contributors="$(
   printf '%s\n' "${generated}" \
@@ -52,7 +54,7 @@ new_contributors="$(
         index($2, pull_url) == 1 &&
         substr($2, length(pull_url) + 1) ~ /^[0-9]+$/ &&
         !seen[tolower($1)]++ {
-          printf "- @%s joined with [#%s](%s)\n", $1, substr($2, length(pull_url) + 1), $2
+          printf "- @%s made their first pull request in [#%s](%s)\n", $1, substr($2, length(pull_url) + 1), $2
         }
       '
 )"
@@ -67,6 +69,9 @@ trap 'rm -f "${notes_file}"' EXIT
   if [ -n "${previous_tag}" ]; then
     printf '\n**Full changelog**: %s/%s/compare/%s...%s\n' \
       "${GITHUB_SERVER_URL:-https://github.com}" "${GH_REPO}" "${previous_tag}" "${tag}"
+  else
+    printf '\n**Full changelog**: %s/%s/commits/%s\n' \
+      "${GITHUB_SERVER_URL:-https://github.com}" "${GH_REPO}" "${tag}"
   fi
 } > "${notes_file}"
 

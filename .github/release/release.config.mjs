@@ -41,6 +41,14 @@ if (!writer.mainTemplate.includes(PRESET_BREAKING_HEADING)) {
 }
 const mainTemplate = writer.mainTemplate.replace(PRESET_BREAKING_HEADING, "### 🚨 Breaking changes");
 
+// The Security section takes `fix(security)` and `fix(deps)` commits, so their
+// scope would only repeat the section name. Every other section keeps scopes.
+const SECURITY_SECTION = "🔒 Security";
+const transform = (commit, context) => {
+  const entry = writer.transform(commit, context);
+  return entry?.type === SECURITY_SECTION ? { ...entry, scope: "" } : entry;
+};
+
 // Must match the top of CHANGELOG.md exactly. The changelog plugin puts each
 // release's notes right after this text, above the older releases.
 const changelogTitle = `# Changelog
@@ -72,7 +80,7 @@ export default {
       {
         preset: "conventionalcommits",
         presetConfig,
-        writerOpts: { mainTemplate },
+        writerOpts: { mainTemplate, transform },
       },
     ],
     ["@semantic-release/changelog", { changelogFile: "CHANGELOG.md", changelogTitle }],
