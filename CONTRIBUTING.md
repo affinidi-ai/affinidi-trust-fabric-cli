@@ -53,7 +53,7 @@ Releases are automatic. Once the [`checks`](.github/workflows/checks.yaml) workf
 
 The release notes list `feat` under New, `fix`, `perf` and `revert` under Fixes, and breaking changes first. A fix with the `security` or `deps` scope, such as `fix(security): ...` or `fix(deps): update quinn-proto`, is listed under Security. Write the title for someone reading the release notes, because it is copied there word for word.
 
-When a release is due, the release bot sets the new version in `Cargo.toml` and `Cargo.lock`, adds the release notes to the top of [`CHANGELOG.md`](CHANGELOG.md), and commits that to `main` as `chore: release vX.Y.Z` through the GitHub API, so GitHub signs the commit and shows it as verified. It then pushes the tag `vX.Y.Z` on that commit. The tag starts the [`release`](.github/workflows/release.yaml) workflow, which builds the Linux binaries, publishes them with a `SHA256SUMS` file to a GitHub Release, and sets the release notes from `CHANGELOG.md` along with the authors of the pull requests in it.
+When a release is due, the release bot sets the new version in `Cargo.toml` and `Cargo.lock`, adds the release notes to the top of [`CHANGELOG.md`](CHANGELOG.md), and commits that to `main` as `chore: release vX.Y.Z` through the GitHub API, so GitHub signs the commit and shows it as verified. It then pushes the tag `vX.Y.Z` on that commit. The tag starts the [`release`](.github/workflows/release.yaml) workflow, which builds the Linux binaries, publishes them with a `SHA256SUMS` file to a GitHub Release, and sets the release notes from `CHANGELOG.md` along with the authors of the pull requests in it. Beside that it builds the macOS binaries for Apple silicon and Intel, signs and notarizes them, and adds them and their lines in `SHA256SUMS` to the same release once it is published.
 
 Never edit `CHANGELOG.md`, the version in `Cargo.toml`, or the `v*` tags by hand. The first run of the workflow, before any `v*` tag exists, tags the version already in `Cargo.toml` (`v0.1.0`) at the commit that added its `CHANGELOG.md` section, then releases anything merged after it in the same run.
 
@@ -66,6 +66,27 @@ A repository admin sets these up once, before the release bot's secrets are adde
 1. A `main` environment that only `main` can deploy to, holding the release bot app's ID as `RELEASE_BOT_APP_ID` and its private key as `RELEASE_BOT_PRIVATE_KEY`, both as secrets. If it doesn't exist yet, the first run of the `version` workflow creates it with no branch limit, so set it up first.
 2. The release bot app as a bypass actor on the `release-tags` tag ruleset, so it can push `v*` tags.
 3. Rebase merging and merge commits turned off, so squash merging is the only merge method.
+4. A `macos-release` environment that only `v*` tags can deploy to, holding the secrets in [macOS signing](#macos-signing). If it doesn't exist yet, the first `v*` tag creates it with no tag limit, so set it up first.
+5. Immutable releases left off, because the macOS archives and their `SHA256SUMS` lines are added after the release is published.
+
+### macOS signing
+
+The `macos-build` job builds the macOS binaries with no secrets. The `macos-sign` job then signs them with Affinidi's Developer ID and notarizes them with Apple, using [`scripts/sign-macos.sh`](scripts/sign-macos.sh). It runs in a `macos-release` environment that only `v*` tags can deploy to, and that environment holds these secrets:
+
+| Secret | Value |
+| --- | --- |
+| `APPLE_SIGNING_IDENTITY` | The certificate's name, `Developer ID Application: <name> (8Q88B239RG)` |
+| `APPLE_DEVELOPER_ID_P12` | The Developer ID Application certificate and its private key as a `.p12` exported from Keychain Access, in base64: `base64 -i developer-id.p12 \| pbcopy`. A `.p12` made with OpenSSL 3 needs `openssl pkcs12 -export -legacy`, or macOS can't import it |
+| `APPLE_DEVELOPER_ID_P12_PASSWORD` | The password of that `.p12` |
+| `APPLE_NOTARY_KEY` | The App Store Connect API key, the whole text of its `.p8` file including the `-----BEGIN PRIVATE KEY-----` line |
+| `APPLE_NOTARY_KEY_ID` | That key's 10-character Key ID |
+| `APPLE_NOTARY_ISSUER_ID` | The team's Issuer ID from App Store Connect, a UUID in lower case as App Store Connect shows it |
+
+The Team ID `8Q88B239RG` is set as `CLI_MACOS_TEAM_ID` in the workflow, because every signed binary shows it, so it isn't a secret. The script checks the shape of every value before it signs anything, and asks Apple whether the notary key works.
+
+The Linux release is published first and doesn't wait for macOS. If signing or notarizing fails, the release has only the Linux binaries until the cause is fixed and the failed jobs are re-run from the workflow run's page. Re-run them within 7 days, because the re-run signs the unsigned binaries the first run built, and those are kept for 7 days. After that, re-run the `macos-build` job instead, which builds them again and re-runs the signing and publishing jobs after it. A re-run replaces the macOS archives and their `SHA256SUMS` lines, so it never adds them twice. If a failed upload left the release with no `SHA256SUMS`, the re-run rebuilds it from the Linux archives; each run also keeps the file it uploads as the `release-sha256sums` artifact.
+
+Until the repository is public, the Homebrew tap [`affinidi-ai/homebrew-tap`](https://github.com/affinidi-ai/homebrew-tap) is updated by hand: after a release, open a pull request there that sets `fabric` to the new version and the SHA-256 of both macOS archives from the release's `SHA256SUMS`. The tap has no `fabric` entry yet, so the first such pull request adds it.
 
 ## Code of Conduct
 
