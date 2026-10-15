@@ -5,7 +5,8 @@ name: release
 # sets the release notes from CHANGELOG.md. The macOS binaries are built,
 # signed and notarized beside them and added to the same release and
 # SHA256SUMS once it is published. The version workflow pushes these tags; see
-# CONTRIBUTING.md.
+# CONTRIBUTING.md. Once this workflow passes, homebrew-tap.yaml opens the pull
+# request that moves the Homebrew cask to the new version.
 on:
   push:
     tags:

@@ -1,0 +1,112 @@
+name: homebrew-tap
+
+# Once the release workflow passes on a tag `v<version>`, opens a pull request
+# on affinidi-ai/homebrew-tap that moves the fabric cask to that version, with
+# the sha256 of both macOS archives from the release's SHA256SUMS. A CODEOWNER
+# of the tap reviews and merges it, so nothing reaches brew users before that.
+# See scripts/homebrew-cask.sh and scripts/open-tap-pr.sh. To retry, run it by
+# hand on main with the tag.
+on:
+  workflow_run:
+    workflows:
+      - release
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag, for example v0.2.0
+        required: true
+        type: string
+
+# The job token can only read. Every write to the tap goes through the release
+# bot's token.
+permissions:
+  contents: read
+
+# One run per tag at a time, never cancelled halfway through opening the pull
+# request.
+concurrency:
+  group: homebrew-tap-${{ github.event.workflow_run.head_branch || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  tap:
+    # Only a release that passed on a tag pushed to this repository counts. A
+    # run by hand must be on main.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    # The release bot's secrets live in this environment, which only main can
+    # use. A workflow_run always runs from main.
+    environment: main
+    steps:
+      # The tag of a release run is its head_branch. It and the tag typed in
+      # by hand are only used once they look like v1.2.3. If the repository
+      # isn't public, brew can't download the archives and the tap's check of
+      # the pull request would fail, so the run passes with a notice, as it
+      # does when the release bot's secrets aren't set.
+      - name: Check the tag, the repository and the release bot
+        id: check
+        env:
+          TAG: ${{ github.event.workflow_run.head_branch || inputs.tag }}
+          VISIBILITY: ${{ github.event.repository.visibility }}
+          HAS_SECRETS: ${{ secrets.RELEASE_BOT_APP_ID != '' && secrets.RELEASE_BOT_PRIVATE_KEY != '' }}
+        run: |
+          if ! [[ "${TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::notice::The tag isn't a release tag like v1.2.3, so the tap isn't updated"
+            exit 0
+          fi
+          if [ "${VISIBILITY}" != "public" ]; then
+            echo "::notice::The repository is ${VISIBILITY}, not public, so brew can't download ${TAG} and the tap isn't updated"
+            exit 0
+          fi
+          if [ "${HAS_SECRETS}" != "true" ]; then
+            echo "::notice::RELEASE_BOT_APP_ID and RELEASE_BOT_PRIVATE_KEY aren't set in the main environment, so the tap isn't updated"
+            exit 0
+          fi
+          echo "version=${TAG#v}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.check.outputs.version != ''
+        with:
+          persist-credentials: false
+
+      - name: Render the cask
+        if: steps.check.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "v${VERSION}" --pattern SHA256SUMS --dir dist
+          scripts/homebrew-cask.sh "${VERSION}" dist/SHA256SUMS > dist/fabric.rb
+          cat dist/fabric.rb
+
+      # A token of the release bot app limited to the tap, and there to its
+      # contents and pull requests. `client-id` takes the App ID as well.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        if: steps.check.outputs.version != ''
+        id: app-token
+        with:
+          client-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: affinidi-ai
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+
+      # The pull request links the release run, which a run by hand doesn't
+      # have.
+      - name: Open the tap pull request
+        if: steps.check.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+          RELEASE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: scripts/open-tap-pr.sh "${VERSION}" dist/fabric.rb
