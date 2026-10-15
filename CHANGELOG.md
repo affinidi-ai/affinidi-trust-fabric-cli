@@ -2,6 +2,12 @@
 
 All notable changes to Affinidi Trust Fabric CLI are documented in this file. Entries are written from pull request titles when a release is made, and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/compare/v0.1.1...v0.1.2) (2026-10-15)
+
+### 🔒 Security
+
+* update dependencies ([#33](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/issues/33)) ([0c2d1ae](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/commit/0c2d1ae7193e33180eee40360caa3101acf3aa95))
+
 ## [0.1.1](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/compare/v0.1.0...v0.1.1) (2026-10-15)
 
 ### 🔒 Security
