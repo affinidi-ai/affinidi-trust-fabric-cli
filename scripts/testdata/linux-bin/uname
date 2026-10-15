@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stands in for `uname` in scripts/test-release-scripts.sh, so
+# scripts/sign-macos.sh sees a Linux machine and stops before anything that
+# needs a Mac, even when the tests run on one.
+echo Linux

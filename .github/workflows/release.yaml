@@ -2,8 +2,10 @@ name: release
 
 # Pushing a tag `v<version>` that matches the version in Cargo.toml builds the
 # Linux binaries and publishes them to the GitHub Release for that tag, then
-# sets the release notes from CHANGELOG.md. The version workflow pushes these
-# tags; see CONTRIBUTING.md.
+# sets the release notes from CHANGELOG.md. The macOS binaries are built,
+# signed and notarized beside them and added to the same release and
+# SHA256SUMS once it is published. The version workflow pushes these tags; see
+# CONTRIBUTING.md.
 on:
   push:
     tags:
@@ -28,6 +30,8 @@ jobs:
       toolchain: '1.96.0'
       # The README promises glibc 2.34; the build fails if a binary needs newer.
       max-glibc: '2.34'
+      # No `targets`, so the shared default Linux targets are built. If that
+      # changes, update the target list in scripts/release-sums.sh to match.
 
   # The shared workflow publishes the release with notes GitHub generates. This
   # replaces them with the version's CHANGELOG.md section and the people whose
@@ -50,3 +54,240 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: scripts/release-notes.sh "${TAG}"
+
+  # Builds both macOS binaries on Apple silicon, the Intel one cross compiled.
+  # This job has no secrets and no environment, so no build script of a
+  # dependency ever runs where the signing identity is. The artifact names
+  # don't start with `fabric-`, because the shared workflow publishes every
+  # artifact of this run named `fabric-*`.
+  macos-build:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same toolchain as linux-binaries. No cache: a release build starts
+      # clean so nothing restored from an earlier run ends up in the binary.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: '1.96.0'
+          target: aarch64-apple-darwin,x86_64-apple-darwin
+          rustflags: ""
+          cache: false
+
+      - name: Check the tag matches the package version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(any(.targets[]; .name == "fabric" and (.kind | index("bin")))) | .version')"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match the package version ${version}, expected v${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      # Stripped here, before signing, because stripping a signed binary breaks
+      # its signature. The deployment target sets the oldest macOS the binaries
+      # load on to 12, as the README promises, instead of rustc's default for
+      # each target.
+      - name: Build
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '12.0'
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --target "${target}" --bin fabric
+            mkdir -p "unsigned/${target}"
+            cp "target/${target}/release/fabric" "unsigned/${target}/fabric"
+            strip "unsigned/${target}/fabric"
+          done
+
+      # The minimum macOS version a binary loads on is in its LC_BUILD_VERSION.
+      # This fails the build if the deployment target didn't reach the linker.
+      - name: Check the minimum macOS version
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            minos="$(vtool -show-build "unsigned/${target}/fabric" | awk '$1 == "minos" { print $2 }')"
+            if [ "${minos}" != "12.0" ]; then
+              echo "::error::The ${target} binary needs macOS '${minos}', expected 12.0"
+              exit 1
+            fi
+            echo "${target}: macOS ${minos}"
+          done
+
+      # Kept as long as the signed archives, because re-running a failed
+      # macos-sign doesn't build again and needs this artifact.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-unsigned
+          path: unsigned/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Signs and notarizes the binaries, then packages them like the Linux ones.
+  # The Apple secrets live in the macos-release environment, which only `v*`
+  # tags can deploy to, and only the signing step gets them. The checkout is
+  # for scripts/sign-macos.sh and the files that go in the archives; nothing is
+  # built here.
+  macos-sign:
+    needs: [macos-build]
+    runs-on: macos-15
+    environment: macos-release
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.macos-build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-unsigned
+          path: unsigned
+
+      - name: Sign and notarize
+        env:
+          # Affinidi's Apple Team ID. It is in every signed binary, so it isn't a secret.
+          CLI_MACOS_TEAM_ID: 8Q88B239RG
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          # Artifacts don't keep the executable bit.
+          chmod 0755 unsigned/*/fabric
+          scripts/sign-macos.sh --bin-dir unsigned --notary-dir notary
+
+      # Run here, not in the signing step, so the binary never runs next to the
+      # secrets or the signing keychain, which the script deleted on exit. The
+      # runner is Apple silicon, so the x86_64 binary runs under Rosetta, and
+      # is skipped with a notice if the runner image has no Rosetta.
+      - name: Check the signed binaries run
+        run: |
+          set -euo pipefail
+          check_version() {
+            local target="$1" printed
+            shift
+            printed="$("$@" "unsigned/${target}/fabric" --version)"
+            if [ "${printed}" != "fabric ${VERSION}" ]; then
+              echo "::error::The signed ${target} binary printed '${printed}', expected 'fabric ${VERSION}'"
+              exit 1
+            fi
+            echo "${target}: ${printed}"
+          }
+          check_version aarch64-apple-darwin
+          if arch -x86_64 /usr/bin/true 2> /dev/null; then
+            check_version x86_64-apple-darwin arch -x86_64
+          else
+            echo "::notice::Rosetta is not installed on this runner, so the x86_64 binary was not run"
+          fi
+
+      # The same layout as the Linux archives. COPYFILE_DISABLE and
+      # --no-mac-metadata keep macOS extended attributes out of the archive.
+      - name: Package
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            stage="fabric-${VERSION}-${target}"
+            mkdir -p "dist/${stage}"
+            cp "unsigned/${target}/fabric" "dist/${stage}/"
+            # Apache-2.0 and similar licenses require these to travel with the binary.
+            for doc in LICENSE NOTICE.txt NOTICE README.md; do
+              if [ -f "${doc}" ]; then
+                cp "${doc}" "dist/${stage}/"
+              fi
+            done
+            COPYFILE_DISABLE=1 tar -C dist --uid 0 --gid 0 --numeric-owner --no-mac-metadata \
+              -czf "dist/${stage}.tar.gz" "${stage}"
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-signed
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+      # Apple's notarization logs, kept when notarization fails too.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: macos-notary-logs
+          path: notary/
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+
+  # Adds the macOS archives to the release the shared workflow published and
+  # their lines to its SHA256SUMS. A re-run replaces the archives and their
+  # lines, so it is safe to run again. It shares the shared publish job's
+  # concurrency group, so the two never change the release at the same time.
+  macos-publish:
+    needs: [linux-binaries, macos-sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # uploads the archives and SHA256SUMS to the release
+    concurrency:
+      group: release-binaries-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-signed
+          path: dist
+
+      # scripts/release-sums.sh rebuilds the Linux lines if an earlier failed
+      # upload left the release with no SHA256SUMS.
+      - name: Add the macOS lines to SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          scripts/release-sums.sh "${TAG}" dist
+          scripts/macos-sums.sh dist/SHA256SUMS \
+            "dist/fabric-${version}-aarch64-apple-darwin.tar.gz" \
+            "dist/fabric-${version}-x86_64-apple-darwin.tar.gz"
+          cat dist/SHA256SUMS
+
+      # Kept in case the upload below fails after it deleted the release's
+      # SHA256SUMS. Overwritten on a re-run, which builds the file again.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-sha256sums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+      - name: Add the macOS archives to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          gh release upload "${TAG}" --clobber \
+            "dist/fabric-${version}-aarch64-apple-darwin.tar.gz" \
+            "dist/fabric-${version}-x86_64-apple-darwin.tar.gz" \
+            dist/SHA256SUMS

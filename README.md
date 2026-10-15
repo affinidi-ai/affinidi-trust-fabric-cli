@@ -104,7 +104,47 @@ Then download the archive for your machine from the latest release, check it, an
 
 To upgrade later, run the same steps again.
 
-#### macOS, Windows, or from source
+#### macOS
+
+Each [release](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/releases) has prebuilt binaries for Apple silicon and Intel Macs, signed with Affinidi's Developer ID and notarized by Apple, so Gatekeeper lets them run. They need macOS 12 (Monterey) or newer. They are added after the Linux ones, once Apple has notarized them, so if `curl` can't find the archive for a release that just came out, try again later. The install steps need `sudo`.
+
+If you installed `fabric` with Cargo before, run `cargo uninstall affinidi-trust-fabric-cli` first, then open a new terminal or run `hash -r`. Otherwise the old copy in `~/.cargo/bin` comes first on your `PATH` and keeps running instead of the new one.
+
+Then download the archive for your Mac from the latest release, check it, and put `fabric` on your `PATH`. Any failed step stops the rest, so nothing is installed unless `shasum` prints `OK` for the archive:
+
+```sh
+(
+  set -eu
+  case "$(uname -m)" in
+    arm64) TARGET=aarch64-apple-darwin ;;
+    x86_64) TARGET=x86_64-apple-darwin ;;
+    *) echo "No prebuilt binary for $(uname -m); install with Cargo instead" >&2; exit 1 ;;
+  esac
+  REPO=https://github.com/affinidi-ai/affinidi-trust-fabric-cli
+  VERSION="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "${REPO}/releases/latest" | sed -n 's|.*/releases/tag/v||p')"
+  test -n "${VERSION}" || { echo "Could not find the latest release" >&2; exit 1; }
+  BASE="${REPO}/releases/download/v${VERSION}"
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "${TMP}"' EXIT
+  cd "${TMP}"
+
+  curl -fLO "${BASE}/fabric-${VERSION}-${TARGET}.tar.gz"
+  curl -fLO "${BASE}/SHA256SUMS"
+  shasum -a 256 -c --ignore-missing SHA256SUMS
+
+  tar -xzf "fabric-${VERSION}-${TARGET}.tar.gz"
+  sudo mkdir -p /usr/local/bin
+  sudo install -m 0755 "fabric-${VERSION}-${TARGET}/fabric" /usr/local/bin/fabric
+  /usr/local/bin/fabric --version
+)
+```
+
+To upgrade later, run the same steps again.
+
+> [!NOTE]
+> The first time `fabric` reads its token, macOS asks for access to the Keychain. A release binary is signed with Affinidi's Developer ID, so "Always Allow" lasts across upgrades. A binary installed with Cargo is unsigned and identified by its content, so the choice lasts only until you reinstall. Building from source with `make build` signs the binary, if your Keychain has a codesigning identity, so the choice survives rebuilds.
+
+#### Windows, or from source
 
 Install with Cargo, using Rust 1.85 or newer from [rustup](https://rustup.rs):
 
@@ -114,9 +154,6 @@ fabric --version
 ```
 
 To upgrade later, run the same command with `--force`.
-
-> [!NOTE]
-> On macOS, "Always Allow" on the Keychain prompt lasts until you reinstall, because an unsigned binary is identified by its content. Building from source with `make build` signs the binary, if your Keychain has a codesigning identity, so the choice survives rebuilds.
 
 ### Sign in
 
