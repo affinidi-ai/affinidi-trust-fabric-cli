@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Stands in for `gh api graphql --input <file> --jq <expr>` in
+# scripts/test-release-scripts.sh, as scripts/open-tap-pr.sh calls it. The tap
+# is the bare repository FAKE_GH_ORIGIN and its open pull requests are the
+# JSON lines in FAKE_GH_PULLS. It answers the state query from them and does
+# what createRef, createCommitOnBranch and createPullRequest do, refusing a
+# commit if the branch has moved on. FAKE_GH_REPORTED_HEAD, when set, is the
+# branch head the state query reports, as if the branch moved on after the
+# query. The name of every request is added to FAKE_GH_CALLS.
+set -euo pipefail
+
+if [ "$#" -ne 6 ] || [ "$1 $2 $3 $5" != "api graphql --input --jq" ]; then
+  echo "fake gh: unexpected arguments: $*" >&2
+  exit 2
+fi
+: "${FAKE_GH_ORIGIN:?}" "${FAKE_GH_PULLS:?}" "${FAKE_GH_CALLS:?}"
+request="$4"
+pick="$6"
+touch "${FAKE_GH_PULLS}"
+
+input() {
+  jq --raw-output ".variables | $1" "${request}"
+}
+# Prints the commit a ref points to, or nothing if there is no such ref.
+ref_oid() {
+  git -C "${FAKE_GH_ORIGIN}" rev-parse --verify --quiet "$1^{commit}" || true
+}
+work_dir="$(mktemp -d)"
+trap 'rm -rf "${work_dir}"' EXIT
+# Prints a file of the tap as a GraphQL Blob, `{ text: ... }`, or null if
+# there is no such file.
+blob() {
+  if git -C "${FAKE_GH_ORIGIN}" cat-file -e "$1" 2> /dev/null; then
+    git -C "${FAKE_GH_ORIGIN}" show "$1" > "${work_dir}/blob"
+    jq --null-input --rawfile text "${work_dir}/blob" '{ text: $text }'
+  else
+    echo null
+  fi
+}
+
+query="$(jq --raw-output .query "${request}")"
+case "${query}" in
+  *createRef*)
+    echo createRef >> "${FAKE_GH_CALLS}"
+    git -C "${FAKE_GH_ORIGIN}" update-ref "$(input .input.name)" "$(input .input.oid)" ""
+    jq --null-input --arg name "$(input .input.name)" '{ data: { createRef: { ref: { name: $name } } } }' \
+      > "${work_dir}/response.json"
+    ;;
+  *createCommitOnBranch*)
+    echo createCommitOnBranch >> "${FAKE_GH_CALLS}"
+    branch="$(input .input.branch.branchName)"
+    clone="${work_dir}/clone"
+    git clone --quiet --branch "${branch}" "${FAKE_GH_ORIGIN}" "${clone}"
+    if [ "$(git -C "${clone}" rev-parse HEAD)" != "$(input .input.expectedHeadOid)" ]; then
+      echo "fake gh: expectedHeadOid doesn't match the head of ${branch}" >&2
+      exit 1
+    fi
+    count="$(input '.input.fileChanges.additions | length')"
+    for ((i = 0; i < count; i++)); do
+      path="$(input ".input.fileChanges.additions[${i}].path")"
+      mkdir -p "$(dirname "${clone}/${path}")"
+      input ".input.fileChanges.additions[${i}].contents" | base64 --decode > "${clone}/${path}"
+    done
+    git -C "${clone}" add --all
+    git -C "${clone}" commit --quiet --message "$(input .input.message.headline)"
+    git -C "${clone}" push --quiet origin "HEAD:refs/heads/${branch}"
+    jq --null-input --arg oid "$(git -C "${clone}" rev-parse HEAD)" \
+      '{ data: { createCommitOnBranch: { commit: { oid: $oid } } } }' > "${work_dir}/response.json"
+    ;;
+  *createPullRequest*)
+    echo createPullRequest >> "${FAKE_GH_CALLS}"
+    url="https://github.com/example/homebrew-tap/pull/$(($(wc -l < "${FAKE_GH_PULLS}") + 1))"
+    jq --compact-output --arg url "${url}" '.variables.input | {
+      base: .baseRefName, head: .headRefName, title: .title, body: .body, url: $url
+    }' "${request}" >> "${FAKE_GH_PULLS}"
+    jq --null-input --arg url "${url}" '{ data: { createPullRequest: { pullRequest: { url: $url } } } }' \
+      > "${work_dir}/response.json"
+    ;;
+  *)
+    echo query >> "${FAKE_GH_CALLS}"
+    branch="$(input .branch)"
+    base_oid="$(ref_oid "$(input .base)")"
+    head_oid="$(ref_oid "${branch}")"
+    if [ -n "${head_oid}" ] && [ -n "${FAKE_GH_REPORTED_HEAD:-}" ]; then
+      head_oid="${FAKE_GH_REPORTED_HEAD}"
+    fi
+    pull_request="$(jq --raw-output --arg head "${branch#refs/heads/}" 'select(.head == $head) | .url' "${FAKE_GH_PULLS}")"
+    jq --null-input \
+      --arg base "${base_oid}" \
+      --arg head "${head_oid}" \
+      --arg pull_request "${pull_request}" \
+      --argjson base_cask "$(blob "$(input .baseFile)")" \
+      --argjson cask "$(blob "$(input .file)")" \
+      '{ data: { repository: {
+        id: "R_fake",
+        base: (if $base == "" then null else { target: { oid: $base } } end),
+        baseCask: $base_cask,
+        branch: (if $head == "" then null else {
+          target: { oid: $head },
+          associatedPullRequests: { nodes: (if $pull_request == "" then [] else [{ url: $pull_request }] end) }
+        } end),
+        cask: $cask
+      } } }' > "${work_dir}/response.json"
+    ;;
+esac
+jq --raw-output "${pick}" "${work_dir}/response.json"

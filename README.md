@@ -106,11 +106,22 @@ To upgrade later, run the same steps again.
 
 #### macOS
 
-Each [release](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/releases) has prebuilt binaries for Apple silicon and Intel Macs, signed with Affinidi's Developer ID and notarized by Apple, so Gatekeeper lets them run. They need macOS 12 (Monterey) or newer. They are added after the Linux ones, once Apple has notarized them, so if `curl` can't find the archive for a release that just came out, try again later. The install steps need `sudo`.
+Each [release](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/releases) has prebuilt binaries for Apple silicon and Intel Macs, signed with Affinidi's Developer ID and notarized by Apple, so Gatekeeper lets them run. They need macOS 12 (Monterey) or newer.
 
 If you installed `fabric` with Cargo before, run `cargo uninstall affinidi-trust-fabric-cli` first, then open a new terminal or run `hash -r`. Otherwise the old copy in `~/.cargo/bin` comes first on your `PATH` and keeps running instead of the new one.
 
-Then download the archive for your Mac from the latest release, check it, and put `fabric` on your `PATH`. Any failed step stops the rest, so nothing is installed unless `shasum` prints `OK` for the archive:
+If you installed `fabric` with the manual steps below before, run `sudo rm /usr/local/bin/fabric` first. Otherwise Homebrew stops because a `fabric` is already there on Intel Macs, and the old copy may keep running instead of Homebrew's on Apple silicon.
+
+Install with [Homebrew](https://brew.sh) from Affinidi's tap:
+
+```sh
+brew install --cask affinidi-ai/tap/fabric
+fabric --version
+```
+
+To upgrade later, run `brew upgrade --cask affinidi-ai/tap/fabric`. Always use the full name `affinidi-ai/tap/fabric`, because Homebrew has an unrelated formula also called `fabric`. A new version reaches the tap a little after its release, once it has been reviewed there.
+
+Without Homebrew, download the archive for your Mac from the latest release, check it, and put `fabric` on your `PATH`. The macOS archives are added after the Linux ones, once Apple has notarized them, so if `curl` can't find the archive for a release that just came out, try again later. The steps need `sudo`, and any failed step stops the rest, so nothing is installed unless `shasum` prints `OK` for the archive:
 
 ```sh
 (

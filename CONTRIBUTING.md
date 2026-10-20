@@ -86,7 +86,21 @@ The Team ID `8Q88B239RG` is set as `CLI_MACOS_TEAM_ID` in the workflow, because 
 
 The Linux release is published first and doesn't wait for macOS. If signing or notarizing fails, the release has only the Linux binaries until the cause is fixed and the failed jobs are re-run from the workflow run's page. Re-run them within 7 days, because the re-run signs the unsigned binaries the first run built, and those are kept for 7 days. After that, re-run the `macos-build` job instead, which builds them again and re-runs the signing and publishing jobs after it. A re-run replaces the macOS archives and their `SHA256SUMS` lines, so it never adds them twice. If a failed upload left the release with no `SHA256SUMS`, the re-run rebuilds it from the Linux archives; each run also keeps the file it uploads as the `release-sha256sums` artifact.
 
-Until the repository is public, the Homebrew tap [`affinidi-ai/homebrew-tap`](https://github.com/affinidi-ai/homebrew-tap) is updated by hand: after a release, open a pull request there that sets `fabric` to the new version and the SHA-256 of both macOS archives from the release's `SHA256SUMS`. The tap has no `fabric` entry yet, so the first such pull request adds it.
+### Homebrew tap
+
+Mac users install `fabric` from the cask `Casks/fabric.rb` in the Homebrew tap [`affinidi-ai/homebrew-tap`](https://github.com/affinidi-ai/homebrew-tap). Once the `release` workflow passes on a tag, the [`homebrew-tap`](.github/workflows/homebrew-tap.yaml) workflow renders the cask for that version with [`scripts/homebrew-cask.sh`](scripts/homebrew-cask.sh), taking the SHA-256 of both macOS archives from the release's `SHA256SUMS`. It then opens a pull request on the tap titled `chore(cask): fabric X.Y.Z` from a branch `fabric-X.Y.Z`, with [`scripts/open-tap-pr.sh`](scripts/open-tap-pr.sh). It never pushes to the tap's `main`. The release bot's token for this is limited to the tap's contents and pull requests.
+
+The tap's CODEOWNERS file makes `@affinidi-ai/affinidi-fabric-cli-codeowners` the reviewers of `Casks/fabric.rb`. The tap's `cask` check installs the cask and checks that `fabric --version` prints the new version. Until the pull request is merged, `brew` keeps installing the previous version. The pull request lists what to check before approving.
+
+A release whose failed jobs are re-run until it passes starts the workflow again by itself. To retry a failed `homebrew-tap` run, run it by hand on `main` with the tag:
+
+```sh
+gh workflow run homebrew-tap.yaml -R affinidi-ai/affinidi-trust-fabric-cli --ref main -f tag=v0.1.3
+```
+
+A retry is safe: it commits nothing if the branch already holds the same cask, and opens no second pull request. It also does nothing when the tap's `main` already holds this cask or a newer version, so a retry after the merge or a re-run of an old release opens no pull request.
+
+A re-run of the macOS jobs replaces the archives, so their SHA-256 changes. If the tap pull request for that release was already merged, `brew` fails the checksum until a new tap pull request with the new hashes is merged. The `homebrew-tap` workflow opens it once the re-run passes, because the hashes differ from `main`'s.
 
 ## Code of Conduct
 

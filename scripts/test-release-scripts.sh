@@ -6,7 +6,11 @@
 # commits the release files on top of the checked out commit and moves HEAD to
 # that commit, or changes nothing. scripts/macos-sums.sh adds the macOS
 # archives to SHA256SUMS once, even on a re-run, scripts/release-sums.sh
-# rebuilds a release's SHA256SUMS only when it is missing, and
+# rebuilds a release's SHA256SUMS only when it is missing,
+# scripts/homebrew-cask.sh renders the cask from a SHA256SUMS,
+# scripts/open-tap-pr.sh opens the tap pull request once, even on a re-run,
+# when the tap's main holds an older version, none once main holds the cask
+# or a newer one, and stops when main's version isn't X.Y.Z, and
 # scripts/sign-macos.sh stops on a bad argument or setting before it needs a
 # Mac. Run by .github/workflows/checks.yaml; the working tree is never changed.
 set -euo pipefail
@@ -277,6 +281,225 @@ if "${root}/scripts/release-sums.sh" v9.9.9 2> /dev/null; then
 fi
 if "${root}/scripts/release-sums.sh" v9.9.9 "${work_dir}/no-such-dir" 2> /dev/null; then
   fail "release-sums.sh passed a directory that doesn't exist"
+fi
+
+# homebrew-cask.sh renders scripts/testdata/fabric-9.9.9.rb from
+# scripts/testdata/SHA256SUMS-9.9.9, and stops when a macOS line is missing
+# or wrong.
+cask_dir="${work_dir}/cask"
+mkdir -p "${cask_dir}"
+if ! "${root}/scripts/homebrew-cask.sh" 9.9.9 "${testdata}/SHA256SUMS-9.9.9" > "${cask_dir}/fabric.rb"; then
+  fail "homebrew-cask.sh failed on scripts/testdata/SHA256SUMS-9.9.9"
+elif ! cmp -s "${testdata}/fabric-9.9.9.rb" "${cask_dir}/fabric.rb"; then
+  fail "homebrew-cask.sh rendered a different cask:"
+  diff "${testdata}/fabric-9.9.9.rb" "${cask_dir}/fabric.rb" >&2 || true
+fi
+if ! grep -qxF "  desc \"$(package_field description)\"" "${cask_dir}/fabric.rb"; then
+  fail "homebrew-cask.sh's desc isn't the description in Cargo.toml"
+fi
+check_cask_stops() {
+  local what="$1" version="$2" sums="$3"
+  if "${root}/scripts/homebrew-cask.sh" "${version}" "${sums}" > /dev/null 2>&1; then
+    fail "homebrew-cask.sh passed ${what}"
+  fi
+}
+grep -v x86_64-apple-darwin "${testdata}/SHA256SUMS-9.9.9" > "${cask_dir}/no-intel"
+check_cask_stops "with no line for the Intel archive" 9.9.9 "${cask_dir}/no-intel"
+sed 's/^[0-9a-f]*  \(fabric-9.9.9-aarch64-apple-darwin\)/not-a-sha256  \1/' "${testdata}/SHA256SUMS-9.9.9" \
+  > "${cask_dir}/bad-hash"
+check_cask_stops "with a line for the Apple silicon archive that isn't a sha256" 9.9.9 "${cask_dir}/bad-hash"
+cat "${testdata}/SHA256SUMS-9.9.9" "${testdata}/SHA256SUMS-9.9.9" > "${cask_dir}/twice"
+check_cask_stops "with the macOS lines given twice" 9.9.9 "${cask_dir}/twice"
+check_cask_stops "with a tag instead of a version" v9.9.9 "${testdata}/SHA256SUMS-9.9.9"
+check_cask_stops "with a version that isn't X.Y.Z" 9.9 "${testdata}/SHA256SUMS-9.9.9"
+check_cask_stops "with no SHA256SUMS" 9.9.9 "${cask_dir}/missing"
+
+# open-tap-pr.sh runs against a tap that is a local bare repository.
+# scripts/testdata/tap-bin/gh stands in for GitHub. new_tap starts the tap
+# again with one commit on main, which holds the given cask as
+# Casks/fabric.rb when one is given.
+tap_origin="${work_dir}/tap.git"
+tap_seed="${work_dir}/tap-seed"
+tap_pulls="${work_dir}/tap-pulls.jsonl"
+tap_calls="${work_dir}/tap-calls"
+new_tap() {
+  rm -rf "${tap_origin}" "${tap_seed}" "${tap_pulls}"
+  git init --quiet --bare --initial-branch=main "${tap_origin}"
+  git init --quiet --initial-branch=main "${tap_seed}"
+  echo "# tap" > "${tap_seed}/README.md"
+  if [ "$#" -eq 1 ]; then
+    mkdir -p "${tap_seed}/Casks"
+    cp "$1" "${tap_seed}/Casks/fabric.rb"
+  fi
+  git -C "${tap_seed}" add --all
+  git -C "${tap_seed}" commit --quiet --message "feat: the tap"
+  git -C "${tap_seed}" push --quiet "${tap_origin}" main
+  tap_main="$(git -C "${tap_origin}" rev-parse main)"
+}
+# Runs open-tap-pr.sh with the given arguments, after the settings that come
+# first, for example GH_TOKEN=.
+run_open_tap_pr() {
+  : > "${tap_calls}"
+  (
+    export GH_TOKEN=test-token TAP_REPOSITORY=example/homebrew-tap
+    export FAKE_GH_ORIGIN="${tap_origin}" FAKE_GH_PULLS="${tap_pulls}" FAKE_GH_CALLS="${tap_calls}"
+    while [[ "${1-}" == *=* ]]; do
+      export "${1?}"
+      shift
+    done
+    PATH="${testdata}/tap-bin:${PATH}" "${root}/scripts/open-tap-pr.sh" "$@"
+  ) > "${work_dir}/open-tap-pr.log" 2>&1
+}
+# Checks the branch fabric-<version> holds the given cask in one commit on
+# top of main per change, and that exactly one pull request is open for it.
+check_tap() {
+  local what="$1" version="$2" cask="$3" commits="$4" pulls
+  local branch="fabric-${version}" title="chore(cask): fabric ${version}"
+  if [ "$(git -C "${tap_origin}" rev-parse main)" != "${tap_main}" ]; then
+    fail "open-tap-pr.sh ${what} changed main"
+  fi
+  if [ "$(git -C "${tap_origin}" rev-list --count "${tap_main}..${branch}" 2> /dev/null)" != "${commits}" ]; then
+    fail "open-tap-pr.sh ${what} didn't leave ${commits} commit(s) on ${branch} on top of main"
+  fi
+  if ! cmp -s "${cask}" <(git -C "${tap_origin}" show "${branch}:Casks/fabric.rb" 2> /dev/null); then
+    fail "open-tap-pr.sh ${what} didn't leave the cask in Casks/fabric.rb on ${branch}"
+  fi
+  if [ "$(git -C "${tap_origin}" log -1 --format=%s "${branch}" 2> /dev/null)" != "${title}" ]; then
+    fail "open-tap-pr.sh ${what} titled the commit '$(git -C "${tap_origin}" log -1 --format=%s "${branch}" 2> /dev/null)'"
+  fi
+  pulls="$(jq --compact-output '[.base, .head, .title]' "${tap_pulls}" 2> /dev/null)"
+  if [ "${pulls}" != "$(jq --null-input --compact-output --arg branch "${branch}" --arg title "${title}" '["main", $branch, $title]')" ]; then
+    fail "open-tap-pr.sh ${what} left these pull requests instead of one to main: ${pulls}"
+  fi
+}
+# Checks a run that should stop before any request left the tap as it was.
+check_tap_stops() {
+  local what="$1"
+  shift
+  if run_open_tap_pr "$@"; then
+    fail "open-tap-pr.sh passed ${what}"
+  elif [ -s "${tap_calls}" ]; then
+    fail "open-tap-pr.sh called GitHub ${what}: $(tr '\n' ' ' < "${tap_calls}")"
+  fi
+}
+# Checks a run that finds nothing to do passed after one query, with no
+# branch and no pull request.
+check_tap_untouched() {
+  local what="$1"
+  shift
+  if ! run_open_tap_pr "$@"; then
+    fail "open-tap-pr.sh failed ${what}:"
+    cat "${work_dir}/open-tap-pr.log" >&2
+  fi
+  if [ "$(cat "${tap_calls}")" != query ]; then
+    fail "open-tap-pr.sh changed something ${what}: $(tr '\n' ' ' < "${tap_calls}")"
+  fi
+  if git -C "${tap_origin}" rev-parse --verify --quiet fabric-9.9.9 > /dev/null; then
+    fail "open-tap-pr.sh made fabric-9.9.9 ${what}"
+  fi
+  if [ -s "${tap_pulls}" ]; then
+    fail "open-tap-pr.sh opened a pull request ${what}"
+  fi
+}
+
+new_tap
+release_run_url="https://github.com/example/cli/actions/runs/123"
+if ! run_open_tap_pr RELEASE_RUN_URL="${release_run_url}" 9.9.9 "${cask_dir}/fabric.rb"; then
+  fail "open-tap-pr.sh failed:"
+  cat "${work_dir}/open-tap-pr.log" >&2
+fi
+check_tap "on the first run" 9.9.9 "${cask_dir}/fabric.rb" 1
+if ! grep -qF "both \`sha256\` values match" "${tap_pulls}"; then
+  fail "open-tap-pr.sh opened the pull request without the review checklist"
+fi
+if ! grep -qF "(${release_run_url})" "${tap_pulls}"; then
+  fail "open-tap-pr.sh opened the pull request without a link to the release run"
+fi
+
+# A re-run with the same cask only asks GitHub what is there.
+if ! run_open_tap_pr 9.9.9 "${cask_dir}/fabric.rb"; then
+  fail "open-tap-pr.sh failed on a re-run:"
+  cat "${work_dir}/open-tap-pr.log" >&2
+fi
+check_tap "on a re-run" 9.9.9 "${cask_dir}/fabric.rb" 1
+if [ "$(cat "${tap_calls}")" != query ]; then
+  fail "open-tap-pr.sh changed something on a re-run: $(tr '\n' ' ' < "${tap_calls}")"
+fi
+
+# A re-run with a changed cask commits it to the open pull request's branch.
+sed 's/^  version "9.9.9"$/  version "9.9.9" # changed/' "${cask_dir}/fabric.rb" > "${cask_dir}/changed.rb"
+if ! run_open_tap_pr 9.9.9 "${cask_dir}/changed.rb"; then
+  fail "open-tap-pr.sh failed on a re-run with a changed cask:"
+  cat "${work_dir}/open-tap-pr.log" >&2
+fi
+check_tap "on a re-run with a changed cask" 9.9.9 "${cask_dir}/changed.rb" 2
+
+check_tap_stops "with a tag instead of a version" v9.9.9 "${cask_dir}/fabric.rb"
+check_tap_stops "with a cask file that doesn't exist" 9.9.9 "${cask_dir}/missing.rb"
+check_tap_stops "with an empty GH_TOKEN" GH_TOKEN= 9.9.9 "${cask_dir}/fabric.rb"
+check_tap_stops "with a TAP_REPOSITORY that isn't owner/name" TAP_REPOSITORY=a/b/c 9.9.9 "${cask_dir}/fabric.rb"
+check_tap_stops "with a RELEASE_RUN_URL that isn't a GitHub Actions run" \
+  "RELEASE_RUN_URL=https://example.com/actions/runs/1)" 9.9.9 "${cask_dir}/fabric.rb"
+
+# GitHub refuses the commit when the branch moved on after the query, and the
+# script stops before it opens a pull request.
+new_tap
+git -C "${tap_seed}" commit --quiet --allow-empty --message "chore: moved on"
+git -C "${tap_seed}" push --quiet "${tap_origin}" HEAD:refs/heads/fabric-9.9.9
+if run_open_tap_pr FAKE_GH_REPORTED_HEAD="${tap_main}" 9.9.9 "${cask_dir}/fabric.rb"; then
+  fail "open-tap-pr.sh passed when GitHub refused the commit"
+elif [ "$(tr '\n' ' ' < "${tap_calls}")" != "query createCommitOnBranch " ]; then
+  fail "open-tap-pr.sh went on after GitHub refused the commit: $(tr '\n' ' ' < "${tap_calls}")"
+elif [ -s "${tap_pulls}" ]; then
+  fail "open-tap-pr.sh opened a pull request after GitHub refused the commit"
+fi
+
+# A retry after the pull request was merged, whose branch the tap deleted,
+# and a re-run of a release older than main's change nothing.
+new_tap "${cask_dir}/fabric.rb"
+check_tap_untouched "when main already holds the cask" 9.9.9 "${cask_dir}/fabric.rb"
+sed 's/^  version "9.9.9"$/  version "10.0.0"/' "${cask_dir}/fabric.rb" > "${cask_dir}/newer.rb"
+new_tap "${cask_dir}/newer.rb"
+check_tap_untouched "when main holds a newer version" 9.9.9 "${cask_dir}/fabric.rb"
+
+# The same version with other hashes, as after a re-run of the macOS jobs,
+# gets a pull request.
+sed 's/^\(  sha256 arm:   "\)[0-9a-f]*/\1'"$(printf '0%.0s' {1..64})"'/' "${cask_dir}/fabric.rb" > "${cask_dir}/old-hashes.rb"
+new_tap "${cask_dir}/old-hashes.rb"
+if ! run_open_tap_pr 9.9.9 "${cask_dir}/fabric.rb"; then
+  fail "open-tap-pr.sh failed when main holds the version with other hashes:"
+  cat "${work_dir}/open-tap-pr.log" >&2
+fi
+check_tap "when main holds the version with other hashes" 9.9.9 "${cask_dir}/fabric.rb" 1
+
+# A release after main's older version gets a pull request, also when only
+# a version sort puts main's version first.
+sed 's/^  version "9.9.9"$/  version "9.9.8"/' "${cask_dir}/fabric.rb" > "${cask_dir}/older.rb"
+new_tap "${cask_dir}/older.rb"
+if ! run_open_tap_pr 9.9.9 "${cask_dir}/fabric.rb"; then
+  fail "open-tap-pr.sh failed when main holds an older version:"
+  cat "${work_dir}/open-tap-pr.log" >&2
+fi
+check_tap "when main holds an older version" 9.9.9 "${cask_dir}/fabric.rb" 1
+sed 's/^  version "9.9.9"$/  version "9.9.10"/' "${cask_dir}/fabric.rb" > "${cask_dir}/older-patch.rb"
+sed 's/^  version "9.9.9"$/  version "9.10.0"/' "${cask_dir}/fabric.rb" > "${cask_dir}/fabric-9.10.0.rb"
+new_tap "${cask_dir}/older-patch.rb"
+if ! run_open_tap_pr 9.10.0 "${cask_dir}/fabric-9.10.0.rb"; then
+  fail "open-tap-pr.sh failed for 9.10.0 when main holds 9.9.10:"
+  cat "${work_dir}/open-tap-pr.log" >&2
+fi
+check_tap "for 9.10.0 when main holds 9.9.10" 9.10.0 "${cask_dir}/fabric-9.10.0.rb" 1
+
+# A cask on main whose version isn't X.Y.Z stops the script after the query.
+sed 's/^  version "9.9.9"$/  version "latest"/' "${cask_dir}/fabric.rb" > "${cask_dir}/latest.rb"
+new_tap "${cask_dir}/latest.rb"
+if run_open_tap_pr 9.9.9 "${cask_dir}/fabric.rb"; then
+  fail "open-tap-pr.sh passed when main's cask has the version 'latest'"
+elif [ "$(cat "${tap_calls}")" != query ]; then
+  fail "open-tap-pr.sh went on when main's cask has the version 'latest': $(tr '\n' ' ' < "${tap_calls}")"
+elif ! grep -qF "has the version 'latest'" "${work_dir}/open-tap-pr.log"; then
+  fail "open-tap-pr.sh stopped on main's version 'latest' with another error:"
+  cat "${work_dir}/open-tap-pr.log" >&2
 fi
 
 # sign-macos.sh checks its arguments and settings before anything that needs
