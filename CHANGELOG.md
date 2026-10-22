@@ -2,6 +2,12 @@
 
 All notable changes to Affinidi Trust Fabric CLI are documented in this file. Entries are written from pull request titles when a release is made, and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/compare/v0.1.2...v0.1.3) (2026-10-22)
+
+### 🔒 Security
+
+* update rustls-webpki and webpki-root-certs ([#42](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/issues/42)) ([d556cd8](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/commit/d556cd8dbc31308335a2e8da4da414622189f4ff))
+
 ## [0.1.2](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/compare/v0.1.1...v0.1.2) (2026-10-15)
 
 ### 🔒 Security
