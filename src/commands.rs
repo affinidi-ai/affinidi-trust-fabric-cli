@@ -13911,8 +13911,9 @@ const AUDIT_LIST_EXAMPLES: &str = r#"Examples:
   Policy decisions and trust checks only:
     fabric agent-gateway audit list --category policy_decision,trust_check
 
-  Requests denied at access points:
+  Requests denied at access points, by a policy and by a policy error:
     fabric agent-gateway audit list --flow access_point --decision deny
+    fabric agent-gateway audit list --flow access_point --decision error
 
   Events that mention "stripe" anywhere, second page of 50:
     fabric agent-gateway audit list --filter stripe --limit 50 --page 2
@@ -13958,10 +13959,13 @@ struct AuditListArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuditFlow {
+    /// Inbound requests at a surface's Access Point.
     #[value(name = "access_point")]
     AccessPoint,
+    /// Outbound requests leaving through a Transit Point.
     #[value(name = "transit_point")]
     TransitPoint,
+    /// Inbound requests received over Fabric from another gateway.
     Fabric,
 }
 
@@ -13977,16 +13981,16 @@ impl AuditFlow {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuditScope {
-    /// The gateway-wide policy, checked before the surface policy
+    /// The gateway-wide policy, checked before the surface policy.
     Gateway,
-    /// The surface policy
+    /// The surface policy.
     Surface,
-    /// An MCP tool policy
+    /// An MCP tool policy.
     #[value(name = "mcp_tool")]
     McpTool,
-    /// The policy on the response sent back to the caller
+    /// The policy on the response sent back to the caller.
     Response,
-    /// Tools a `tools/list` filter removed from the response
+    /// Tools a `tools/list` filter removed from the response.
     #[value(name = "mcp_tool_list")]
     McpToolList,
 }
@@ -14005,11 +14009,11 @@ impl AuditScope {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuditDecision {
-    /// The policy allowed the request
+    /// The policy allowed the request.
     Allow,
-    /// The policy denied the request
+    /// The policy denied the request.
     Deny,
-    /// The policy could not decide, so the request was denied
+    /// The policy could not decide, so the request was denied.
     Error,
 }
 

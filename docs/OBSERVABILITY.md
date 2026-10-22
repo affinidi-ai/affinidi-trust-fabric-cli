@@ -101,6 +101,7 @@ Paging is by offset over a newest-first list. Events written while the run is in
 ```sh
 fabric agent-gateway audit list --category policy_decision,trust_check
 fabric agent-gateway audit list --flow access_point --decision deny
+fabric agent-gateway audit list --flow access_point --decision error
 ```
 
 | Flag | Meaning |
@@ -114,6 +115,7 @@ fabric agent-gateway audit list --flow access_point --decision deny
 > [!WARNING]
 >
 > - **`--flow`, `--scope`, and `--decision` restrict the view to policy decisions.** Setting any of them drops every other kind of event, rather than narrowing the policy decisions within a wider set.
+> - **`--decision deny` leaves out `error` decisions, which also denied the request.** To see every request turned away, run it with `deny` and again with `error`.
 > - **`--filter` matches more than a row displays.** It also matches field names and the base64 body of an embedded JWT.
 
 Good to know:
