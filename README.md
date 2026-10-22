@@ -185,6 +185,22 @@ fabric agent-gateway surfaces get "Sales Agent" --output json
 
 Run `fabric agent-gateway --help` to list every command group, add `--help` to any command for its options, or run `fabric agent-gateway shell` to work interactively.
 
+### Use it from your coding agent
+
+The [Agent Gateway skill](https://github.com/affinidi-ai/agent-gateway-skills) lets a coding agent run your gateway with `fabric` for you, such as putting an MCP server behind it or finding out why a call gets a 403. It installs as a plugin in Claude Code and GitHub Copilot CLI:
+
+```sh
+# Claude Code
+claude plugin marketplace add affinidi-ai/agent-gateway-skills
+claude plugin install affinidi-agent-gateway@affinidi-agent-gateway-skills
+
+# GitHub Copilot CLI
+copilot plugin marketplace add affinidi-ai/agent-gateway-skills
+copilot plugin install affinidi-agent-gateway@affinidi-agent-gateway-skills
+```
+
+Sign in with `fabric` first, because the agent uses your saved login. The [skill's README](https://github.com/affinidi-ai/agent-gateway-skills#readme) has other install methods and example requests.
+
 ## Documentation
 
 | Goal | Documentation |
