@@ -13943,6 +13943,7 @@ struct AuditListArgs {
     #[arg(long, value_enum)]
     scope: Option<AuditScope>,
     /// Only policy decisions with this outcome; other events are dropped.
+    /// `deny` leaves out `error` decisions, which also denied the request.
     #[arg(long, value_enum)]
     decision: Option<AuditDecision>,
     /// Read every page instead of one. With --output json the per-page
@@ -13976,11 +13977,16 @@ impl AuditFlow {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuditScope {
+    /// The gateway-wide policy, checked before the surface policy
     Gateway,
+    /// The surface policy
     Surface,
+    /// An MCP tool policy
     #[value(name = "mcp_tool")]
     McpTool,
+    /// The policy on the response sent back to the caller
     Response,
+    /// Tools a `tools/list` filter removed from the response
     #[value(name = "mcp_tool_list")]
     McpToolList,
 }
@@ -13999,8 +14005,11 @@ impl AuditScope {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuditDecision {
+    /// The policy allowed the request
     Allow,
+    /// The policy denied the request
     Deny,
+    /// The policy could not decide, so the request was denied
     Error,
 }
 
@@ -15818,6 +15827,22 @@ mod observability_tests {
     fn audit_all_and_page_are_mutually_exclusive() {
         Cli::try_parse_from(["fabric", "agent-gateway", "audit", "list", "--all", "--page", "2"])
             .expect_err("--all reads every page, so a single page cannot also be selected");
+    }
+
+    #[test]
+    fn audit_filter_value_names_match_the_gateway() {
+        for flow in <AuditFlow as clap::ValueEnum>::value_variants() {
+            let name = clap::ValueEnum::to_possible_value(flow).expect("every flow is selectable");
+            assert_eq!(name.get_name(), flow.as_str());
+        }
+        for scope in <AuditScope as clap::ValueEnum>::value_variants() {
+            let name = clap::ValueEnum::to_possible_value(scope).expect("every scope is selectable");
+            assert_eq!(name.get_name(), scope.as_str());
+        }
+        for decision in <AuditDecision as clap::ValueEnum>::value_variants() {
+            let name = clap::ValueEnum::to_possible_value(decision).expect("every decision is selectable");
+            assert_eq!(name.get_name(), decision.as_str());
+        }
     }
 
     #[test]
