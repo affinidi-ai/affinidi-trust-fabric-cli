@@ -13981,6 +13981,8 @@ enum AuditScope {
     #[value(name = "mcp_tool")]
     McpTool,
     Response,
+    #[value(name = "mcp_tool_list")]
+    McpToolList,
 }
 
 impl AuditScope {
@@ -13990,6 +13992,7 @@ impl AuditScope {
             Self::Surface => "surface",
             Self::McpTool => "mcp_tool",
             Self::Response => "response",
+            Self::McpToolList => "mcp_tool_list",
         }
     }
 }
@@ -13998,6 +14001,7 @@ impl AuditScope {
 enum AuditDecision {
     Allow,
     Deny,
+    Error,
 }
 
 impl AuditDecision {
@@ -14005,6 +14009,7 @@ impl AuditDecision {
         match self {
             Self::Allow => "allow",
             Self::Deny => "deny",
+            Self::Error => "error",
         }
     }
 }
@@ -15825,7 +15830,9 @@ mod observability_tests {
             "--flow",
             "access_point",
             "--scope",
-            "mcp_tool",
+            "mcp_tool_list",
+            "--decision",
+            "error",
         ])
         .expect("snake_case filter values match the gateway's own");
         let Command::Audit {
@@ -15842,7 +15849,12 @@ mod observability_tests {
         assert_eq!(
             args.scope
                 .map(AuditScope::as_str),
-            Some("mcp_tool")
+            Some("mcp_tool_list")
+        );
+        assert_eq!(
+            args.decision
+                .map(AuditDecision::as_str),
+            Some("error")
         );
     }
 

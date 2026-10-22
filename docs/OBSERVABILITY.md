@@ -108,8 +108,8 @@ fabric agent-gateway audit list --flow access_point --decision deny
 | `--category` | Comma-separated event categories, such as `policy_decision,trust_check,consent_granted,token_injected,payment`. An OR set: an event matching any of them is kept |
 | `--filter` | Case-insensitive substring, matched by the gateway against each event re-serialised as JSON, including policy evidence the gateway adds from signed VPs |
 | `--flow` | Policy decisions from this request flow: `access_point`, `transit_point`, or `fabric` |
-| `--scope` | Policy decisions at this scope: `gateway`, `surface`, `mcp_tool`, or `response` |
-| `--decision` | Policy decisions with this outcome: `allow` or `deny` |
+| `--scope` | Policy decisions at this scope: `gateway`, `surface`, `mcp_tool`, `response`, or `mcp_tool_list` (tools a `tools/list` filter removed) |
+| `--decision` | Policy decisions with this outcome: `allow`, `deny`, or `error` (the policy could not decide, so the request was denied) |
 
 > [!WARNING]
 >
