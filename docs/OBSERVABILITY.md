@@ -101,6 +101,7 @@ Paging is by offset over a newest-first list. Events written while the run is in
 ```sh
 fabric agent-gateway audit list --category policy_decision,trust_check
 fabric agent-gateway audit list --flow access_point --decision deny
+fabric agent-gateway audit list --flow access_point --decision error
 ```
 
 | Flag | Meaning |
@@ -108,12 +109,13 @@ fabric agent-gateway audit list --flow access_point --decision deny
 | `--category` | Comma-separated event categories, such as `policy_decision,trust_check,consent_granted,token_injected,payment`. An OR set: an event matching any of them is kept |
 | `--filter` | Case-insensitive substring, matched by the gateway against each event re-serialised as JSON, including policy evidence the gateway adds from signed VPs |
 | `--flow` | Policy decisions from this request flow: `access_point`, `transit_point`, or `fabric` |
-| `--scope` | Policy decisions at this scope: `gateway`, `surface`, `mcp_tool`, or `response` |
-| `--decision` | Policy decisions with this outcome: `allow` or `deny` |
+| `--scope` | Policy decisions at this scope: `gateway`, `surface`, `mcp_tool`, `response`, or `mcp_tool_list` (tools a `tools/list` filter removed) |
+| `--decision` | Policy decisions with this outcome: `allow`, `deny`, or `error` (the policy could not decide, so the request was denied) |
 
 > [!WARNING]
 >
 > - **`--flow`, `--scope`, and `--decision` restrict the view to policy decisions.** Setting any of them drops every other kind of event, rather than narrowing the policy decisions within a wider set.
+> - **`--decision deny` leaves out `error` decisions, which also denied the request.** To see every request turned away, run it with `deny` and again with `error`.
 > - **`--filter` matches more than a row displays.** It also matches field names and the base64 body of an embedded JWT.
 
 Good to know:

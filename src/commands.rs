@@ -13911,8 +13911,9 @@ const AUDIT_LIST_EXAMPLES: &str = r#"Examples:
   Policy decisions and trust checks only:
     fabric agent-gateway audit list --category policy_decision,trust_check
 
-  Requests denied at access points:
+  Requests denied at access points, by a policy and by a policy error:
     fabric agent-gateway audit list --flow access_point --decision deny
+    fabric agent-gateway audit list --flow access_point --decision error
 
   Events that mention "stripe" anywhere, second page of 50:
     fabric agent-gateway audit list --filter stripe --limit 50 --page 2
@@ -13943,6 +13944,7 @@ struct AuditListArgs {
     #[arg(long, value_enum)]
     scope: Option<AuditScope>,
     /// Only policy decisions with this outcome; other events are dropped.
+    /// `deny` leaves out `error` decisions, which also denied the request.
     #[arg(long, value_enum)]
     decision: Option<AuditDecision>,
     /// Read every page instead of one. With --output json the per-page
@@ -13957,10 +13959,13 @@ struct AuditListArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuditFlow {
+    /// Inbound requests at a surface's Access Point.
     #[value(name = "access_point")]
     AccessPoint,
+    /// Outbound requests leaving through a Transit Point.
     #[value(name = "transit_point")]
     TransitPoint,
+    /// Inbound requests received over Fabric from another gateway.
     Fabric,
 }
 
@@ -13976,11 +13981,18 @@ impl AuditFlow {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuditScope {
+    /// The gateway-wide policy, checked before the surface policy.
     Gateway,
+    /// The surface policy.
     Surface,
+    /// An MCP tool policy.
     #[value(name = "mcp_tool")]
     McpTool,
+    /// The policy on the response sent back to the caller.
     Response,
+    /// Tools a `tools/list` filter removed from the response.
+    #[value(name = "mcp_tool_list")]
+    McpToolList,
 }
 
 impl AuditScope {
@@ -13990,14 +14002,19 @@ impl AuditScope {
             Self::Surface => "surface",
             Self::McpTool => "mcp_tool",
             Self::Response => "response",
+            Self::McpToolList => "mcp_tool_list",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuditDecision {
+    /// The policy allowed the request.
     Allow,
+    /// The policy denied the request.
     Deny,
+    /// The policy could not decide, so the request was denied.
+    Error,
 }
 
 impl AuditDecision {
@@ -14005,6 +14022,7 @@ impl AuditDecision {
         match self {
             Self::Allow => "allow",
             Self::Deny => "deny",
+            Self::Error => "error",
         }
     }
 }
@@ -15816,6 +15834,22 @@ mod observability_tests {
     }
 
     #[test]
+    fn audit_filter_value_names_match_the_gateway() {
+        for flow in <AuditFlow as clap::ValueEnum>::value_variants() {
+            let name = clap::ValueEnum::to_possible_value(flow).expect("every flow is selectable");
+            assert_eq!(name.get_name(), flow.as_str());
+        }
+        for scope in <AuditScope as clap::ValueEnum>::value_variants() {
+            let name = clap::ValueEnum::to_possible_value(scope).expect("every scope is selectable");
+            assert_eq!(name.get_name(), scope.as_str());
+        }
+        for decision in <AuditDecision as clap::ValueEnum>::value_variants() {
+            let name = clap::ValueEnum::to_possible_value(decision).expect("every decision is selectable");
+            assert_eq!(name.get_name(), decision.as_str());
+        }
+    }
+
+    #[test]
     fn audit_filters_accept_the_gateway_vocabulary() {
         let cli = Cli::try_parse_from([
             "fabric",
@@ -15825,7 +15859,9 @@ mod observability_tests {
             "--flow",
             "access_point",
             "--scope",
-            "mcp_tool",
+            "mcp_tool_list",
+            "--decision",
+            "error",
         ])
         .expect("snake_case filter values match the gateway's own");
         let Command::Audit {
@@ -15842,7 +15878,12 @@ mod observability_tests {
         assert_eq!(
             args.scope
                 .map(AuditScope::as_str),
-            Some("mcp_tool")
+            Some("mcp_tool_list")
+        );
+        assert_eq!(
+            args.decision
+                .map(AuditDecision::as_str),
+            Some("error")
         );
     }
 
