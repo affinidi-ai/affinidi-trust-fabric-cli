@@ -2,6 +2,12 @@
 
 All notable changes to Affinidi Trust Fabric CLI are documented in this file. Entries are written from pull request titles when a release is made, and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/compare/v0.1.3...v0.1.4) (2026-10-23)
+
+### 🛠️ Fixes
+
+* accept mcp_tool_list scope and error decision in audit list ([#43](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/issues/43)) ([699da72](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/commit/699da72a622493648596a7b124216eca36e191d0))
+
 ## [0.1.3](https://github.com/affinidi-ai/affinidi-trust-fabric-cli/compare/v0.1.2...v0.1.3) (2026-10-22)
 
 ### 🔒 Security
