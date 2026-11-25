@@ -59,6 +59,14 @@ Never edit `CHANGELOG.md`, the version in `Cargo.toml`, or the `v*` tags by hand
 
 If `main` has moved on by the time the checks pass on a commit, that run releases nothing, and the newer commit releases both once its own checks pass. To retry a failed release, run the `version` workflow by hand on `main`. If the release commit `chore: release vX.Y.Z` reached `main` but its tag didn't, that run first tags the release commit, so the version isn't made twice.
 
+The one failure a re-run can't fix is a missing git note. semantic-release pushes `refs/notes/semantic-release-vX.Y.Z` last, after the release commit and the tag, and the `version` workflow pushes it again up to three times if GitHub refuses it. If every push fails, the run fails with `vX.Y.Z is released ..., but refs/notes/semantic-release-vX.Y.Z could not be pushed`. The release itself is out, and a re-run finds nothing to release and never pushes the note. Add it from a checkout with write access:
+
+```sh
+git fetch origin --tags
+git notes --ref semantic-release-vX.Y.Z add -f -m '{"channels":[null]}' vX.Y.Z
+git push origin refs/notes/semantic-release-vX.Y.Z
+```
+
 ### Release setup
 
 A repository admin sets these up once, before the release bot's secrets are added. Until both secrets are set, the `version` workflow passes with a notice and releases nothing.
