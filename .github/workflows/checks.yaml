@@ -74,6 +74,48 @@ jobs:
       coverage: 80
       useRedis: false
 
+  # The `agent-stream` Cargo feature is off by default and in releases, so the
+  # shared jobs above never build it. This job tests and lints the feature
+  # build, then checks that the default binary still rejects `fabric
+  # agent-stream`. The shared `test` job already checks that through
+  # `the_default_build_does_not_know_agent_stream` in
+  # tests/agent_stream_feature.rs, and the last step here repeats it on
+  # purpose, so the release guarantee shows up as a check of its own. The
+  # shared workflows take no features input, so this job runs cargo directly,
+  # with the same toolchain and flags.
+  agent-stream:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy
+          rustup default 1.96.0
+
+      - name: Test with the feature
+        run: cargo test --locked --features agent-stream
+
+      - name: Lint with the feature
+        run: cargo clippy --locked --features agent-stream --all-targets
+
+      - name: Build without the feature
+        run: cargo build --locked
+
+      - name: The default binary rejects agent-stream
+        run: |
+          set +e
+          stderr="$(target/debug/fabric agent-stream 2>&1 >/dev/null)"
+          code=$?
+          set -e
+          echo "$stderr"
+          test "$code" -eq 2
+          grep -q "unrecognized subcommand" <<< "$stderr"
+
   # The release scripts only run on main after a merge, so they are checked
   # here first. shellcheck comes with the runner image.
   release-scripts:

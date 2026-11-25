@@ -11,6 +11,12 @@ license = "Apache-2.0"
 name = "fabric"
 path = "src/main.rs"
 
+# The `fabric agent-stream` command group is still being built, so it is only
+# compiled when asked for. The same feature turns on the stop of a command
+# aimed at the other product (`src/product.rs`). Release builds leave both out.
+[features]
+agent-stream = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

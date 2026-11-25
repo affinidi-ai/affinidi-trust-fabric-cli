@@ -52,6 +52,7 @@ make build
 | `make sign BIN=<path>` | Codesign an existing binary only | the path given |
 | `make` or `make help` | Lists the targets | |
 | `cargo build` | Debug build, unsigned | `target/debug/fabric` |
+| `cargo build --features agent-stream` | Debug build, unsigned, with the `fabric agent-stream` commands and the stop of a command aimed at the other product, both of which release builds leave out | `target/debug/fabric` |
 
 The first build downloads and compiles every dependency, so it takes a few minutes. Later
 builds are incremental.
@@ -131,6 +132,8 @@ Run the same checks CI runs before you push:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo clippy --all-targets --features agent-stream -- -D warnings
+cargo test --features agent-stream
 cargo deny check
 ```
 
@@ -139,6 +142,8 @@ cargo deny check
 | `cargo fmt --check` | `fmt` | Style is set in [`rustfmt.toml`](../../rustfmt.toml), including a 120-column line width. Run `cargo fmt` to fix. |
 | `cargo clippy --all-targets -- -D warnings` | `clippy` | Every warning fails the build. CI passes `-D warnings` as the Rust flags of the check, test, fmt, clippy, and coverage jobs. |
 | `cargo test` | `test` | Unit and integration tests. See [`TESTING.md`](TESTING.md). |
+| `cargo clippy --all-targets --features agent-stream -- -D warnings` | `agent-stream` | The same lint on the build with the `agent-stream` feature, which the `clippy` job does not build. |
+| `cargo test --features agent-stream` | `agent-stream` | The same tests on the build with the `agent-stream` feature, plus the ones only that build has. The job's last step checks that the default binary rejects `fabric agent-stream`, which `cargo test` already covers locally. |
 | `cargo deny check` | `cargo-deny` | Licences, advisories, bans, and sources, configured in [`deny.toml`](../../deny.toml). Run it whenever you add or update a dependency. |
 
 CI also runs `cargo check` (the `check` job), a dependency audit (`audit`), a security

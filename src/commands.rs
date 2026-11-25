@@ -16,14 +16,15 @@ use crate::{
     },
     config::{Config, Connection, normalize_host, normalize_user_host, saved_host_http_warning},
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
-    features, surface_patch, surface_validate,
+    features,
+    product::{self, Product},
+    surface_patch, surface_validate,
     tables::{self, Layout, Scope, table_cell},
     tool_gate_preview::{self, Conditions, Gating, Preview, ToolPreview, Verdict},
 };
 
-/// Prefix that identifies a gateway personal access token, matching
-/// `access_tokens::TOKEN_PREFIX` on the gateway.
-const PAT_TOKEN_PREFIX: &str = "agpat_";
+/// Prefix that identifies a gateway personal access token.
+const PAT_TOKEN_PREFIX: &str = product::AGENT_GATEWAY_PAT_PREFIX;
 
 /// Connection name `login` saves under when --connection is not supplied.
 const DEFAULT_CONNECTION: &str = "default";
@@ -40,7 +41,11 @@ pub struct Cli {
 enum Appliance {
     /// Manage Affinidi Agent Gateway.
     #[command(name = "agent-gateway")]
-    AgentGateway(AgentGatewayArgs),
+    AgentGateway(Box<AgentGatewayArgs>),
+    /// Manage Affinidi Agent Stream.
+    #[cfg(feature = "agent-stream")]
+    #[command(name = "agent-stream")]
+    AgentStream(crate::agent_stream::AgentStreamArgs),
 }
 
 #[derive(Debug, Args)]
@@ -87,30 +92,52 @@ struct AgentGatewayArgs {
 }
 
 impl Cli {
+    /// The Agent Gateway arguments, or `None` when the command is addressed
+    /// to another appliance.
+    fn agent_gateway_args(&self) -> Option<&AgentGatewayArgs> {
+        match &self.appliance {
+            Appliance::AgentGateway(args) => Some(args.as_ref()),
+            #[cfg(feature = "agent-stream")]
+            Appliance::AgentStream(_) => None,
+        }
+    }
+
+    /// The Agent Gateway arguments of a command line that tests parsed for
+    /// the gateway.
+    #[cfg(test)]
     fn agent_gateway(&self) -> &AgentGatewayArgs {
-        let Appliance::AgentGateway(args) = &self.appliance;
-        args
+        self.agent_gateway_args()
+            .expect("the test parsed an Agent Gateway command")
     }
 
-    fn agent_gateway_mut(&mut self) -> &mut AgentGatewayArgs {
-        let Appliance::AgentGateway(args) = &mut self.appliance;
-        args
-    }
-
+    /// Like [`Self::agent_gateway`], giving the arguments away.
+    #[cfg(test)]
     fn into_agent_gateway(self) -> AgentGatewayArgs {
-        let Appliance::AgentGateway(args) = self.appliance;
-        args
+        match self.appliance {
+            Appliance::AgentGateway(args) => *args,
+            #[cfg(feature = "agent-stream")]
+            Appliance::AgentStream(_) => panic!("the test parsed an Agent Stream command"),
+        }
     }
 
+    /// Whether this is `fabric agent-gateway shell`, the one command that opens
+    /// the interactive shell.
     pub fn is_interactive(&self) -> bool {
-        matches!(self.agent_gateway().command, Command::Shell)
+        matches!(
+            self.agent_gateway_args()
+                .map(|gateway| &gateway.command),
+            Some(Command::Shell)
+        )
     }
 
     /// Arguments every line typed in the interactive shell is parsed after:
-    /// the appliance plus the global flags the shell was started with.
+    /// `fabric agent-gateway`, the one appliance with a shell, plus the global
+    /// flags the shell was started with.
     pub fn interactive_prefix(&self) -> Vec<String> {
-        let gateway = self.agent_gateway();
         let mut args = vec!["fabric".to_owned(), "agent-gateway".to_owned()];
+        let Some(gateway) = self.agent_gateway_args() else {
+            return args;
+        };
         if let Some(connection) = &gateway.connection {
             args.extend(["--connection".to_owned(), connection.clone()]);
         }
@@ -137,24 +164,28 @@ impl Cli {
     }
 
     pub fn login_wants_paste_prompt(&self) -> bool {
-        matches!(&self.agent_gateway().command, Command::Login(args) if args.paste && args.token.is_none() && !args.token_stdin)
+        matches!(
+            self.agent_gateway_args()
+                .map(|gateway| &gateway.command),
+            Some(Command::Login(args)) if args.paste && args.token.is_none() && !args.token_stdin
+        )
     }
 
     pub fn set_login_token(
         &mut self,
         token: String,
     ) {
-        if let Command::Login(args) = &mut self
-            .agent_gateway_mut()
-            .command
+        if let Appliance::AgentGateway(gateway) = &mut self.appliance
+            && let Command::Login(args) = &mut gateway.command
         {
             args.token = Some(token);
         }
     }
 }
 
+/// How a command that returns data prints it.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum Output {
+pub(crate) enum Output {
     Json,
     Table,
 }
@@ -1911,18 +1942,21 @@ fn run_offline(cli: &AgentGatewayArgs) -> Option<Result<()>> {
     )
 }
 
-/// Runs one command. Both the one-shot CLI and the interactive shell print
-/// what this returns, so every command's error passes through
-/// `add_terms_hint` here, and only here: the gateway's Terms gate can refuse
-/// any route, not only the terms ones.
+/// Runs one command, on the appliance it is addressed to. Both the one-shot
+/// CLI and the interactive shell print what this returns, so every gateway
+/// command's error passes through `add_terms_hint` here, and only here: the
+/// gateway's Terms gate can refuse any route, not only the terms ones.
 pub async fn run(cli: Cli) -> Result<()> {
-    dispatch(cli)
-        .await
-        .map_err(add_terms_hint)
+    match cli.appliance {
+        Appliance::AgentGateway(args) => dispatch(*args)
+            .await
+            .map_err(add_terms_hint),
+        #[cfg(feature = "agent-stream")]
+        Appliance::AgentStream(args) => crate::agent_stream::dispatch(args),
+    }
 }
 
-async fn dispatch(cli: Cli) -> Result<()> {
-    let cli = cli.into_agent_gateway();
+async fn dispatch(cli: AgentGatewayArgs) -> Result<()> {
     if let Some(result) = run_offline(&cli) {
         return result;
     }
@@ -2004,6 +2038,7 @@ async fn dispatch_with(
                          {name} --host {host}`"
                     )
                 })?;
+            product::check_product(Product::AgentGateway, &host, Some(&token), cli.host.is_some()).await?;
             let client = GatewayClient::new(host, token)?;
             if let Command::AccessTokens { command } = command {
                 return run_access_tokens(&client, command, cli.output).await;
@@ -2137,7 +2172,7 @@ fn first_warning_for(key: String) -> bool {
 }
 
 /// The `#` name warnings of `config` not shown yet in this process.
-fn new_hash_name_warnings(config: &Config) -> Vec<String> {
+pub(crate) fn new_hash_name_warnings(config: &Config) -> Vec<String> {
     config
         .hash_name_warnings()
         .into_iter()
@@ -2335,8 +2370,23 @@ async fn login(
 /// Validate a login and save it as `connection`, trimmed, in the configuration
 /// file at `config_path`. A name that is empty once trimmed is refused before
 /// the gateway, the credential store or the file is touched, and so is a plain
-/// http host that is not local unless `allow_http` is set. Returns a note to
-/// show the user when the login replaced a connection that already existed.
+/// http host that is not local unless `allow_http` is set.
+///
+/// In a binary built with the `agent-stream` Cargo feature, a login to an
+/// Agent Stream is refused too, before the token is sent and before anything
+/// is saved (see [`product::check_product`]). The host is asked which product
+/// it is before this function reads a token or opens the browser, unless the
+/// token in `args` already says so by its prefix. That token was given with
+/// `--token` or FABRIC_TOKEN, or, for `login --paste` in the interactive
+/// shell, typed at the shell's own prompt, which comes before this function
+/// and so before the host is asked. A `--pat` login is not asked, because it
+/// only accepts a token with the Agent Gateway prefix. A token read
+/// afterwards, from standard input, a prompt, or the browser, is refused when
+/// its prefix says Agent Stream issued it. A binary built without the
+/// feature, as every release is, does none of this.
+///
+/// Returns a note to show the user when the login replaced a connection that
+/// already existed.
 async fn login_and_save(
     config: &mut Config,
     credentials: &impl CredentialStore,
@@ -2359,7 +2409,12 @@ async fn login_and_save(
             .context("--host is required for login")?,
         allow_http,
     )?;
+    if args.pat.is_none() {
+        product::check_product(Product::AgentGateway, &host, args.token.as_deref(), true).await?;
+    }
     let token = acquire_login_token(&host, &args).await?;
+    // The host has answered by now, so only the token's prefix is left to check.
+    product::check_product(Product::AgentGateway, &host, Some(&token), false).await?;
     let client = GatewayClient::new(&host, &token)?;
     if args.pat.is_some() {
         client
@@ -2559,6 +2614,7 @@ async fn whoami_info(
         token,
         token_stored,
     } = command_target(config, credentials, connection, host_override, flags, token_override)?;
+    product::check_product(Product::AgentGateway, &host, token.as_deref(), host_override.is_some()).await?;
 
     let mut info = json!({
         "connection": name,
@@ -16725,7 +16781,7 @@ fn print_rows(
 
 /// Prints a list in the layout of its resource. `--output json` and anything
 /// that is not a plain list go through the shared printer unchanged.
-fn print_list(
+pub(crate) fn print_list(
     value: &Value,
     output: Output,
     layout: &Layout,
@@ -17054,8 +17110,12 @@ mod tests {
         config
     }
 
-    /// Starts a one-shot HTTP server that replies with the given status line
-    /// and body to the first request it receives, then returns its base URL.
+    /// Starts an HTTP server and returns its base URL. The server answers one
+    /// request with `status_line` and `body`, then stops. A request for the
+    /// public permission list gets a 404 and does not use up that one answer.
+    /// A build with the `agent-stream` Cargo feature may send that request
+    /// first, to ask which product the host is, and then reads the host as
+    /// unknown and carries on. A build without the feature never sends it.
     async fn one_shot_server(
         status_line: &'static str,
         body: &'static str,
@@ -17067,15 +17127,25 @@ mod tests {
             .local_addr()
             .expect("local addr");
         tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
+            while let Ok((mut socket, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
-                let _ = socket.read(&mut buf).await;
-                let response =
-                    format!("{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let read = socket
+                    .read(&mut buf)
+                    .await
+                    .unwrap_or(0);
+                let asks_the_product = buf[..read].starts_with(PROBE_REQUEST.as_bytes());
+                let response = if asks_the_product {
+                    NOT_FOUND.to_owned()
+                } else {
+                    format!("{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                };
                 let _ = socket
                     .write_all(response.as_bytes())
                     .await;
                 let _ = socket.shutdown().await;
+                if !asks_the_product {
+                    return;
+                }
             }
         });
         format!("http://{addr}")
@@ -17436,6 +17506,7 @@ mod tests {
     }
 
     const OK_EMPTY: &str = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
     const OK_EMPTY_LIST: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n[]";
 
     fn gateway_args(args: &[&str]) -> AgentGatewayArgs {
@@ -17783,6 +17854,528 @@ mod tests {
         let allowed = target(true).expect("--allow-http accepts the plain http host");
         assert_eq!(allowed.host, "http://gateway.example.com");
         assert!(allowed.connection.is_none());
+    }
+
+    const AGENT_STREAM_TOKEN: &str = "aspat_given";
+    const SESSION_TOKEN: &str = "session-given";
+    const PROBE_REQUEST: &str = "GET /api/v1/permissions/public HTTP/1.1";
+    const AUTHENTICATED: &str = r#"{"authenticated": true}"#;
+
+    fn first_lines(requests: &std::sync::Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| {
+                request
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_session_token_with_a_saved_gateway_host_is_not_probed() {
+        let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+        let config = config_with_connection("prod", &host);
+        let credentials = credentials_bound_to("prod", SESSION_TOKEN, &host);
+
+        dispatch_with(gateway_args(&["api", "get", "/v1/gateways"]), config, &credentials)
+            .await
+            .expect("a saved connection runs without a probe");
+
+        assert_eq!(first_lines(&requests), ["GET /api/v1/gateways HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn login_with_a_personal_access_token_does_not_ask_the_host() {
+        let (host, requests) = recording_server(vec![OK_EMPTY]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        let credentials = MemoryCredentials::default();
+        let args = LoginArgs {
+            host: Some(host.clone()),
+            token_stdin: false,
+            paste: false,
+            token: None,
+            pat: Some("agpat_valid".to_owned()),
+        };
+
+        login_and_save(&mut config, &credentials, "production", args, false, &path)
+            .await
+            .expect("the prefix says Agent Gateway, so the host is not asked");
+
+        assert_eq!(first_lines(&requests), ["GET /api/v1/token-info HTTP/1.1"]);
+    }
+
+    /// The stop of a command aimed at Agent Stream, which only acts in a build
+    /// with the `agent-stream` Cargo feature.
+    #[cfg(feature = "agent-stream")]
+    mod with_the_agent_stream_feature {
+        use super::*;
+
+        const GATEWAY_PERMISSIONS: &str = r#"{"surfaces.view":false}"#;
+        const AGENT_STREAM_PERMISSIONS: &str = r#"{"pipes.view":false}"#;
+        const SAVED_GATEWAY_HOST: &str = "https://gateway.example.com";
+
+        #[tokio::test]
+        async fn a_given_agent_stream_token_on_a_gateway_command_sends_nothing_and_says_who_issued_it() {
+            let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+
+            let error = dispatch_with(
+                gateway_args(&["--host", &host, "--token", AGENT_STREAM_TOKEN, "api", "get", "/v1/gateways"]),
+                Config::default(),
+                &UnreachableKeyring,
+            )
+            .await
+            .expect_err("an Agent Stream token must not reach the gateway");
+
+            let text = error.to_string();
+            assert!(text.contains("issued by Agent Stream"), "{text}");
+            assert!(text.contains("`fabric agent-stream ...`"), "{text}");
+            assert!(!text.contains(AGENT_STREAM_TOKEN), "{text}");
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn an_agent_stream_token_given_with_a_leading_space_on_a_gateway_command_sends_nothing() {
+            let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+            let token = format!(" {AGENT_STREAM_TOKEN}");
+
+            let error = dispatch_with(
+                gateway_args(&["--host", &host, "--token", &token, "api", "get", "/v1/gateways"]),
+                Config::default(),
+                &UnreachableKeyring,
+            )
+            .await
+            .expect_err("the space must not hide the Agent Stream prefix");
+
+            let text = error.to_string();
+            assert!(text.contains("issued by Agent Stream"), "{text}");
+            assert!(!text.contains(AGENT_STREAM_TOKEN), "{text}");
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_saved_agent_stream_token_on_a_gateway_connection_sends_nothing() {
+            let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+            let config = config_with_connection("prod", &host);
+            let credentials = credentials_bound_to("prod", AGENT_STREAM_TOKEN, &host);
+
+            let error = dispatch_with(gateway_args(&["surfaces", "list"]), config, &credentials)
+                .await
+                .expect_err("a saved Agent Stream token must not reach the gateway");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("issued by Agent Stream"),
+                "{error}"
+            );
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_session_token_with_a_given_agent_stream_host_stops_after_the_probe() {
+            let (host, requests) = recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS), OK_EMPTY_LIST]).await;
+
+            let error = dispatch_with(
+                gateway_args(&["--host", &host, "--token", SESSION_TOKEN, "surfaces", "list"]),
+                Config::default(),
+                &UnreachableKeyring,
+            )
+            .await
+            .expect_err("an Agent Stream host must be refused");
+
+            let text = error.to_string();
+            assert!(text.contains(&format!("{host} is an Agent Stream, not an Agent Gateway")), "{text}");
+            assert!(!text.contains(SESSION_TOKEN), "{text}");
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST]);
+            assert!(
+                !requests.lock().unwrap()[0]
+                    .to_ascii_lowercase()
+                    .contains("authorization"),
+                "the probe carries no token"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_session_token_with_a_given_gateway_host_runs_after_the_probe() {
+            let (host, requests) = recording_server(vec![ok_json(GATEWAY_PERMISSIONS), OK_EMPTY_LIST]).await;
+
+            dispatch_with(
+                gateway_args(&["--host", &host, "--token", SESSION_TOKEN, "api", "get", "/v1/gateways"]),
+                Config::default(),
+                &UnreachableKeyring,
+            )
+            .await
+            .expect("a gateway host answers the command");
+
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST, "GET /api/v1/gateways HTTP/1.1"]);
+            let requests = requests.lock().unwrap();
+            assert!(
+                !requests[0]
+                    .to_ascii_lowercase()
+                    .contains("authorization")
+            );
+            assert!(
+                requests[1]
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {SESSION_TOKEN}"))
+            );
+        }
+
+        #[tokio::test]
+        async fn whoami_with_a_given_agent_stream_host_stops_after_the_probe() {
+            let (host, requests) = recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS)]).await;
+
+            let error = whoami_info(
+                &Config::default(),
+                &UnreachableKeyring,
+                None,
+                Some(&host),
+                HostFlags::default(),
+                Some(SESSION_TOKEN),
+            )
+            .await
+            .expect_err("an Agent Stream host must be refused");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("is an Agent Stream, not an Agent Gateway"),
+                "{error}"
+            );
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST]);
+        }
+
+        #[tokio::test]
+        async fn login_with_an_agent_stream_token_stops_before_contacting_the_gateway() {
+            let (host, requests) = recording_server(vec![ok_json(r#"{"authenticated": true}"#)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = Config::default();
+            let credentials = MemoryCredentials::default();
+
+            let error = login_and_save(
+                &mut config,
+                &credentials,
+                "production",
+                login_args_with_token(&host, AGENT_STREAM_TOKEN),
+                false,
+                &path,
+            )
+            .await
+            .expect_err("an Agent Stream token must not be saved as a gateway login");
+
+            let text = error.to_string();
+            assert!(text.contains("`fabric agent-stream ...`"), "{text}");
+            assert!(!text.contains(AGENT_STREAM_TOKEN), "{text}");
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!path.exists());
+            assert_eq!(
+                credentials
+                    .get_token("production")
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn a_saved_token_overridden_to_an_agent_stream_host_is_never_sent() {
+            let (host, requests) = recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS), OK_EMPTY_LIST]).await;
+            let config = config_with_connection("prod", SAVED_GATEWAY_HOST);
+            let credentials = credentials_bound_to("prod", SESSION_TOKEN, SAVED_GATEWAY_HOST);
+
+            let error = dispatch_with(
+                gateway_args(&["--host", &host, "--allow-host-override", "surfaces", "list"]),
+                config,
+                &credentials,
+            )
+            .await
+            .expect_err("an Agent Stream host must not get the saved gateway token");
+
+            let text = error.to_string();
+            assert!(text.contains(&format!("{host} is an Agent Stream, not an Agent Gateway")), "{text}");
+            assert!(!text.contains(SESSION_TOKEN), "{text}");
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST]);
+            let probe = requests.lock().unwrap()[0].to_ascii_lowercase();
+            assert!(!probe.contains("authorization"), "{probe}");
+            assert!(!probe.contains(SESSION_TOKEN), "{probe}");
+        }
+
+        #[tokio::test]
+        async fn commands_run_in_one_session_ask_a_given_host_once() {
+            let (host, requests) =
+                recording_server(vec![ok_json(GATEWAY_PERMISSIONS), OK_EMPTY_LIST, OK_EMPTY_LIST]).await;
+
+            product::remembering_probes(async {
+                for _ in 0..2 {
+                    dispatch_with(
+                        gateway_args(&["--host", &host, "--token", SESSION_TOKEN, "api", "get", "/v1/gateways"]),
+                        Config::default(),
+                        &UnreachableKeyring,
+                    )
+                    .await
+                    .expect("a gateway host answers the command");
+                }
+            })
+            .await;
+
+            assert_eq!(
+                first_lines(&requests),
+                [PROBE_REQUEST, "GET /api/v1/gateways HTTP/1.1", "GET /api/v1/gateways HTTP/1.1"]
+            );
+        }
+
+        #[tokio::test]
+        async fn login_with_a_session_token_on_an_agent_stream_host_stops_after_the_probe_and_saves_nothing() {
+            let (host, requests) =
+                recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS), ok_json(AUTHENTICATED)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = Config::default();
+            let credentials = MemoryCredentials::default();
+
+            let error = login_and_save(
+                &mut config,
+                &credentials,
+                "production",
+                login_args_with_token(&host, SESSION_TOKEN),
+                false,
+                &path,
+            )
+            .await
+            .expect_err("a session on an Agent Stream must not be saved as a gateway login");
+
+            let text = error.to_string();
+            assert!(text.contains(&format!("{host} is an Agent Stream, not an Agent Gateway")), "{text}");
+            assert!(text.contains("`fabric agent-stream ...`"), "{text}");
+            assert!(!text.contains(SESSION_TOKEN), "{text}");
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST]);
+            let probe = requests.lock().unwrap()[0].to_ascii_lowercase();
+            assert!(!probe.contains("authorization"), "{probe}");
+            assert!(!probe.contains(SESSION_TOKEN), "{probe}");
+            assert!(!path.exists());
+            assert!(config.connections.is_empty());
+            assert_eq!(config.current, None);
+            assert_eq!(
+                credentials
+                    .get_token("production")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                credentials
+                    .get_bound_host("production")
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn login_asks_the_host_before_it_reads_a_token_from_standard_input() {
+            let (host, requests) =
+                recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS), ok_json(AUTHENTICATED)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = Config::default();
+            let credentials = MemoryCredentials::default();
+            let args = LoginArgs {
+                host: Some(host.clone()),
+                token_stdin: true,
+                paste: false,
+                token: None,
+                pat: None,
+            };
+
+            let error = login_and_save(&mut config, &credentials, "production", args, false, &path)
+                .await
+                .expect_err("an Agent Stream host must be refused before a token is read");
+
+            let text = error.to_string();
+            assert!(text.contains(&format!("{host} is an Agent Stream, not an Agent Gateway")), "{text}");
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST]);
+            assert!(!path.exists());
+            assert_eq!(
+                credentials
+                    .get_token("production")
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn login_with_a_session_token_on_a_gateway_host_sends_the_token_after_the_probe() {
+            let (host, requests) = recording_server(vec![ok_json(GATEWAY_PERMISSIONS), ok_json(AUTHENTICATED)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = Config::default();
+            let credentials = MemoryCredentials::default();
+
+            login_and_save(
+                &mut config,
+                &credentials,
+                "production",
+                login_args_with_token(&host, SESSION_TOKEN),
+                false,
+                &path,
+            )
+            .await
+            .expect("a gateway host accepts the login");
+
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST, "GET /api/auth/check HTTP/1.1"]);
+            let requests = requests.lock().unwrap();
+            assert!(
+                !requests[0]
+                    .to_ascii_lowercase()
+                    .contains("authorization")
+            );
+            assert!(
+                requests[1]
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {SESSION_TOKEN}"))
+            );
+            assert_eq!(
+                credentials
+                    .get_token("production")
+                    .unwrap()
+                    .as_deref(),
+                Some(SESSION_TOKEN)
+            );
+            assert_eq!(
+                Config::load_from(&path)
+                    .unwrap()
+                    .connections["production"]
+                    .host,
+                host
+            );
+        }
+    }
+
+    /// A build without the `agent-stream` Cargo feature, as every release is,
+    /// sends what it sent before the stop existed: it asks no host which
+    /// product it is and refuses no token by its prefix.
+    #[cfg(not(feature = "agent-stream"))]
+    mod without_the_agent_stream_feature {
+        use super::*;
+
+        #[tokio::test]
+        async fn a_gateway_command_given_a_host_and_a_session_token_sends_only_its_own_request() {
+            let (host, requests) = recording_server(vec![OK_EMPTY_LIST, OK_EMPTY_LIST]).await;
+
+            dispatch_with(
+                gateway_args(&["--host", &host, "--token", SESSION_TOKEN, "api", "get", "/v1/gateways"]),
+                Config::default(),
+                &UnreachableKeyring,
+            )
+            .await
+            .expect("the command runs as it did before the stop existed");
+
+            assert_eq!(first_lines(&requests), ["GET /api/v1/gateways HTTP/1.1"]);
+            assert!(
+                requests.lock().unwrap()[0]
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {SESSION_TOKEN}"))
+            );
+        }
+
+        #[tokio::test]
+        async fn a_gateway_command_given_a_token_with_the_agent_stream_prefix_sends_it_as_before() {
+            let (host, requests) = recording_server(vec![OK_EMPTY_LIST, OK_EMPTY_LIST]).await;
+
+            dispatch_with(
+                gateway_args(&["--host", &host, "--token", AGENT_STREAM_TOKEN, "api", "get", "/v1/gateways"]),
+                Config::default(),
+                &UnreachableKeyring,
+            )
+            .await
+            .expect("no token is refused by its prefix");
+
+            assert_eq!(first_lines(&requests), ["GET /api/v1/gateways HTTP/1.1"]);
+            assert!(
+                requests.lock().unwrap()[0]
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {AGENT_STREAM_TOKEN}"))
+            );
+        }
+
+        #[tokio::test]
+        async fn login_with_a_host_and_a_session_token_sends_only_the_token_check() {
+            let (host, requests) = recording_server(vec![ok_json(AUTHENTICATED), ok_json(AUTHENTICATED)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = Config::default();
+            let credentials = MemoryCredentials::default();
+
+            login_and_save(
+                &mut config,
+                &credentials,
+                "production",
+                login_args_with_token(&host, SESSION_TOKEN),
+                false,
+                &path,
+            )
+            .await
+            .expect("the login runs as it did before the stop existed");
+
+            assert_eq!(first_lines(&requests), ["GET /api/auth/check HTTP/1.1"]);
+            assert_eq!(
+                credentials
+                    .get_token("production")
+                    .unwrap()
+                    .as_deref(),
+                Some(SESSION_TOKEN)
+            );
+        }
+
+        #[tokio::test]
+        async fn whoami_given_a_host_and_a_session_token_does_not_ask_which_product_the_host_is() {
+            let (host, requests) = recording_server(vec![OK_EMPTY, OK_EMPTY, OK_EMPTY, OK_EMPTY]).await;
+
+            whoami_info(
+                &Config::default(),
+                &UnreachableKeyring,
+                None,
+                Some(&host),
+                HostFlags::default(),
+                Some(SESSION_TOKEN),
+            )
+            .await
+            .expect("whoami runs as it did before the stop existed");
+
+            let lines = first_lines(&requests);
+            assert!(!lines.is_empty());
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line == PROBE_REQUEST),
+                "{lines:?}"
+            );
+        }
     }
 
     #[test]

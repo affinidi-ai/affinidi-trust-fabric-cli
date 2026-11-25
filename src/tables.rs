@@ -358,6 +358,13 @@ pub static CONNECTION_SETTINGS: Layout = Layout {
     columns: &[whole("NAME", &["name"]), whole("HOST", &["host"]), col("CURRENT", &["current"])],
 };
 
+/// The saved Agent Stream connections, as `fabric agent-stream config list` shows them.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_CONNECTIONS: Layout = Layout {
+    empty: "No Agent Stream connections yet.",
+    columns: &[whole("NAME", &["name"]), whole("HOST", &["host"]), col("CURRENT", &["current"])],
+};
+
 /// Renders a list as a header row and one row per entry, or the layout's
 /// "nothing yet" line when the list is empty. Rows that are not objects are
 /// printed as they are, one per line.

@@ -22,6 +22,8 @@ Before calling a change done:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo clippy --all-targets --features agent-stream -- -D warnings
+cargo test --features agent-stream
 ```
 
 Commits must follow [Conventional Commits](https://www.conventionalcommits.org) and should be signed.

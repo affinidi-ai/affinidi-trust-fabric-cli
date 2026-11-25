@@ -12,15 +12,17 @@ The CLI is one Rust binary, `fabric`, built from [`src/`](src/). There is no lib
 target: [`Cargo.toml`](Cargo.toml) declares a single `[[bin]]` whose entry point is
 [`src/main.rs`](src/main.rs). Arguments are defined with clap's derive API.
 
-Every command is addressed to an appliance first. Today there is one,
-`agent-gateway`, so a command line reads `fabric agent-gateway <group> <command>`. The
-CLI talks to the gateway's management API over HTTP; it has no server component of its
-own, apart from the short-lived loopback listener used during browser login.
+Every command is addressed to an appliance first, so a command line reads
+`fabric agent-gateway <group> <command>`. A second appliance, `agent-stream`, is being
+built behind the `agent-stream` Cargo feature in [`src/agent_stream/`](src/agent_stream/):
+it is off by default and in releases, so the shipped binary rejects `fabric agent-stream`.
+The CLI talks to the gateway's management API over HTTP; it has no server component of
+its own, apart from the short-lived loopback listener used during browser login.
 
 | Concern | Where it lives |
 | --- | --- |
 | Command definitions, help text, and handlers | [`src/commands.rs`](src/commands.rs) |
-| Saved connections (name and host) | [`src/config.rs`](src/config.rs), in `config.toml` |
+| Saved connections (name and host) | [`src/config.rs`](src/config.rs), in `config.toml` for Agent Gateway and `agent-stream.toml` for Agent Stream |
 | Tokens | [`src/credentials.rs`](src/credentials.rs), in the OS credential store |
 | HTTP to the gateway | [`src/client.rs`](src/client.rs) |
 | Output | [`src/tables.rs`](src/tables.rs) and the print helpers at the end of `commands.rs` |
@@ -39,6 +41,16 @@ The CLI keeps two pieces of local state, and keeps them apart.
 
 Because the bound host shares the account namespace, `login` refuses a connection name
 containing `#`, and `Config::hash_name_warnings` warns about any such name already saved.
+
+Agent Stream connections (feature build only) use the same `Config` type and
+`CredentialStore` trait, but live in `fabric/agent-stream.toml` beside `config.toml` and
+under the keyring service `affinidi-trust-fabric-cli/agent-stream`, so each product can
+have a connection named `default` and a CLI from before the feature never sees the file.
+`agent_stream::dispatch` treats that file as `dispatch` treats `config.toml`. It prints
+the `#` name warnings and moves a `token` line it finds into the Agent Stream keyring
+service before any command rewrites the file. An error from a keyring that cannot be
+reached gets one hint, as on a gateway command: the move adds its own, which names the
+connection, and the command's own error gets the general one.
 
 Older versions wrote the token into `config.toml`. `Connection` still reads that `token`
 field (into `legacy_token`) but never writes it, and `Config::migrate_legacy_tokens` moves any token
@@ -73,8 +85,8 @@ flowchart TB
 1. `inline_secret_warnings` scans the raw arguments for a secret typed on the command
    line (`--token`, `--pat`, `--value`, `--password`) and prints a `warning:` for each,
    naming the safer source to use instead. It stops at `--`.
-2. clap parses the arguments into `Cli`. The tree is `Cli` → `Appliance` (one variant,
-   `AgentGateway`) → `AgentGatewayArgs` → `Command`.
+2. clap parses the arguments into `Cli`. The tree is `Cli` → `Appliance` (`AgentGateway`,
+   plus `AgentStream` in the feature build) → `AgentGatewayArgs` → `Command`.
 3. `env_token_and_host_note` prints a `note:` when both the token and the host came from
    environment variables (`FABRIC_TOKEN` and `FABRIC_HOST`), so the two do not meet
    silently. It runs once per process, here, rather than inside `run`, because the
@@ -105,6 +117,47 @@ a `&impl CredentialStore` as arguments so tests can supply both. The migration i
 skipped when `skips_the_credential_store` says the command was given both a host and a
 token and is not `login`, `logout` or `config`, because such a command never reads the
 credential store, so a server with no desktop session never reaches the keyring.
+
+Before a token is sent, the command calls `product::check_product`. In a binary built
+without the `agent-stream` Cargo feature, as every release is, that call returns at
+once: no token is refused, no host is asked anything, and a gateway command sends
+exactly the requests it sent before the check existed. The rest of this part describes
+a binary built with the feature.
+
+There, `check_product` makes sure the command is not aimed at the other product. A
+token whose prefix says the other product issued it (`agpat_` is Agent Gateway;
+`aspat_` and the older `atgpat_` are Agent Stream) is refused without a request.
+Whitespace around the token is ignored when its prefix is read. A token with no prefix
+together with a host typed with `--host` or set in `FABRIC_HOST` makes the CLI ask the
+host which product it is, through `GET /api/v1/permissions/public` with no token: the
+key `pipes.view` exists only on Agent Stream, and a host that answers as the other
+product is refused. A saved connection is never probed, since it already belongs to one
+product's store. When the probe cannot tell, a gateway command carries on and an Agent
+Stream command stops. Both refusals get their text from `wrong_product_message`, which
+never sees the token and names the command group to use for the other product, such as
+`fabric agent-stream ...`.
+
+`login` always has a typed host, so `login_and_save` asks it before it reads a token or
+opens the browser, and stops before `check_auth` and before anything is saved when the
+host answers as Agent Stream. A token that is already in hand with a product prefix
+answers the question without a request. `login --pat` is never asked, because it only
+accepts an `agpat_` token. A token read afterwards (standard input, a prompt, the
+browser) still has its prefix checked. In the interactive shell, `login --paste` prompts
+for the token before `login_and_save` runs, so there the host is asked after the token
+is typed, and still before the token is sent.
+
+The interactive shell runs every line as a command against the same host, so
+`interactive::run` runs under `product::remembering_probes`, which keeps each host's
+answer for as long as the shell is open. Only a product the host named is kept. A host
+that could not be read is asked again on the next line, so it is still refused if it
+later answers as the other product. A one-shot command, and a test that does not open
+that scope, remembers nothing.
+
+Only gateway commands call `check_product` today. The Agent Stream side of it, which
+stops on a host it cannot read, is exercised by tests alone until `fabric agent-stream`
+gets `login`, its first command that takes a host and a token. The rules sit in
+`stop_if_other_product`, which the unit tests call directly, so they are tested in both
+builds.
 
 `dispatch_with` first handles the commands that do not take the shared path below
 (`login`, `logout`, `config`, `whoami`, and the feature list with no surface). For every
@@ -246,7 +299,9 @@ line goes through `commands::run`, the same path as a one-shot command.
 The shell runs `inline_secret_warnings` on every line and keeps a line that triggers one
 out of its history. `login --paste` prompts without echo. Warnings that would repeat on
 every line, such as the plain-http warning for a saved host, are shown once per process through
-`first_warning_for` and the `WARNED_ONCE` list in `commands.rs`.
+`first_warning_for` and the `WARNED_ONCE` list in `commands.rs`. In a binary built with
+the `agent-stream` feature, the question of which product a typed host is gets asked
+once per shell as well, through `product::remembering_probes`.
 
 ### Browser login
 
@@ -264,9 +319,13 @@ every line, such as the plain-http warning for a saved host, are shown once per 
 
 The token never appears in a browser URL. `acquire_login_token` in `commands.rs` decides
 whether browser login runs at all: an explicit token, `--pat`, `--token-stdin`,
-`--paste`, or piped standard input each take precedence. `login_and_save` validates the
-token against the gateway before saving it, and restores the previous token and bound
-host if saving fails.
+`--paste`, or piped standard input each take precedence. In a binary built with the
+`agent-stream` feature, `login_and_save` first asks the host which product it is and
+refuses an Agent Stream, except for `--pat` and for a token whose prefix already names
+the product (see
+[Resolving the connection, host, and token](#resolving-the-connection-host-and-token)).
+`login_and_save` validates the token against the gateway before saving it, and restores
+the previous token and bound host if saving fails.
 
 ## Surface editing
 
@@ -319,8 +378,10 @@ Every file in [`src/`](src/) and what it owns.
 | [`main.rs`](src/main.rs) | Entry point. Secret warnings, parsing, the environment note, then `interactive::run` or `commands::run`. Prints the final `error:` and sets the exit status. |
 | [`commands.rs`](src/commands.rs) | The clap definitions (`Cli`, `Command`, every subcommand enum), their help text, `dispatch_with`, connection and token resolution, every group handler, and the print helpers. |
 | [`client.rs`](src/client.rs) | `GatewayClient`, the shared HTTP client, path checks, `gateway_error`, redaction, and the terminal sanitisers. |
-| [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` path and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
-| [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`. |
+| [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
+| [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
+| [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, and `remembering_probes`, which keeps a host's answer for the length of an interactive shell. |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions and dispatch in `mod.rs`, one file per command group, starting with `config.rs` for the saved Agent Stream connections, and `test_support.rs` for what their tests share. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |
@@ -341,6 +402,7 @@ Every file in [`src/`](src/) and what it owns.
 | Change which host or token a command uses | `dispatch_with`, `command_host`, `check_token_host` |
 | Change login | `login_and_save` and `acquire_login_token` in `commands.rs`, `browser_login.rs` |
 | Change where connections or tokens are stored | `config.rs`, `credentials.rs` |
+| Add an Agent Stream command group | A new file under `src/agent_stream/`, declared in its `mod.rs` |
 | Add a surface feature | `FEATURES` in `features.rs` |
 | Change the `surfaces update` path syntax | `surface_patch.rs` |
 | Look a resource up by name | `Lookup`, `resolve_id`, and `resolve_surface_id` in `commands.rs` |

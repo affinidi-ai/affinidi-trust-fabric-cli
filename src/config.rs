@@ -99,7 +99,11 @@ impl Config {
         Ok(())
     }
 
-    fn migrate_legacy_tokens_to(
+    /// Moves every plaintext `token` read from the file at `path` into
+    /// `credentials`, records the host each one belongs to, and rewrites the
+    /// file without them. Does nothing, and touches neither, when the file
+    /// held no token.
+    pub(crate) fn migrate_legacy_tokens_to(
         &mut self,
         credentials: &impl CredentialStore,
         path: &std::path::Path,
@@ -219,11 +223,24 @@ fn is_loopback_host(url: &url::Url) -> bool {
     }
 }
 
+/// The file the Agent Gateway connections are saved in. It predates the Agent
+/// Stream file, so it carries no product name.
 pub(crate) fn config_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("config.toml"))
+}
+
+/// The file the Agent Stream connections are saved in, beside the Agent
+/// Gateway one, so a connection named `default` in one never touches the
+/// other, and a CLI from before this file ignores it.
+#[cfg(feature = "agent-stream")]
+pub(crate) fn agent_stream_config_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("agent-stream.toml"))
+}
+
+/// The `fabric` directory under the user configuration directory.
+fn config_dir() -> Result<PathBuf> {
     let base = dirs::config_dir().context("could not determine the user configuration directory")?;
-    Ok(base
-        .join("fabric")
-        .join("config.toml"))
+    Ok(base.join("fabric"))
 }
 
 #[cfg(unix)]
@@ -351,6 +368,91 @@ mod tests {
             !std::fs::read_to_string(path)
                 .unwrap()
                 .contains("token")
+        );
+    }
+
+    /// A `config.toml` as the 0.1.4 CLI wrote it: a `current` name and
+    /// `[connections.<name>]` tables holding only a `host`.
+    const V0_1_4_CONFIG: &str = r#"current = "default"
+
+[connections.default]
+host = "https://gateway.example"
+
+[connections.staging]
+host = "https://staging.example"
+"#;
+
+    #[test]
+    fn a_config_file_written_by_version_0_1_4_still_loads_and_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, V0_1_4_CONFIG).unwrap();
+
+        let config = Config::load_from(&path).unwrap();
+
+        let (name, connection) = config.resolve(None).unwrap();
+        assert_eq!(name, "default");
+        assert_eq!(connection.host, "https://gateway.example");
+        let (name, connection) = config
+            .resolve(Some("staging"))
+            .unwrap();
+        assert_eq!(name, "staging");
+        assert_eq!(connection.host, "https://staging.example");
+        config.save_to(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), V0_1_4_CONFIG);
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[test]
+    fn the_agent_stream_file_sits_beside_the_gateway_file_under_its_own_name() {
+        let gateway = config_path().unwrap();
+        let stream = agent_stream_config_path().unwrap();
+
+        assert_eq!(gateway.parent(), stream.parent());
+        assert_eq!(gateway.file_name().unwrap(), "config.toml");
+        assert_eq!(stream.file_name().unwrap(), "agent-stream.toml");
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[test]
+    fn a_default_connection_in_each_product_file_leaves_the_other_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway_path = dir.path().join("config.toml");
+        let stream_path = dir
+            .path()
+            .join("agent-stream.toml");
+        std::fs::write(&gateway_path, V0_1_4_CONFIG).unwrap();
+        let mut stream = Config {
+            current: Some("default".into()),
+            ..Config::default()
+        };
+        stream
+            .connections
+            .insert("default".into(), Connection::new("https://stream.example".into()));
+
+        stream
+            .save_to(&stream_path)
+            .unwrap();
+        stream
+            .connections
+            .remove("default");
+        stream.current = None;
+        stream
+            .save_to(&stream_path)
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&gateway_path).unwrap(), V0_1_4_CONFIG);
+        let (name, connection) = Config::load_from(&gateway_path)
+            .unwrap()
+            .resolve(None)
+            .map(|(name, connection)| (name.to_owned(), connection.host.clone()))
+            .unwrap();
+        assert_eq!((name.as_str(), connection.as_str()), ("default", "https://gateway.example"));
+        assert!(
+            Config::load_from(&stream_path)
+                .unwrap()
+                .connections
+                .is_empty()
         );
     }
 

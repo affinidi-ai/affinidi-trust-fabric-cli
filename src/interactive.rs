@@ -2,9 +2,22 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use rustyline::{DefaultEditor, error::ReadlineError};
 
-use crate::commands::{Cli, inline_secret_warnings, run as run_command};
+use crate::{
+    commands::{Cli, inline_secret_warnings, run as run_command},
+    product::remembering_probes,
+};
 
+/// Opens the interactive shell and runs every typed line as a command, until
+/// `exit`, `quit` or the end of input. A host given with `--host` or
+/// FABRIC_HOST is the same for every line, so a binary built with the
+/// `agent-stream` Cargo feature asks it which product it is once for the
+/// whole shell instead of before every line. A binary built without the
+/// feature never asks.
 pub async fn run(initial: Cli) -> Result<()> {
+    remembering_probes(read_lines(initial)).await
+}
+
+async fn read_lines(initial: Cli) -> Result<()> {
     let prefix = initial.interactive_prefix();
     let mut editor = DefaultEditor::new()?;
 

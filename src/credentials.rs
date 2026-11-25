@@ -1,6 +1,14 @@
 use anyhow::{Context, Result};
 
-const SERVICE_NAME: &str = "affinidi-trust-fabric-cli";
+/// Keyring service the Agent Gateway connections are saved under. It predates
+/// the Agent Stream service, so it carries no product suffix.
+const AGENT_GATEWAY_SERVICE: &str = "affinidi-trust-fabric-cli";
+
+/// Keyring service the Agent Stream connections are saved under, so an Agent
+/// Stream connection named `default` never shares an entry with the Agent
+/// Gateway one.
+#[cfg(feature = "agent-stream")]
+const AGENT_STREAM_SERVICE: &str = "affinidi-trust-fabric-cli/agent-stream";
 
 pub trait CredentialStore {
     fn get_token(
@@ -48,15 +56,29 @@ fn bound_host_key(connection: &str) -> String {
     format!("{connection}#bound-host")
 }
 
-pub struct OsCredentialStore;
+/// The OS keyring, with every entry under one product's service name, so the
+/// connections of two products never share an entry.
+pub struct OsCredentialStore {
+    service: &'static str,
+}
 
 impl OsCredentialStore {
+    /// The store of the Agent Gateway connections.
     pub fn new() -> Self {
-        Self
+        Self { service: AGENT_GATEWAY_SERVICE }
     }
 
-    fn entry(connection: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(SERVICE_NAME, connection)
+    /// The store of the Agent Stream connections.
+    #[cfg(feature = "agent-stream")]
+    pub fn agent_stream() -> Self {
+        Self { service: AGENT_STREAM_SERVICE }
+    }
+
+    fn entry(
+        &self,
+        connection: &str,
+    ) -> Result<keyring::Entry> {
+        keyring::Entry::new(self.service, connection)
             .with_context(|| format!("open OS keyring entry for connection '{connection}'"))
     }
 }
@@ -175,7 +197,10 @@ impl CredentialStore for OsCredentialStore {
         &self,
         connection: &str,
     ) -> Result<Option<String>> {
-        match Self::entry(connection)?.get_password() {
+        match self
+            .entry(connection)?
+            .get_password()
+        {
             Ok(token) => Ok(Some(token)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(error).with_context(|| format!("read connection '{connection}' token from OS keyring")),
@@ -187,7 +212,7 @@ impl CredentialStore for OsCredentialStore {
         connection: &str,
         token: &str,
     ) -> Result<()> {
-        Self::entry(connection)?
+        self.entry(connection)?
             .set_password(token)
             .with_context(|| format!("store connection '{connection}' token in OS keyring"))
     }
@@ -196,7 +221,10 @@ impl CredentialStore for OsCredentialStore {
         &self,
         connection: &str,
     ) -> Result<()> {
-        match Self::entry(connection)?.delete_credential() {
+        match self
+            .entry(connection)?
+            .delete_credential()
+        {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(error).with_context(|| format!("delete connection '{connection}' token from OS keyring")),
         }
@@ -415,6 +443,13 @@ mod tests {
         let error = anyhow::anyhow!("gateway returned 401 Unauthorized");
 
         assert_eq!(format!("{:#}", add_no_keyring_hint(error)), "gateway returned 401 Unauthorized");
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[test]
+    fn the_agent_stream_store_uses_its_own_keyring_service() {
+        assert_eq!(OsCredentialStore::new().service, "affinidi-trust-fabric-cli");
+        assert_eq!(OsCredentialStore::agent_stream().service, "affinidi-trust-fabric-cli/agent-stream");
     }
 
     #[test]
