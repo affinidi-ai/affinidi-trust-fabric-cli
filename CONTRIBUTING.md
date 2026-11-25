@@ -35,8 +35,9 @@ Run the local checks and make sure CI passes:
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
-4. If you added or changed a dependency: `cargo deny check`
-5. If you changed the release scripts in `scripts/`: `shellcheck scripts/*.sh` and `scripts/test-release-scripts.sh`
+4. `cargo clippy --all-targets --features agent-stream -- -D warnings` and `cargo test --features agent-stream`, which lint and test the build with the `agent-stream` feature that releases leave out
+5. If you added or changed a dependency: `cargo deny check`
+6. If you changed the release scripts in `scripts/`: `shellcheck scripts/*.sh` and `scripts/test-release-scripts.sh`
 
 CI also runs a dependency audit, a security scan, and a coverage check that requires at least 80% coverage. Pull requests from forks don't run the security scan, because forks don't receive repository secrets; it runs once the change reaches `main`.
 

@@ -1,3 +1,5 @@
+#[cfg(feature = "agent-stream")]
+mod agent_stream;
 mod browser_login;
 mod client;
 mod commands;
@@ -5,6 +7,7 @@ mod config;
 mod credentials;
 mod features;
 mod interactive;
+mod product;
 mod surface_patch;
 mod surface_validate;
 mod tables;

@@ -62,7 +62,7 @@ rather than inventing a new shape.
 
 | Helper | Where | Behaviour |
 | --- | --- | --- |
-| `one_shot_server` | `client.rs`, and the `tests` and `gateway_config_tests` modules of `commands.rs` | Answers the first request with a given status line (and, in `commands.rs`, a body), then stops. Returns the base URL. The `gateway_config_tests` version also returns a receiver carrying the request line, so a test can assert the method and path. |
+| `one_shot_server` | `client.rs`, and the `tests` and `gateway_config_tests` modules of `commands.rs` | Answers the first request with a given status line (and, in `commands.rs`, a body), then stops. Returns the base URL. The `gateway_config_tests` version also returns a receiver carrying the request line, so a test can assert the method and path. The `tests` version answers a request for the public permission list with a 404 without using up its one answer. Only a build with the `agent-stream` feature sends that request, to ask the host which product it is, and it then reads "unknown" and carries on. |
 | `scripted_server` | `gateway_config_tests` in `commands.rs` | Answers successive connections from a list of `(status line, body)` pairs and records each whole request, headers and body. A request beyond the script is recorded and answered with `UNSCRIPTED`, a `418`, so an unexpected call shows up in the recording rather than failing silently. |
 | `scripted_server` | `secrets_certs_tests` in `commands.rs` | The same idea, recording request lines in an `Arc<Mutex<Vec<String>>>`. Used where a name lookup's list call and the call that follows must both be seen. |
 | `capturing_server`, `echoing_server`, `dripping_server`, `silent_server` | `client.rs` | Capture the request head; echo the request's `Authorization` header back in the body (for redaction tests); send one byte at a time; or never answer (the last two for timeout tests) |
@@ -74,6 +74,28 @@ To run a whole command, call `dispatch_with` with a `Config` pointing at the ser
 test credential store. The `dispatched_requests` helper in `gateway_config_tests` does
 exactly that and returns the request lines.
 
+A build with the `agent-stream` Cargo feature sometimes sends
+`GET /api/v1/permissions/public` first, to ask the host which product it is. A build
+without the feature never sends it. The request goes out before:
+
+- a command or `whoami` given `--host` or `FABRIC_HOST`, unless its token starts with a
+  product prefix (`agpat_`, `aspat_`, or `atgpat_`);
+- a `login` that is not `--pat`, unless it was given a token that starts with a product
+  prefix.
+
+A test that scripts an answer for that request, or asserts that a command was stopped,
+only holds with the feature, so it goes in a module marked
+`#[cfg(feature = "agent-stream")]`, such as `with_the_agent_stream_feature` in the
+`tests` module of `commands.rs`. A test of what the build without the feature sends goes
+in a module marked `#[cfg(not(feature = "agent-stream"))]`, such as
+`without_the_agent_stream_feature` beside it. The rules themselves are tested in both
+builds, because the tests in `product.rs` call `stop_if_other_product` directly and not
+through `check_product`, which does nothing without the feature.
+
+The answer is only remembered inside `product::remembering_probes`, which the
+interactive shell opens and no other code does, so tests never share an answer. A test
+of the remembering itself wraps its calls in `remembering_probes`.
+
 ### Credential stores in tests
 
 A unit test must never read or write the OS keyring. `CredentialStore` is a trait, and
@@ -82,11 +104,12 @@ instead of `OsCredentialStore`.
 
 | Store | Where | Behaviour |
 | --- | --- | --- |
-| `MemoryCredentials` | `config.rs` tests, `tests` in `commands.rs` | A `HashMap` behind a `Mutex`. Bound hosts work through the trait's default methods. |
+| `MemoryCredentials` | `config.rs` tests, `tests` in `commands.rs`, `agent_stream/test_support.rs` | A `HashMap` behind a `Mutex`. Bound hosts work through the trait's default methods. |
 | `MemoryStore` | `credentials.rs` tests | The same, for the trait's own tests |
 | `NoCredentials` | `gateway_config_tests` in `commands.rs` | Holds nothing, and every write fails. For commands that pass `--token`. |
 | `UnreachableKeyring` | `tests` in `commands.rs` | Panics on any use, for commands given both a host and a token, which must never open the credential store |
 | `UnwritableCredentials` | `tests` in `commands.rs` | Wraps `MemoryCredentials`, but `set_token` fails, for the path where a bound host cannot be recorded |
+| `NoKeyring` | `agent_stream/test_support.rs`, on Linux only | Every call fails as the keyring does on a Linux machine with no D-Bus session, for the hint that case adds. The hint is only added on Linux, so the store and its tests are compiled there alone. |
 | `FailingCredentials` | `config.rs` tests | Writes fail, for legacy token migration |
 | `NoSecretService` | `config.rs` tests, Linux only | Every call fails as the Secret Service client does with no D-Bus session, for the migration hint |
 
@@ -121,13 +144,21 @@ Each file in [`tests/`](../../tests/) runs the built binary through
 | --- | --- |
 | [`lists_and_deletes.rs`](../../tests/lists_and_deletes.rs) | The tables lists print, the one-line confirmations of deletes and other changes, and what goes to standard output versus standard error |
 | [`env_token_and_host_note.rs`](../../tests/env_token_and_host_note.rs) | The `note:` printed when both the token and the host come from the environment, including in the interactive shell |
+| [`product_check.rs`](../../tests/product_check.rs) | Every request a host gets from a gateway command, `login`, and the interactive shell given a host and a token. The build with the `agent-stream` feature asks the host which product it is once, without the token, and sends nothing more to one that answers as Agent Stream. The default build never asks and sends only the command's own requests. Each test is compiled for one of the two builds only |
+| [`agent_stream_feature.rs`](../../tests/agent_stream_feature.rs) | The default build rejects `fabric agent-stream`. The build with the `agent-stream` feature lists Agent Stream connections apart from the Agent Gateway ones and warns about a `#` in a connection name. Each test is compiled for one of the two builds only |
 
 Every run is isolated from your own configuration:
 
 - `HOME` is a fresh temporary directory, and `XDG_CONFIG_HOME` is a directory inside it.
 - A `config.toml` with a saved connection is written to both
   `Library/Application Support/fabric/` and `xdg/fabric/` under that home, because the
-  configuration directory differs between macOS and Linux.
+  configuration directory differs between macOS and Linux. `lists_and_deletes.rs` does
+  that in its own `fabric` helper. The other files go through `fabric_in_fresh_home` in
+  [`tests/common/fresh_home.rs`](../../tests/common/fresh_home.rs), which writes the
+  files a test hands it into both directories. `agent_stream_feature.rs` hands it a
+  `config.toml`, an `agent-stream.toml`, both, or no file, depending on the test, and
+  `product_check.rs` hands it no file, because its commands are given their host and
+  token.
 - `FABRIC_HOST`, `FABRIC_CONNECTION`, and `FABRIC_TOKEN` are removed from the inherited
   environment, and each test sets only the ones it needs. `lists_and_deletes.rs` always
   sets `FABRIC_TOKEN` to a test value.
@@ -157,6 +188,7 @@ unreachable loopback ports, and it asserts only on standard error.
 | `cargo test --test lists_and_deletes <filter>` | Matching tests in that file |
 | `cargo test --bin fabric os_keyring_round_trip -- --ignored` | The ignored keyring test. It writes, then deletes, a temporary entry in your real credential store. |
 | `cargo test --no-run` | Compile the tests without running them |
+| `cargo test --features agent-stream` | Everything, with the `fabric agent-stream` commands compiled in. Tests marked `#[cfg(feature = "agent-stream")]` only run here, and tests marked `#[cfg(not(feature = "agent-stream"))]` only run without the flag. `tests/agent_stream_feature.rs` checks the default build rejects `fabric agent-stream` and the feature build accepts it. |
 
 ## Coverage
 
@@ -173,7 +205,12 @@ The checks from [`CONTRIBUTING.md`](../../CONTRIBUTING.md):
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo clippy --all-targets --features agent-stream -- -D warnings
+cargo test --features agent-stream
 ```
+
+The last two lint and test the build with the `agent-stream` feature, which CI's
+`agent-stream` job runs on every pull request.
 
 And, when you added or updated a dependency:
 

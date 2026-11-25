@@ -8,7 +8,8 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 
 | Term | Meaning |
 | --- | --- |
-| **Appliance** | A Trust Fabric product the CLI manages. Commands take the shape `fabric <appliance> <command>`. Agent Gateway, under `agent-gateway`, is the only appliance today. |
+| **Appliance** | A Trust Fabric product the CLI manages. Commands take the shape `fabric <appliance> <command>`. Release builds have one appliance, Agent Gateway, under `agent-gateway`. |
+| **Agent Stream** | The second appliance, under `agent-stream`. It exists only in builds with the `agent-stream` Cargo feature, which releases leave out. |
 | **Command group** | The second word of a command, such as `surfaces` or `secrets`, naming the kind of resource or area it works on. |
 | **Shared CRUD commands** | The `list`, `get`, `create`, `update`, and `delete` commands that several groups share, such as `issuers`, `mediators`, and `connections`. `update` sends a JSON document; depending on the resource, the gateway replaces the whole record or changes only the fields sent (see [Manage other resources](docs/SCRIPTING_AND_OUTPUT.md#manage-other-resources)). |
 | **Interactive shell** | `fabric agent-gateway shell`, which reads Agent Gateway commands without the `fabric agent-gateway` prefix and parses them exactly as one-shot commands. |
@@ -17,7 +18,8 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 
 | Term | Meaning |
 | --- | --- |
-| **Connection** (_connection profile_) | A gateway saved on this machine under a name: its host in the configuration file and its token in the OS credential store. Selected with `--connection` or `FABRIC_CONNECTION`, and managed with `login`, `logout`, and `config`. _Not the same as a gateway connection, below._ |
+| **Connection** (_connection profile_) | An appliance host saved on this machine under a name, with its token in the OS credential store. Agent Gateway connections live in `config.toml` and the credential-store service `affinidi-trust-fabric-cli`. Agent Stream connections (only in builds with the `agent-stream` feature) live in `agent-stream.toml` and the service `affinidi-trust-fabric-cli/agent-stream`, so each product has its own names. Selected with `--connection` or `FABRIC_CONNECTION`. Managed with `login`, `logout`, and `config` for Agent Gateway, and with `config` for Agent Stream. _Not the same as a gateway connection, below._ |
+| **Product** | The appliance a token or host belongs to. In builds with the `agent-stream` feature, the wrong-product check stops a command before it sends a token when the token's prefix (`agpat_` for Agent Gateway; `aspat_` or `atgpat_` for Agent Stream) or the answer of a typed host shows the other product, and `logout` sends nothing for a saved Agent Stream token. Release builds have no such check. |
 | **Current connection** | The connection commands use when none is named. `login` makes the connection it saves current, and `config use` changes it. |
 | **Bound host** | The host a saved token was issued for. The CLI sends a saved token only to its bound host, unless `--allow-host-override` is passed. |
 | **Session token** | The token a browser login captures. It expires after the gateway's idle timeout and is renewed by use. |
