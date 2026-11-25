@@ -2852,8 +2852,11 @@ fn info_table_lines(value: &Value) -> Vec<String> {
 
 /// Signs out of a connection: ends the session on the gateway when the saved
 /// token is a session token, tells the user how to revoke it when it is a
-/// personal access token, then removes the local copy. The gateway part is best
-/// effort, so an unreachable gateway never stops the local removal.
+/// personal access token, then removes the local copy. In a binary built with
+/// the `agent-stream` Cargo feature, a saved token issued by Agent Stream is
+/// not sent to the gateway, and only the local copy is removed. The gateway
+/// part is best effort, so an unreachable gateway never stops the local
+/// removal.
 async fn logout(
     config: &mut Config,
     credentials: &impl CredentialStore,
@@ -2899,7 +2902,10 @@ enum PatChoice {
 /// Does what can be done on the gateway about the token saved for `name`, and
 /// returns the line to show about it. The token is only ever sent to the host
 /// it was saved for. A personal access token is revoked while it is still in
-/// hand when `pat_choice` says so; a browser session is always ended.
+/// hand when `pat_choice` says so; a browser session is always ended. In a
+/// binary built with the `agent-stream` Cargo feature, a token whose prefix
+/// says Agent Stream issued it is not sent at all, the same way every other
+/// gateway command refuses it (see [`product::check_product`]).
 async fn end_remote_credential(
     credentials: &impl CredentialStore,
     name: &str,
@@ -2915,6 +2921,9 @@ async fn end_remote_credential(
         .ok()
         .flatten()
         .unwrap_or_else(|| connection.host.clone());
+    if cfg!(feature = "agent-stream") && product::token_product(&token) == Some(Product::AgentStream) {
+        return Some(agent_stream_token_kept_note(&host));
+    }
     if let Some(warning) = saved_host_http_warning(&host) {
         eprintln!("{warning}");
     }
@@ -2965,6 +2974,16 @@ async fn end_remote_credential(
             sanitize_for_terminal(&error.to_string())
         ),
     })
+}
+
+/// What to tell a user who logged out of a connection whose saved token was
+/// issued by Agent Stream: logout sent nothing to `host`, so the token is
+/// still valid there.
+fn agent_stream_token_kept_note(host: &str) -> String {
+    format!(
+        "note: the saved token was issued by Agent Stream, so nothing was sent to {host}; logging out only removed \
+         the local copy, and the token stays valid there until it is revoked or expires"
+    )
 }
 
 /// Asks on the terminal whether logout should also revoke the personal access
@@ -18274,6 +18293,56 @@ mod tests {
                 host
             );
         }
+
+        #[tokio::test]
+        async fn logout_of_a_saved_agent_stream_token_sends_nothing_and_removes_the_local_copy() {
+            let (host, requests) = recording_server(vec![OK_EMPTY, OK_EMPTY]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = config_with_connection("prod", &host);
+            let credentials = credentials_bound_to("prod", AGENT_STREAM_TOKEN, &host);
+
+            let note =
+                end_remote_credential(&credentials, "prod", &config.connections["prod"].clone(), PatChoice::Revoke)
+                    .await
+                    .expect("a note");
+            remove_connection(&mut config, &credentials, "prod", &path).expect("local removal");
+
+            assert!(note.starts_with("note: the saved token was issued by Agent Stream"), "{note}");
+            assert!(note.contains(&format!("nothing was sent to {host}")), "{note}");
+            assert!(!note.contains(AGENT_STREAM_TOKEN), "{note}");
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                credentials
+                    .get_token("prod")
+                    .unwrap(),
+                None
+            );
+            assert!(config.connections.is_empty());
+        }
+
+        #[tokio::test]
+        async fn logout_of_a_saved_agent_stream_token_with_a_leading_space_sends_nothing() {
+            let (host, requests) = recording_server(vec![OK_EMPTY]).await;
+            let credentials = credentials_bound_to("prod", " atgpat_saved", &host);
+
+            let note = end_remote_credential(&credentials, "prod", &Connection::new(host.clone()), PatChoice::Keep)
+                .await
+                .expect("a note");
+
+            assert!(note.starts_with("note: the saved token was issued by Agent Stream"), "{note}");
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     /// A build without the `agent-stream` Cargo feature, as every release is,
@@ -18374,6 +18443,24 @@ mod tests {
                     .iter()
                     .any(|line| line == PROBE_REQUEST),
                 "{lines:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn logout_of_a_saved_token_with_the_agent_stream_prefix_ends_the_session_as_before() {
+            let (host, requests) = recording_server(vec![OK_EMPTY]).await;
+            let credentials = credentials_bound_to("prod", AGENT_STREAM_TOKEN, &host);
+
+            let note = end_remote_credential(&credentials, "prod", &Connection::new(host.clone()), PatChoice::Keep)
+                .await
+                .expect("a note");
+
+            assert_eq!(note, format!("note: ended the session on {host}"));
+            assert_eq!(first_lines(&requests), ["POST /api/auth/logout HTTP/1.1"]);
+            assert!(
+                requests.lock().unwrap()[0]
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {AGENT_STREAM_TOKEN}"))
             );
         }
     }

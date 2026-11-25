@@ -153,11 +153,16 @@ that could not be read is asked again on the next line, so it is still refused i
 later answers as the other product. A one-shot command, and a test that does not open
 that scope, remembers nothing.
 
-Only gateway commands call `check_product` today. The Agent Stream side of it, which
-stops on a host it cannot read, is exercised by tests alone until `fabric agent-stream`
-gets `login`, its first command that takes a host and a token. The rules sit in
-`stop_if_other_product`, which the unit tests call directly, so they are tested in both
-builds.
+Only gateway commands call `check_product` today, and `logout` is not one of them,
+because it must remove the local copy whatever token is saved. Instead, in a binary
+built with the feature, `end_remote_credential` reads the saved token's prefix with
+`product::token_product`, and when it names Agent Stream, logout builds no client and
+sends nothing (no session end, no token lookup, and no revoke), removes the local copy,
+and prints a note that the token stays valid on the host until it expires. The Agent
+Stream side of `check_product`, which stops on a host it cannot read, is exercised by
+tests alone until `fabric agent-stream` gets `login`, its first command that takes a
+host and a token. The rules sit in `stop_if_other_product`, which the unit tests call
+directly, so they are tested in both builds.
 
 `dispatch_with` first handles the commands that do not take the shared path below
 (`login`, `logout`, `config`, `whoami`, and the feature list with no surface). For every
