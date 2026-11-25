@@ -12,7 +12,8 @@
 # when the tap's main holds an older version, none once main holds the cask
 # or a newer one, and stops when main's version isn't X.Y.Z, and
 # scripts/sign-macos.sh stops on a bad argument or setting before it needs a
-# Mac. Run by .github/workflows/checks.yaml; the working tree is never changed.
+# Mac, and scripts/push-release-notes.sh pushes a release's missing git note
+# again, retrying a refused push, and leaves every other failure alone. Run by .github/workflows/checks.yaml; the working tree is never changed.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -560,6 +561,123 @@ check_sign_args_stop "with a --bin-dir that isn't a directory" "is not a directo
   --bin-dir "${work_dir}/no-such-dir" --notary-dir "${work_dir}/notary"
 if [ -e "${work_dir}/notary" ]; then
   fail "sign-macos.sh made the notary folder before its checks passed"
+fi
+
+# push-release-notes.sh runs in a clone where semantic-release tagged the
+# release v9.9.9 and noted it, with origin a local bare repository. Its
+# pre-receive hook refuses a push of a refs/notes/ ref while
+# ${notes_refusals} holds a number above 0, and counts every such push in
+# ${notes_pushes}.
+notes_repo="${work_dir}/notes"
+notes_origin="${work_dir}/notes-origin.git"
+notes_refusals="${work_dir}/notes-refusals"
+notes_pushes="${work_dir}/notes-pushes"
+notes_ref=refs/notes/semantic-release-v9.9.9
+# A global tag.gpgSign or commit.gpgSign would make the plain tag below an
+# annotated one that needs a message, so these tests ignore the global config.
+export GIT_CONFIG_GLOBAL=/dev/null
+setup_notes_repo() {
+  local refusals="$1"
+  rm -rf "${notes_repo}" "${notes_origin}"
+  git init --quiet --bare --initial-branch=main "${notes_origin}"
+  cat > "${notes_origin}/hooks/pre-receive" << EOF
+#!/usr/bin/env bash
+while read -r _ _ ref; do
+  case "\${ref}" in
+    refs/notes/*)
+      echo push >> "${notes_pushes}"
+      left="\$(cat "${notes_refusals}")"
+      if [ "\${left}" -gt 0 ]; then
+        echo "\$((left - 1))" > "${notes_refusals}"
+        exit 1
+      fi
+      ;;
+  esac
+done
+EOF
+  chmod +x "${notes_origin}/hooks/pre-receive"
+  echo "${refusals}" > "${notes_refusals}"
+  : > "${notes_pushes}"
+  git init --quiet --initial-branch=main "${notes_repo}"
+  git -C "${notes_repo}" commit --quiet --allow-empty --message "chore: release v9.9.9"
+  git -C "${notes_repo}" remote add origin "${notes_origin}"
+  git -C "${notes_repo}" tag v9.9.9
+  git -C "${notes_repo}" notes --ref "${notes_ref}" add --message '{"channels":[null]}' v9.9.9
+  git -C "${notes_repo}" push --quiet origin main refs/tags/v9.9.9
+}
+run_push_release_notes() {
+  (
+    cd "${notes_repo}"
+    RELEASE_NOTES_RETRY_DELAY=0 "${root}/scripts/push-release-notes.sh" v9.9.9
+  ) > "${work_dir}/push-release-notes.log" 2>&1
+}
+# Checks the run exited with the given status after the given number of
+# pushes of the note.
+check_notes_run() {
+  local what="$1" expected_status="$2" expected_pushes="$3" status=0 pushes
+  run_push_release_notes || status=$?
+  pushes="$(wc -l < "${notes_pushes}" | tr -d ' ')"
+  if [ "${status}" != "${expected_status}" ] || [ "${pushes}" != "${expected_pushes}" ]; then
+    fail "push-release-notes.sh ${what} exited ${status} after ${pushes} pushes; expected ${expected_status} after ${expected_pushes}:"
+    cat "${work_dir}/push-release-notes.log" >&2
+  fi
+}
+check_notes_on_origin() {
+  local what="$1"
+  if [ "$(git -C "${notes_origin}" rev-parse --verify --quiet "${notes_ref}")" != "$(git -C "${notes_repo}" rev-parse "${notes_ref}")" ]; then
+    fail "push-release-notes.sh ${what} didn't leave the note on origin"
+  fi
+}
+check_no_notes_on_origin() {
+  local what="$1"
+  if git -C "${notes_origin}" rev-parse --verify --quiet "${notes_ref}" > /dev/null; then
+    fail "push-release-notes.sh ${what} pushed the note"
+  fi
+}
+
+setup_notes_repo 0
+check_notes_run "when the note is missing on origin" 0 1
+check_notes_on_origin "when the note is missing on origin"
+
+setup_notes_repo 2
+check_notes_run "when GitHub refuses the note twice" 0 3
+check_notes_on_origin "when GitHub refuses the note twice"
+if ! grep -qF "attempt 3 of 3 pushed it" "${work_dir}/push-release-notes.log"; then
+  fail "push-release-notes.sh didn't say which attempt pushed the note:"
+  cat "${work_dir}/push-release-notes.log" >&2
+fi
+
+setup_notes_repo 9
+check_notes_run "when GitHub always refuses the note" 1 3
+check_no_notes_on_origin "when GitHub always refuses the note"
+if ! grep -qF "v9.9.9 is released (tag and release commit are on GitHub), but ${notes_ref} could not be pushed after 3 attempts" "${work_dir}/push-release-notes.log"; then
+  fail "push-release-notes.sh didn't explain the note it could not push:"
+  cat "${work_dir}/push-release-notes.log" >&2
+fi
+
+# Every other failure of semantic-release is left alone, without a push.
+setup_notes_repo 0
+git -C "${notes_repo}" push --quiet origin "${notes_ref}"
+: > "${notes_pushes}"
+check_notes_run "when origin already has the note" 2 0
+
+setup_notes_repo 0
+git -C "${notes_origin}" tag --delete v9.9.9 > /dev/null
+check_notes_run "when origin has no tag" 2 0
+check_no_notes_on_origin "when origin has no tag"
+
+setup_notes_repo 0
+git -C "${notes_repo}" commit --quiet --allow-empty --message "fix: later"
+git -C "${notes_repo}" push --quiet --force origin HEAD:refs/tags/v9.9.9
+check_notes_run "when origin's tag is on another commit" 2 0
+
+setup_notes_repo 0
+git -C "${notes_repo}" notes --ref "${notes_ref}" remove v9.9.9 2> /dev/null
+check_notes_run "when semantic-release made no note" 2 0
+
+setup_notes_repo 0
+if (cd "${notes_repo}" && "${root}/scripts/push-release-notes.sh" 'v9.9.9;true') > "${work_dir}/push-release-notes.log" 2>&1; then
+  fail "push-release-notes.sh passed with the tag 'v9.9.9;true'"
 fi
 
 if [ "${failures}" -ne 0 ]; then

@@ -15,7 +15,8 @@
 # since the last tag, has scripts/commit-release.sh commit
 # `chore: release v<version>` to `main` through the GitHub API, which signs it,
 # and pushes the tag on that commit. Every tag push starts
-# .github/workflows/release.yaml.
+# .github/workflows/release.yaml. If semantic-release then fails only to push
+# its git note for the tag, scripts/push-release-notes.sh pushes it again.
 set -euo pipefail
 
 : "${GH_TOKEN:?GH_TOKEN must hold the release bot token}"
@@ -99,5 +100,24 @@ else
   fi
 fi
 
-exec "${root}/.github/release/node_modules/.bin/semantic-release" \
-  --extends "${root}/.github/release/release.config.mjs" "$@"
+status=0
+"${root}/.github/release/node_modules/.bin/semantic-release" \
+  --extends "${root}/.github/release/release.config.mjs" "$@" || status=$?
+if [ "${status}" -eq 0 ]; then
+  exit 0
+fi
+
+# semantic-release pushes its git note for the new tag last, after the release
+# commit and the tag. When GitHub refuses only that push, the release is out and
+# scripts/push-release-notes.sh pushes the note again; any other failure keeps
+# semantic-release's exit status. The tag semantic-release made is on HEAD,
+# which scripts/commit-release.sh moved to the release commit.
+tag="$(git tag --points-at HEAD --list 'v*' | head -n 1)"
+if [ -n "${tag}" ]; then
+  notes_status=0
+  "${root}/scripts/push-release-notes.sh" "${tag}" || notes_status=$?
+  if [ "${notes_status}" -eq 0 ]; then
+    exit 0
+  fi
+fi
+exit "${status}"
