@@ -128,10 +128,10 @@ enum AgentStreamCommand {
     /// Stream's version (`agent_stream_version`), whether the token was read
     /// from the OS credential store (`token_stored`, false for one given with
     /// --token or FABRIC_TOKEN), whether the Agent Stream accepts it
-    /// (`authenticated`), and the signed-in user. A failed check is shown as
-    /// `error`. A version that cannot be read shows `unknown` (`null` in
-    /// JSON), with a warning on standard error unless the Agent Stream has no
-    /// version route.
+    /// (`authenticated`), and the signed-in user. A failed check, or a
+    /// signed-in user's profile that cannot be read, is shown as `error`. A
+    /// version that cannot be read shows `unknown` (`null` in JSON), with a
+    /// warning on standard error unless the Agent Stream has no version route.
     ///
     /// The command exits 0 even when the token is rejected, so scripts should
     /// read `authenticated`.
@@ -159,7 +159,8 @@ enum AgentStreamCommand {
     /// --file, not both; `patch` needs one and sends it as a JSON Merge Patch.
     /// A body still carrying the masked placeholder is refused.
     ///
-    /// Responses print as the Agent Stream sent them, as JSON.
+    /// Responses print as the Agent Stream sent them. In table mode a JSON
+    /// array prints as a NAME ID DESCRIPTION table, anything else as JSON.
     #[command(after_long_help = API_EXAMPLES)]
     Api(ApiArgs),
     /// Open the interactive shell.
@@ -263,12 +264,15 @@ impl AgentStreamArgs {
         matches!(&self.command, AgentStreamCommand::Login(args) if args.paste && self.token.is_none() && !args.token_stdin)
     }
 
-    /// Gives a `login` the token the interactive shell read for it.
+    /// Gives a `login --paste` the token the interactive shell read for it at
+    /// its own prompt. The token takes the place of --paste, which login would
+    /// otherwise refuse beside a given token.
     pub fn set_login_token(
         &mut self,
         token: String,
     ) {
-        if matches!(self.command, AgentStreamCommand::Login(_)) {
+        if let AgentStreamCommand::Login(args) = &mut self.command {
+            args.paste = false;
             self.token = Some(token);
         }
     }
@@ -414,6 +418,8 @@ mod tests {
     const PROFILE_REFUSED: Route = ("GET /api/v1/profile", "HTTP/1.1 401 Unauthorized", "");
     const STREAM_PERMISSIONS: Route =
         ("GET /api/v1/permissions/public", "HTTP/1.1 200 OK", r#"{"pipes.view":false,"users.view":false}"#);
+    const GATEWAY_PERMISSIONS: Route =
+        ("GET /api/v1/permissions/public", "HTTP/1.1 200 OK", r#"{"surfaces.view":false,"users.view":false}"#);
     const SIGNED_IN: Route =
         ("GET /api/auth/check", "HTTP/1.1 200 OK", r#"{"authenticated":true,"username":"ada","terms_enabled":false}"#);
     const SIGNED_IN_TERMS_PENDING: Route = (
@@ -488,8 +494,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_with_an_access_token_reads_the_profile_and_saves_the_token_in_the_store_only() {
-        let (host, requests) = scripted_agent_stream(vec![PROFILE]).await;
+    async fn login_with_an_access_token_asks_the_host_reads_the_profile_and_saves_the_token_in_the_store_only() {
+        let (host, requests) = scripted_agent_stream(vec![STREAM_PERMISSIONS, PROFILE]).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir
             .path()
@@ -505,8 +511,9 @@ mod tests {
         .await
         .expect("the access token reads the profile");
 
-        assert_eq!(start_lines(&requests), ["GET /api/v1/profile HTTP/1.1"]);
-        assert!(sends_bearer(&requests.lock().unwrap()[0], ACCESS_TOKEN));
+        assert_eq!(start_lines(&requests), ["GET /api/v1/permissions/public HTTP/1.1", "GET /api/v1/profile HTTP/1.1"]);
+        assert!(!sends_bearer(&requests.lock().unwrap()[0], ACCESS_TOKEN), "the probe carries no token");
+        assert!(sends_bearer(&requests.lock().unwrap()[1], ACCESS_TOKEN));
         assert_eq!(
             credentials
                 .get_token("local")
@@ -530,14 +537,14 @@ mod tests {
 
     #[tokio::test]
     async fn login_accepts_an_access_token_with_the_older_prefix() {
-        let (host, requests) = scripted_agent_stream(vec![PROFILE]).await;
+        let (host, requests) = scripted_agent_stream(vec![STREAM_PERMISSIONS, PROFILE]).await;
         let credentials = MemoryCredentials::default();
 
         run_stream(&["login", "--host", &host, "--token", OLD_ACCESS_TOKEN], Config::default(), &credentials)
             .await
             .expect("an atgpat_ token is an Agent Stream access token");
 
-        assert_eq!(start_lines(&requests), ["GET /api/v1/profile HTTP/1.1"]);
+        assert_eq!(start_lines(&requests), ["GET /api/v1/permissions/public HTTP/1.1", "GET /api/v1/profile HTTP/1.1"]);
         assert_eq!(
             credentials
                 .get_token("default")
@@ -590,7 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_with_an_access_token_agent_stream_refuses_saves_nothing_and_says_why() {
-        let (host, _) = scripted_agent_stream(vec![PROFILE_REFUSED]).await;
+        let (host, _) = scripted_agent_stream(vec![STREAM_PERMISSIONS, PROFILE_REFUSED]).await;
         let credentials = MemoryCredentials::default();
 
         let error = run_stream(&["login", "--host", &host, "--token", ACCESS_TOKEN], Config::default(), &credentials)
@@ -673,7 +680,9 @@ mod tests {
 
     #[tokio::test]
     async fn login_with_an_access_token_whose_profile_answers_another_success_saves_nothing() {
-        let (host, _) = scripted_agent_stream(vec![("GET /api/v1/profile", "HTTP/1.1 204 No Content", "")]).await;
+        let (host, _) =
+            scripted_agent_stream(vec![STREAM_PERMISSIONS, ("GET /api/v1/profile", "HTTP/1.1 204 No Content", "")])
+                .await;
         let credentials = MemoryCredentials::default();
 
         let error = run_stream(&["login", "--host", &host, "--token", ACCESS_TOKEN], Config::default(), &credentials)
@@ -865,6 +874,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_given_access_token_never_reaches_a_given_gateway_host() {
+        let (gateway, requests) = scripted_agent_stream(vec![GATEWAY_PERMISSIONS, PROFILE, TOKEN_LIST]).await;
+        let (saved, credentials) = saved_login(STREAM_HOST, ACCESS_TOKEN);
+
+        for words in [vec!["tokens", "list"], vec!["api", "get", "/v1/access-tokens"], vec!["whoami"], vec!["login"]] {
+            let line: Vec<&str> = ["--host", gateway.as_str(), "--token", ACCESS_TOKEN]
+                .into_iter()
+                .chain(words.iter().copied())
+                .collect();
+            let error = run_stream(&line, Config::default(), &MemoryCredentials::default())
+                .await
+                .expect_err("an Agent Gateway host must be refused");
+
+            let text = format!("{error:#}");
+            assert!(text.contains(&format!("{gateway} is an Agent Gateway, not an Agent Stream")), "{words:?}: {text}");
+            assert!(!text.contains(ACCESS_TOKEN), "{words:?}: {text}");
+        }
+        let error = run_stream(&["--host", &gateway, "--allow-host-override", "tokens", "list"], saved, &credentials)
+            .await
+            .expect_err("a saved token sent to a given Agent Gateway host must be refused");
+        assert!(format!("{error:#}").contains("is an Agent Gateway, not an Agent Stream"), "{error:#}");
+
+        let requests = requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        for request in requests.iter() {
+            assert!(request.starts_with("GET /api/v1/permissions/public HTTP/1.1"), "{request}");
+            assert!(!sends_bearer(request, ACCESS_TOKEN), "{request}");
+        }
+    }
+
+    #[tokio::test]
     async fn api_reaches_any_route_under_the_api_prefix() {
         let (host, requests) =
             scripted_agent_stream(vec![("GET /api/v1/version", "HTTP/1.1 200 OK", r#"{"version":"1.0.2"}"#)]).await;
@@ -897,7 +937,10 @@ mod tests {
         .await
         .expect("the given host and token need no keyring");
 
-        assert_eq!(start_lines(&requests), ["GET /api/v1/access-tokens HTTP/1.1"]);
+        assert_eq!(
+            start_lines(&requests),
+            ["GET /api/v1/permissions/public HTTP/1.1", "GET /api/v1/access-tokens HTTP/1.1"]
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), written, "the token line is not moved");
     }
 
@@ -1066,21 +1109,82 @@ mod tests {
         assert!(Cli::try_parse_from(gateway_line).is_err(), "an Agent Gateway command is not an Agent Stream one");
     }
 
-    #[test]
-    fn login_paste_in_the_shell_takes_the_token_the_shell_read() {
-        let mut cli = Cli::try_parse_from(["fabric", "agent-stream", "login", "--paste", "--host", STREAM_HOST])
+    #[tokio::test]
+    async fn login_paste_in_the_shell_signs_in_with_the_token_the_shell_read() {
+        let (host, requests) = scripted_agent_stream(vec![STREAM_PERMISSIONS, SIGNED_IN]).await;
+        let mut cli = Cli::try_parse_from(["fabric", "agent-stream", "login", "--paste", "--host", &host])
             .expect("login --paste parses");
         assert!(cli.login_wants_paste_prompt());
 
         cli.set_login_token(SESSION_TOKEN.to_owned());
 
         assert!(!cli.login_wants_paste_prompt());
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = MemoryCredentials::default();
+        dispatch_with(
+            cli.into_agent_stream(),
+            Config::default(),
+            &credentials,
+            &dir.path()
+                .join("agent-stream.toml"),
+        )
+        .await
+        .expect("the pasted session signs in");
+        assert_eq!(start_lines(&requests), ["GET /api/v1/permissions/public HTTP/1.1", "GET /api/auth/check HTTP/1.1"]);
         assert_eq!(
-            cli.into_agent_stream()
-                .token
+            credentials
+                .get_token("default")
+                .unwrap()
                 .as_deref(),
             Some(SESSION_TOKEN)
         );
+    }
+
+    #[tokio::test]
+    async fn login_with_a_token_typed_before_it_refuses_paste_and_token_stdin_before_anything_is_sent() {
+        let (host, requests) = scripted_agent_stream(vec![STREAM_PERMISSIONS, PROFILE]).await;
+        let credentials = MemoryCredentials::default();
+
+        for (flag, expected) in [
+            ("--paste", "the argument '--paste' cannot be used with '--token <TOKEN>'"),
+            ("--token-stdin", "the argument '--token-stdin' cannot be used with '--token <TOKEN>'"),
+        ] {
+            let error =
+                run_stream(&["--token", ACCESS_TOKEN, "login", flag, "--host", &host], Config::default(), &credentials)
+                    .await
+                    .expect_err("two token sources");
+
+            assert_eq!(error.to_string(), expected);
+        }
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            credentials
+                .get_token("default")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn login_paste_in_a_shell_opened_with_a_token_does_not_prompt() {
+        let cli = Cli::try_parse_from([
+            "fabric",
+            "agent-stream",
+            "--token",
+            ACCESS_TOKEN,
+            "login",
+            "--paste",
+            "--host",
+            STREAM_HOST,
+        ])
+        .expect("clap lets a global --token typed before login through");
+
+        assert!(!cli.login_wants_paste_prompt());
     }
 
     #[test]
@@ -1106,6 +1210,39 @@ mod tests {
         assert_eq!(env_of("connection"), None);
         assert_eq!(env_of("host").as_deref(), Some("FABRIC_HOST"));
         assert_eq!(env_of("token").as_deref(), Some("FABRIC_TOKEN"));
+    }
+
+    #[test]
+    fn the_token_commands_name_agent_stream_in_the_help_they_share_with_agent_gateway() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        command.build();
+        let tokens = command
+            .find_subcommand("agent-stream")
+            .and_then(|stream| stream.find_subcommand("tokens"))
+            .expect("the feature build has agent-stream tokens");
+        let help_of = |subcommand: &str, id: &str| {
+            tokens
+                .find_subcommand(subcommand)
+                .and_then(|command| {
+                    command
+                        .get_arguments()
+                        .find(|argument| argument.get_id() == id)
+                })
+                .and_then(|argument| argument.get_help())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| panic!("{subcommand} {id}"))
+        };
+
+        assert_eq!(
+            help_of("create", "scopes"),
+            "Scope to grant the token. Repeat for multiple scopes. Required unless --full-role is given; run \
+             `fabric agent-stream tokens scopes` to see what you can grant"
+        );
+        for subcommand in ["revoke", "rotate"] {
+            assert_eq!(help_of(subcommand, "id"), "ID of the access token (see `fabric agent-stream tokens list`)");
+        }
     }
 
     #[tokio::test]

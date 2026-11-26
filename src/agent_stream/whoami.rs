@@ -132,7 +132,10 @@ fn version_warning(error: &anyhow::Error) -> Option<String> {
 /// Checks `token` live and adds `authenticated` and the signed-in user to
 /// `fields`. An access token is accepted when it reads the caller's profile;
 /// a session token when `/auth/check` calls it authenticated, and the profile
-/// is then read for the user's details. A failed check is added as `error`.
+/// is then read for the user's details. A failed check is added as `error`,
+/// and so is a signed-in session's profile that cannot be read, such as for a
+/// user who has not accepted the Terms and Conditions yet, whom `/auth/check`
+/// still calls authenticated; the username `/auth/check` gave is shown then.
 async fn insert_login_details(
     fields: &mut Map<String, Value>,
     client: &GatewayClient,
@@ -157,8 +160,13 @@ async fn insert_login_details(
         Ok(check) => {
             let signed_in = authenticated(&check);
             fields.insert("authenticated".to_owned(), json!(signed_in));
-            if signed_in && let Ok(profile) = profile(client).await {
-                insert_profile(fields, &profile);
+            if signed_in {
+                match profile(client).await {
+                    Ok(profile) => insert_profile(fields, &profile),
+                    Err(error) => {
+                        fields.insert("error".to_owned(), json!(error.to_string()));
+                    }
+                }
             }
             if !fields.contains_key("username")
                 && let Some(username) = check
@@ -282,6 +290,27 @@ mod tests {
         );
         assert_eq!(info["authenticated"], true);
         assert_eq!(info["email"], "ada@example.test");
+    }
+
+    #[tokio::test]
+    async fn a_signed_in_session_whose_profile_cannot_be_read_shows_why_with_the_checked_username() {
+        let signed_in = (
+            "GET /api/auth/check",
+            "HTTP/1.1 200 OK",
+            r#"{"authenticated":true,"username":"ada","consent_required":true}"#,
+        );
+        let terms_pending =
+            ("GET /api/v1/profile", "HTTP/1.1 403 Forbidden", r#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#);
+
+        let (info, _) = whoami_with_saved(vec![VERSION, signed_in, terms_pending], SESSION_TOKEN).await;
+
+        assert_eq!(info["authenticated"], true);
+        assert_eq!(info["username"], "ada");
+        assert_eq!(
+            info["error"],
+            "Agent Stream refused the request because the signed-in user has not accepted its Terms and Conditions; \
+             accept them in the Agent Stream dashboard, then run the command again"
+        );
     }
 
     #[tokio::test]

@@ -135,22 +135,23 @@ a binary built with the feature.
 There, `check_product` makes sure the command is not aimed at the other product. A
 token whose prefix says the other product issued it (`agpat_` is Agent Gateway;
 `aspat_` and the older `atgpat_` are Agent Stream) is refused without a request.
-Whitespace around the token is ignored when its prefix is read. A token with no prefix
-together with a host typed with `--host` or set in `FABRIC_HOST` makes the CLI ask the
-host which product it is, through `GET /api/v1/permissions/public` with no token: the
-key `pipes.view` exists only on Agent Stream, and a host that answers as the other
-product is refused. A saved connection is never probed, since it already belongs to one
-product's store. When the probe cannot tell, a gateway command carries on and an Agent
-Stream command stops. Both refusals get their text from `wrong_product_message`, which
-never sees the token and names the command group to use for the other product, such as
-`fabric agent-stream ...`.
+Whitespace around the token is ignored when its prefix is read. A host typed with
+`--host` or set in `FABRIC_HOST` makes the CLI ask the host which product it is, through
+`GET /api/v1/permissions/public` with no token: the key `pipes.view` exists only on
+Agent Stream, and a host that answers as the other product is refused. The host is asked
+even when the token has the command's own prefix, so an `agpat_` token is not sent to a typed
+host that answers as Agent Stream, nor an `aspat_` token to one that answers as Agent Gateway. A saved connection is never probed,
+since it already belongs to one product's store. When the probe cannot tell, a gateway
+command carries on and an Agent Stream command stops. Both refusals get their text from
+`wrong_product_message`, which never sees the token and names the command group to use
+for the other product, such as `fabric agent-stream ...`.
 
 `login` always has a typed host, so `login_and_save` asks it before it reads a token or
-opens the browser, and stops before `check_auth` and before anything is saved when the
-host answers as Agent Stream. A token that is already in hand with a product prefix
-answers the question without a request. `login --pat` is never asked, because it only
-accepts an `agpat_` token. A token read afterwards (standard input, a prompt, the
-browser) still has its prefix checked. In the interactive shell, `login --paste` prompts
+opens the browser, and stops before `check_auth` or `check_pat_auth` and before anything
+is saved when the host answers as Agent Stream. This holds for `login --pat` and for a
+token that already has the `agpat_` prefix. A token already in hand with the Agent Stream
+prefix is refused without a request. A token read afterwards (standard input, a prompt,
+the browser) still has its prefix checked. In the interactive shell, `login --paste` prompts
 for the token before `login_and_save` runs, so there the host is asked after the token
 is typed, and still before the token is sent.
 
@@ -171,8 +172,8 @@ valid on the host until it expires. `fabric agent-stream logout` sends nothing f
 token with the Agent Gateway prefix, nor for an Agent Stream access token, since Agent
 Stream has no route that names the token in use. Any other token is a session token,
 which it sends to `/auth/logout` on the host the token was saved for, to end the
-session there. `fabric agent-stream login` calls `check_product` before it reads the
-token and again once it has it, as the gateway `login` does. The rules sit in
+session there. `fabric agent-stream login` refuses a given token with the Agent Gateway prefix without a
+request, asks the host before it reads any other token, and checks the prefix again once it has it. The rules sit in
 `stop_if_other_product`, which the unit tests call directly, so they are tested in
 both builds.
 
@@ -359,8 +360,7 @@ The token never appears in a browser URL. `acquire_login_token` in `commands.rs`
 whether browser login runs at all: an explicit token, `--pat`, `--token-stdin`,
 `--paste`, or piped standard input each take precedence. In a binary built with the
 `agent-stream` feature, `login_and_save` first asks the host which product it is and
-refuses an Agent Stream, except for `--pat` and for a token whose prefix already names
-the product (see
+refuses an Agent Stream, `--pat` included (see
 [Resolving the connection, host, and token](#resolving-the-connection-host-and-token)).
 `login_and_save` validates the token against the gateway, then `save_login`, which
 `fabric agent-stream login` uses too, saves it and restores the previous token and bound

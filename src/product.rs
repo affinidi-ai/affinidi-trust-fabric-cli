@@ -182,13 +182,17 @@ pub async fn check_product(
 /// The stop behind [`check_product`], whatever the binary was built with.
 ///
 /// A `token` with the other product's prefix is refused on the spot, without a
-/// request; one with the expected prefix settles the question. Otherwise, when
-/// `host_given` says the host was typed with `--host` or set in FABRIC_HOST
-/// (a saved connection already belongs to its product's store), `host` is
-/// asked which product it is, without the token, and the other product is
-/// refused. Inside [`remembering_probes`] a host that has named its product
-/// is not asked again. When the host cannot be read, an Agent Gateway command
-/// carries on and an Agent Stream command stops.
+/// request. Any other token, including one with the command's own prefix, is
+/// checked against the host when `host_given` says the host was typed with
+/// `--host` or set in FABRIC_HOST: `host` is asked which product it is,
+/// without the token, and the other product is refused, so an Agent Gateway
+/// access token is not sent to a typed host that answers as Agent Stream, nor
+/// an Agent Stream access token to one that answers as Agent Gateway. A saved
+/// connection is not asked,
+/// because it already belongs to its product's store. Inside
+/// [`remembering_probes`] a host that has named its product is not asked
+/// again. When the host cannot be read, an Agent Gateway command carries on
+/// and an Agent Stream command stops.
 ///
 /// A refusal is worded by [`wrong_product_message`], which names the command
 /// group of the other product. Neither the token nor any part of it is ever
@@ -199,10 +203,11 @@ async fn stop_if_other_product(
     token: Option<&str>,
     host_given: bool,
 ) -> Result<()> {
-    match token.and_then(token_product) {
-        Some(product) if product == expected => return Ok(()),
-        Some(product) => bail!(wrong_product_message(expected, product, Mismatch::TokenPrefix)),
-        None => {}
+    if let Some(product) = token
+        .and_then(token_product)
+        .filter(|product| *product != expected)
+    {
+        bail!(wrong_product_message(expected, product, Mismatch::TokenPrefix));
     }
     if !host_given {
         return Ok(());
@@ -476,7 +481,7 @@ mod tests {
     async fn a_build_without_the_feature_refuses_nothing_and_asks_no_host() {
         let (stream, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
 
-        for token in [STREAM_TOKEN, OLD_STREAM_TOKEN, SESSION_TOKEN] {
+        for token in [GATEWAY_TOKEN, STREAM_TOKEN, OLD_STREAM_TOKEN, SESSION_TOKEN] {
             check_product(Product::AgentGateway, &stream, Some(token), true)
                 .await
                 .expect("the stop is off in a build without the feature");
@@ -563,17 +568,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_token_with_the_expected_prefix_settles_it_without_a_probe() {
+    async fn a_token_with_the_expected_prefix_on_a_saved_connection_is_not_probed() {
         let (host, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
 
-        stop_if_other_product(Product::AgentGateway, &host, Some(GATEWAY_TOKEN), true)
+        stop_if_other_product(Product::AgentGateway, &host, Some(GATEWAY_TOKEN), false)
             .await
-            .expect("the prefix says Agent Gateway, so the host is not asked");
-        stop_if_other_product(Product::AgentStream, &host, Some(STREAM_TOKEN), true)
+            .expect("the prefix says Agent Gateway and the host is saved");
+        stop_if_other_product(Product::AgentStream, &host, Some(STREAM_TOKEN), false)
             .await
-            .expect("the prefix says Agent Stream");
+            .expect("the prefix says Agent Stream and the host is saved");
 
         assert!(request_lines(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_token_with_a_given_host_of_agent_stream_stops_after_a_probe_without_the_token() {
+        let (stream, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
+
+        let error = stop_if_other_product(Product::AgentGateway, &stream, Some(GATEWAY_TOKEN), true)
+            .await
+            .expect_err("an Agent Gateway token must not reach an Agent Stream host");
+
+        let text = error.to_string();
+        assert!(text.contains(&format!("{stream} is an Agent Stream, not an Agent Gateway")), "{text}");
+        assert!(text.contains("`fabric agent-stream ...`"), "{text}");
+        assert!(!text.contains("secret-value"), "{text}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/v1/permissions/public HTTP/1.1"), "{}", requests[0]);
+        assert!(!requests[0].contains("secret-value"), "{}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_token_with_a_given_host_of_agent_gateway_carries_on_after_a_probe() {
+        let (gateway, requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
+
+        stop_if_other_product(Product::AgentGateway, &gateway, Some(GATEWAY_TOKEN), true)
+            .await
+            .expect("an Agent Gateway host");
+
+        assert_eq!(request_lines(&requests), ["GET /api/v1/permissions/public HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_token_with_a_given_host_that_cannot_be_read_carries_on() {
+        stop_if_other_product(Product::AgentGateway, &refusing_host(), Some(GATEWAY_TOKEN), true)
+            .await
+            .expect("an Agent Gateway command carries on when the host cannot be read");
+    }
+
+    #[tokio::test]
+    async fn an_agent_stream_token_with_a_given_host_of_agent_gateway_stops_after_a_probe_without_the_token() {
+        let (gateway, requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
+
+        for token in [STREAM_TOKEN, OLD_STREAM_TOKEN] {
+            let error = stop_if_other_product(Product::AgentStream, &gateway, Some(token), true)
+                .await
+                .expect_err("an Agent Stream token must not reach an Agent Gateway host");
+
+            let text = error.to_string();
+            assert!(text.contains(&format!("{gateway} is an Agent Gateway, not an Agent Stream")), "{text}");
+            assert!(text.contains("`fabric agent-gateway ...`"), "{text}");
+            assert!(!text.contains("secret-value"), "{text}");
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request.starts_with("GET /api/v1/permissions/public HTTP/1.1"), "{request}");
+            assert!(!request.contains("secret-value"), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_stream_token_with_a_given_host_that_cannot_be_read_stops() {
+        let host = refusing_host();
+
+        let error = stop_if_other_product(Product::AgentStream, &host, Some(STREAM_TOKEN), true)
+            .await
+            .expect_err("an Agent Stream command needs a known host");
+
+        let text = error.to_string();
+        assert!(text.contains(&format!("could not confirm that {host} is an Agent Stream")), "{text}");
+        assert!(!text.contains("secret-value"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_stream_token_with_a_given_host_of_agent_stream_carries_on() {
+        let (stream, _) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
+
+        stop_if_other_product(Product::AgentStream, &stream, Some(STREAM_TOKEN), true)
+            .await
+            .expect("an Agent Stream host");
     }
 
     #[tokio::test]

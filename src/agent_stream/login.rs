@@ -56,16 +56,17 @@ const TERMS_PENDING_WARNING: &str = "warning: this session's user has not accept
 /// `--connection` or `default`, in `saved`, the file at `path`, and
 /// `credentials`. A name that is empty once trimmed or contains `#` is refused
 /// first, and so is a plain http host that is not local unless --allow-http is
-/// set.
+/// set, and so is a token given with --token or FABRIC_TOKEN together with
+/// --token-stdin or --paste (see [`token_source`]).
 ///
-/// The host is asked which product it is before the token is read, unless the
-/// token given with --token or FABRIC_TOKEN says so by its prefix, and a token
-/// read afterwards is refused when its prefix says Agent Gateway issued it
-/// (see [`product::check_product`]). The token is then checked with the Agent
-/// Stream (see [`check_token`]), and only a token it accepts is saved, in
-/// `credentials` beside the host it is bound to. A session whose user still has
-/// to accept the Terms and Conditions is saved too, with a warning on standard
-/// error, because accepting them in the dashboard makes the same session work.
+/// The host is asked which product it is before the token is read, whatever
+/// token is given, and a token read afterwards is refused when its prefix says
+/// Agent Gateway issued it (see [`product::check_product`]). The token is then
+/// checked with the Agent Stream (see [`check_token`]), and only a token it
+/// accepts is saved, in `credentials` beside the host it is bound to. A session
+/// whose user still has to accept the Terms and Conditions is saved too, with a
+/// warning on standard error, because accepting them in the dashboard makes the
+/// same session work.
 pub async fn login(
     saved: &mut Config,
     credentials: &impl CredentialStore,
@@ -86,8 +87,9 @@ pub async fn login(
             .context("--host is required for login")?,
         globals.flags.allow_http,
     )?;
+    let source = token_source(globals.token.is_some(), &args, io::stdin().is_terminal())?;
     product::check_product(Product::AgentStream, &host, globals.token.as_deref(), true).await?;
-    let token = acquire_token(globals.token.as_deref(), &args)?;
+    let token = acquire_token(source, globals.token.as_deref())?;
     // The host has answered by now, so only the token's prefix is left to check.
     product::check_product(Product::AgentStream, &host, Some(&token), false).await?;
     let client = GatewayClient::for_agent_stream(&host, &token)?;
@@ -120,31 +122,44 @@ enum TokenSource {
 /// or FABRIC_TOKEN (`given`), else standard input for --token-stdin, else the
 /// terminal for --paste, else standard input when it is piped
 /// (`stdin_is_terminal` false), else the terminal.
+///
+/// A given token together with --token-stdin or --paste is refused, as clap
+/// refuses `login --token ... --paste`: --token is a global flag here, so clap
+/// lets it through when it is typed before `login` or comes from the shell's
+/// own flags.
 fn token_source(
     given: bool,
     args: &LoginArgs,
     stdin_is_terminal: bool,
-) -> TokenSource {
+) -> Result<TokenSource> {
     if given {
-        TokenSource::Given
-    } else if args.token_stdin {
+        if args.token_stdin {
+            bail!("the argument '--token-stdin' cannot be used with '--token <TOKEN>'");
+        }
+        if args.paste {
+            bail!("the argument '--paste' cannot be used with '--token <TOKEN>'");
+        }
+        return Ok(TokenSource::Given);
+    }
+    Ok(if args.token_stdin {
         TokenSource::Stdin
     } else if args.paste || stdin_is_terminal {
         TokenSource::Prompt
     } else {
         TokenSource::Stdin
-    }
+    })
 }
 
-/// The token for a login, read from where [`token_source`] says.
+/// The token for a login, read from `source`, with `given` the token given
+/// with --token or FABRIC_TOKEN.
 fn acquire_token(
+    source: TokenSource,
     given: Option<&str>,
-    args: &LoginArgs,
 ) -> Result<String> {
-    match (token_source(given.is_some(), args, io::stdin().is_terminal()), given) {
-        (TokenSource::Given, Some(token)) => non_empty_token(token.to_owned()),
+    match (source, given) {
+        (TokenSource::Given, Some(token)) => non_empty_token(token.to_owned(), &super::SHELL_TEXT),
         (TokenSource::Prompt, _) => prompt_token(&super::SHELL_TEXT),
-        _ => read_stdin_token(),
+        _ => read_stdin_token(&super::SHELL_TEXT),
     }
 }
 
@@ -379,15 +394,15 @@ mod tests {
     #[test]
     fn a_given_token_comes_first_then_token_stdin_then_paste_then_piped_input_then_the_terminal() {
         for (given, token_stdin, paste, stdin_is_terminal, expected) in [
-            (true, true, false, true, TokenSource::Given),
-            (true, false, true, false, TokenSource::Given),
+            (true, false, false, true, TokenSource::Given),
+            (true, false, false, false, TokenSource::Given),
             (false, true, false, true, TokenSource::Stdin),
             (false, false, true, false, TokenSource::Prompt),
             (false, false, false, false, TokenSource::Stdin),
             (false, false, false, true, TokenSource::Prompt),
         ] {
             assert_eq!(
-                token_source(given, &login_args(token_stdin, paste), stdin_is_terminal),
+                token_source(given, &login_args(token_stdin, paste), stdin_is_terminal).unwrap(),
                 expected,
                 "given {given}, --token-stdin {token_stdin}, --paste {paste}, terminal {stdin_is_terminal}"
             );
@@ -395,11 +410,21 @@ mod tests {
     }
 
     #[test]
-    fn a_given_token_is_trimmed_and_an_empty_one_is_refused() {
-        let args = login_args(true, false);
+    fn a_given_token_with_token_stdin_or_paste_is_refused() {
+        for (args, flag) in [(login_args(true, false), "--token-stdin"), (login_args(false, true), "--paste")] {
+            for stdin_is_terminal in [true, false] {
+                let error = token_source(true, &args, stdin_is_terminal).expect_err("two token sources");
 
-        assert_eq!(acquire_token(Some("  aspat_secret \n"), &args).unwrap(), "aspat_secret");
-        assert!(acquire_token(Some("   "), &args).is_err());
+                assert_eq!(error.to_string(), format!("the argument '{flag}' cannot be used with '--token <TOKEN>'"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_given_token_is_trimmed_and_an_empty_one_is_refused() {
+        assert_eq!(acquire_token(TokenSource::Given, Some("  aspat_secret \n")).unwrap(), "aspat_secret");
+        let error = acquire_token(TokenSource::Given, Some("   ")).expect_err("an empty token");
+        assert_eq!(error.to_string(), "token must not be empty");
     }
 
     #[tokio::test]

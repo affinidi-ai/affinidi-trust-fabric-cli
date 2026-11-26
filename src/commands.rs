@@ -1757,57 +1757,57 @@ const TOKENS_ROTATE_EXAMPLES: &str = r#"Examples:
 #[derive(Debug, Args)]
 pub(crate) struct AccessTokenRevokeArgs {
     /// ID of the personal access token to revoke.
-    pub(crate) id: String,
+    id: String,
     /// Skip the confirmation prompt. Required when running non-interactively.
     #[arg(short, long)]
-    pub(crate) yes: bool,
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct AccessTokenRotateArgs {
     /// ID of the personal access token to rotate.
-    pub(crate) id: String,
+    id: String,
     /// Skip the confirmation prompt. Required when running non-interactively.
     #[arg(short, long)]
-    pub(crate) yes: bool,
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct AccessTokenCreateArgs {
     /// Token name. Required unless --file is given.
     #[arg(long, required_unless_present = "file")]
-    pub(crate) name: Option<String>,
+    name: Option<String>,
     /// What the token is for.
     #[arg(long, default_value = "")]
-    pub(crate) description: String,
+    description: String,
     /// Scope to grant the token. Repeat for multiple scopes. Required unless
     /// --full-role is given; run `fabric agent-gateway tokens scopes` to see
     /// what you can grant.
     #[arg(long = "scope")]
-    pub(crate) scopes: Vec<String>,
+    scopes: Vec<String>,
     /// Give the token everything your own role can do, instead of listing
     /// scopes. Use it only when a limited token will not do.
     #[arg(long, conflicts_with = "scopes")]
-    pub(crate) full_role: bool,
+    full_role: bool,
     /// RFC 3339 expiry timestamp, for example 2027-01-01T00:00:00Z. Defaults
     /// to 90 days from now.
     #[arg(long)]
-    pub(crate) expires_at: Option<String>,
+    expires_at: Option<String>,
     /// Resource the token is limited to, as
     /// TENANT:${header}:<resource-kind>:<id-pattern>, where ${header} names
     /// one of the --required-header flags. Omit for an appliance-wide token.
     #[arg(long)]
-    pub(crate) resource_pattern: Option<String>,
+    resource_pattern: Option<String>,
     /// Header the caller must send, as name=pattern, where pattern is a regex
     /// the whole header value must match. Repeat for more headers. The header
     /// named in --resource-pattern must normally be one exact value, such as
     /// acme.
     #[arg(long = "required-header", value_parser = parse_required_header)]
-    pub(crate) required_headers: Vec<(String, String)>,
+    required_headers: Vec<(String, String)>,
     /// JSON request body, or - for standard input. Other creation flags except
     /// --full-role are ignored when set.
     #[arg(short, long)]
-    pub(crate) file: Option<PathBuf>,
+    file: Option<PathBuf>,
 }
 
 /// How long a token lives when `tokens create` is not told.
@@ -1816,7 +1816,7 @@ const DEFAULT_TOKEN_LIFETIME_DAYS: u64 = 90;
 /// Parses a `--required-header` occurrence of the form `name=pattern` into
 /// its two non-empty parts, rejecting malformed input before it ever reaches
 /// the gateway.
-pub(crate) fn parse_required_header(raw: &str) -> Result<(String, String), String> {
+fn parse_required_header(raw: &str) -> Result<(String, String), String> {
     let (name, pattern) = raw
         .split_once('=')
         .ok_or_else(|| format!("expected name=pattern, got '{raw}'"))?;
@@ -2501,15 +2501,15 @@ async fn login(
 /// In a binary built with the `agent-stream` Cargo feature, a login to an
 /// Agent Stream is refused too, before the token is sent and before anything
 /// is saved (see [`product::check_product`]). The host is asked which product
-/// it is before this function reads a token or opens the browser, unless the
-/// token in `args` already says so by its prefix. That token was given with
-/// `--token` or FABRIC_TOKEN, or, for `login --paste` in the interactive
-/// shell, typed at the shell's own prompt, which comes before this function
-/// and so before the host is asked. A `--pat` login is not asked, because it
-/// only accepts a token with the Agent Gateway prefix. A token read
-/// afterwards, from standard input, a prompt, or the browser, is refused when
-/// its prefix says Agent Stream issued it. A binary built without the
-/// feature, as every release is, does none of this.
+/// it is before this function reads a token or opens the browser, `--pat`
+/// logins and tokens with the Agent Gateway prefix included. A token in `args`
+/// with the Agent Stream prefix is refused without asking. That token was
+/// given with `--token` or FABRIC_TOKEN, or, for `login --paste` in the
+/// interactive shell, typed at the shell's own prompt, which comes before this
+/// function and so before the host is asked. A token read afterwards, from
+/// standard input, a prompt, or the browser, is refused when its prefix says
+/// Agent Stream issued it. A binary built without the feature, as every
+/// release is, does none of this.
 ///
 /// Returns a note to show the user when the login replaced a connection that
 /// already existed.
@@ -2529,9 +2529,7 @@ async fn login_and_save(
             .context("--host is required for login")?,
         allow_http,
     )?;
-    if args.pat.is_none() {
-        product::check_product(Product::AgentGateway, &host, args.token.as_deref(), true).await?;
-    }
+    product::check_product(Product::AgentGateway, &host, args.token.as_deref(), true).await?;
     let token = acquire_login_token(&host, &args).await?;
     // The host has answered by now, so only the token's prefix is left to check.
     product::check_product(Product::AgentGateway, &host, Some(&token), false).await?;
@@ -2638,13 +2636,13 @@ async fn acquire_login_token(
     args: &LoginArgs,
 ) -> Result<String> {
     if let Some(token) = &args.token {
-        return non_empty_token(token.clone());
+        return non_empty_token(token.clone(), &GATEWAY_SHELL_TEXT);
     }
     if args.pat.is_some() {
         return acquire_pat_token(args).await;
     }
     if args.token_stdin {
-        return read_stdin_token();
+        return read_stdin_token(&GATEWAY_SHELL_TEXT);
     }
     if args.paste {
         return prompt_token(&GATEWAY_SHELL_TEXT);
@@ -2652,7 +2650,7 @@ async fn acquire_login_token(
     if !io::stdin().is_terminal() {
         // Piped input without an explicit mode is treated as the token so
         // `printf %s "$TOKEN" | fabric agent-gateway login ...` keeps working in automation.
-        return read_stdin_token();
+        return read_stdin_token(&GATEWAY_SHELL_TEXT);
     }
     crate::browser_login::browser_login(host).await
 }
@@ -2667,18 +2665,18 @@ async fn acquire_pat_token(args: &LoginArgs) -> Result<String> {
         .as_deref()
         .filter(|token| !token.is_empty())
     {
-        non_empty_token(token.to_owned())?
+        non_empty_token(token.to_owned(), &GATEWAY_SHELL_TEXT)?
     } else if let Some(token) = std::env::var("FABRIC_PAT")
         .ok()
         .filter(|token| !token.is_empty())
     {
-        non_empty_token(token)?
+        non_empty_token(token, &GATEWAY_SHELL_TEXT)?
     } else if args.token_stdin || !io::stdin().is_terminal() {
-        read_stdin_token()?
+        read_stdin_token(&GATEWAY_SHELL_TEXT)?
     } else {
         rpassword::prompt_password("Personal access token: ")
             .context("read the personal access token from this terminal")
-            .and_then(non_empty_token)?
+            .and_then(|token| non_empty_token(token, &GATEWAY_SHELL_TEXT))?
     };
     if !token.starts_with(PAT_TOKEN_PREFIX) {
         bail!("personal access token must start with '{PAT_TOKEN_PREFIX}'");
@@ -2686,12 +2684,14 @@ async fn acquire_pat_token(args: &LoginArgs) -> Result<String> {
     Ok(token)
 }
 
-pub(crate) fn read_stdin_token() -> Result<String> {
+/// Reads a token from standard input for a `login` of the appliance `text`
+/// belongs to, whose messages call it by [`ShellText::token_name`].
+pub(crate) fn read_stdin_token(text: &ShellText) -> Result<String> {
     let mut value = String::new();
     io::stdin()
         .read_to_string(&mut value)
-        .context("read bearer token from standard input")?;
-    non_empty_token(value)
+        .with_context(|| format!("read {} from standard input", text.token_name))?;
+    non_empty_token(value, text)
 }
 
 /// Asks for a token on the terminal, without echo, at the paste prompt of
@@ -2705,13 +2705,18 @@ pub(crate) fn prompt_token(text: &ShellText) -> Result<String> {
             text.product.command()
         )
     })?;
-    non_empty_token(token)
+    non_empty_token(token, text)
 }
 
-pub(crate) fn non_empty_token(token: String) -> Result<String> {
+/// `token` without the whitespace around it, refused when nothing is left,
+/// in words that call it what the appliance `text` belongs to calls it.
+pub(crate) fn non_empty_token(
+    token: String,
+    text: &ShellText,
+) -> Result<String> {
     let token = token.trim().to_owned();
     if token.is_empty() {
-        bail!("bearer token must not be empty");
+        bail!("{} must not be empty", text.token_name);
     }
     Ok(token)
 }
@@ -17760,6 +17765,25 @@ mod tests {
     const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
     const OK_EMPTY_LIST: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n[]";
 
+    /// How many requests a gateway command sends to a typed host to ask which
+    /// product it is before its own: one in a build with the `agent-stream`
+    /// Cargo feature, none in a build without it.
+    const GATEWAY_PROBES: usize = if cfg!(feature = "agent-stream") {
+        1
+    } else {
+        0
+    };
+
+    /// `responses` for a gateway command on a typed host, after the Agent
+    /// Gateway answer to the product question in a build with the
+    /// `agent-stream` Cargo feature.
+    fn after_gateway_probe(responses: Vec<&'static str>) -> Vec<&'static str> {
+        let probe = ok_json(r#"{"surfaces.view":false}"#);
+        std::iter::repeat_n(probe, GATEWAY_PROBES)
+            .chain(responses)
+            .collect()
+    }
+
     fn gateway_args(args: &[&str]) -> AgentGatewayArgs {
         Cli::try_parse_from(
             ["fabric", "agent-gateway"]
@@ -17860,7 +17884,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_with_another_host_sends_the_saved_token_with_the_opt_in() {
-        let (other, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+        let (other, requests) = recording_server(after_gateway_probe(vec![OK_EMPTY_LIST])).await;
         let config = config_with_connection("prod", "https://gateway.example.com");
         let credentials = credentials_bound_to("prod", "agpat_secret", "https://gateway.example.com");
 
@@ -17873,19 +17897,19 @@ mod tests {
         .expect("the opt-in lets the token go");
 
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), GATEWAY_PROBES + 1);
         assert!(
-            requests[0]
+            requests[GATEWAY_PROBES]
                 .to_ascii_lowercase()
                 .contains("authorization: bearer agpat_secret"),
             "{}",
-            requests[0]
+            requests[GATEWAY_PROBES]
         );
     }
 
     #[tokio::test]
     async fn an_explicit_token_goes_to_an_explicit_host() {
-        let (other, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+        let (other, requests) = recording_server(after_gateway_probe(vec![OK_EMPTY_LIST])).await;
         let config = config_with_connection("prod", "https://gateway.example.com");
         let credentials = credentials_bound_to("prod", "agpat_saved", "https://gateway.example.com");
 
@@ -17899,13 +17923,17 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert!(
-            requests[0]
+            requests[GATEWAY_PROBES]
                 .to_ascii_lowercase()
                 .contains("authorization: bearer agpat_typed"),
             "{}",
-            requests[0]
+            requests[GATEWAY_PROBES]
         );
-        assert!(!requests[0].contains("agpat_saved"));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("agpat_saved"))
+        );
     }
 
     #[tokio::test]
@@ -18000,7 +18028,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gateway_command_with_a_host_and_token_and_no_saved_connection_skips_the_keyring() {
-        let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+        let (host, requests) = recording_server(after_gateway_probe(vec![OK_EMPTY_LIST])).await;
 
         dispatch_with(
             gateway_args(&["--host", &host, "--token", GIVEN_TOKEN, "api", "get", "/v1/gateways"]),
@@ -18011,9 +18039,10 @@ mod tests {
         .expect("the command should run with only a host and a token");
 
         let requests = requests.lock().unwrap();
-        assert!(requests[0].starts_with("GET /api/v1/gateways "), "{}", requests[0]);
+        let command = &requests[GATEWAY_PROBES];
+        assert!(command.starts_with("GET /api/v1/gateways "), "{command}");
         assert!(
-            requests[0]
+            command
                 .to_ascii_lowercase()
                 .contains(&format!("authorization: bearer {GIVEN_TOKEN}"))
         );
@@ -18064,7 +18093,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_given_host_and_token_override_a_saved_connection_without_the_keyring() {
-        let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+        let (host, requests) = recording_server(after_gateway_probe(vec![OK_EMPTY_LIST])).await;
 
         dispatch_with(
             gateway_args(&["--host", &host, "--token", GIVEN_TOKEN, "api", "get", "/v1/gateways"]),
@@ -18075,7 +18104,7 @@ mod tests {
         .expect("the command should run on the given host and token");
 
         assert!(
-            requests.lock().unwrap()[0]
+            requests.lock().unwrap()[GATEWAY_PROBES]
                 .to_ascii_lowercase()
                 .contains(&format!("authorization: bearer {GIVEN_TOKEN}"))
         );
@@ -18145,8 +18174,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_with_a_personal_access_token_does_not_ask_the_host() {
-        let (host, requests) = recording_server(vec![OK_EMPTY]).await;
+    async fn login_with_a_personal_access_token_checks_it_at_token_info() {
+        let (host, requests) = recording_server(after_gateway_probe(vec![OK_EMPTY])).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut config = Config::default();
@@ -18161,9 +18190,16 @@ mod tests {
 
         login_and_save(&mut config, &credentials, "production", args, false, &path)
             .await
-            .expect("the prefix says Agent Gateway, so the host is not asked");
+            .expect("a gateway host accepts the personal access token");
 
-        assert_eq!(first_lines(&requests), ["GET /api/v1/token-info HTTP/1.1"]);
+        let lines = first_lines(&requests);
+        assert_eq!(lines[GATEWAY_PROBES..], ["GET /api/v1/token-info HTTP/1.1"]);
+        assert!(
+            requests.lock().unwrap()[..GATEWAY_PROBES]
+                .iter()
+                .all(|probe| !probe.contains("agpat_valid")),
+            "the probe carries no token"
+        );
     }
 
     /// The stop of a command aimed at Agent Stream, which only acts in a build
@@ -18527,6 +18563,105 @@ mod tests {
                     .connections["production"]
                     .host,
                 host
+            );
+        }
+
+        #[tokio::test]
+        async fn a_gateway_token_with_a_given_agent_stream_host_stops_after_the_probe() {
+            let (host, requests) = recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS), OK_EMPTY_LIST]).await;
+
+            let error = dispatch_with(
+                gateway_args(&["--host", &host, "--token", GIVEN_TOKEN, "api", "get", "/v1/gateways"]),
+                Config::default(),
+                &UnreachableKeyring,
+            )
+            .await
+            .expect_err("an Agent Gateway token must not reach an Agent Stream host");
+
+            let text = error.to_string();
+            assert!(text.contains(&format!("{host} is an Agent Stream, not an Agent Gateway")), "{text}");
+            assert!(!text.contains(GIVEN_TOKEN), "{text}");
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST]);
+            let probe = requests.lock().unwrap()[0].to_ascii_lowercase();
+            assert!(!probe.contains("authorization"), "{probe}");
+            assert!(!probe.contains(GIVEN_TOKEN), "{probe}");
+        }
+
+        #[tokio::test]
+        async fn login_with_a_gateway_token_on_an_agent_stream_host_stops_after_the_probe_and_saves_nothing() {
+            let (host, requests) =
+                recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS), ok_json(AUTHENTICATED)]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = Config::default();
+            let credentials = MemoryCredentials::default();
+
+            let error = login_and_save(
+                &mut config,
+                &credentials,
+                "production",
+                login_args_with_token(&host, GIVEN_TOKEN),
+                false,
+                &path,
+            )
+            .await
+            .expect_err("an Agent Gateway token must not reach an Agent Stream host");
+
+            let text = error.to_string();
+            assert!(text.contains(&format!("{host} is an Agent Stream, not an Agent Gateway")), "{text}");
+            assert!(!text.contains(GIVEN_TOKEN), "{text}");
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST]);
+            let probe = requests.lock().unwrap()[0].to_ascii_lowercase();
+            assert!(!probe.contains("authorization"), "{probe}");
+            assert!(!probe.contains(GIVEN_TOKEN), "{probe}");
+            assert!(!path.exists());
+            assert!(config.connections.is_empty());
+            assert_eq!(
+                credentials
+                    .get_token("production")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                credentials
+                    .get_bound_host("production")
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn login_with_a_personal_access_token_on_an_agent_stream_host_stops_after_the_probe_and_saves_nothing() {
+            let (host, requests) = recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS), OK_EMPTY]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let mut config = Config::default();
+            let credentials = MemoryCredentials::default();
+            let args = LoginArgs {
+                host: Some(host.clone()),
+                token_stdin: false,
+                paste: false,
+                token: None,
+                pat: Some(GIVEN_TOKEN.to_owned()),
+            };
+
+            let error = login_and_save(&mut config, &credentials, "production", args, false, &path)
+                .await
+                .expect_err("a personal access token must not reach an Agent Stream host");
+
+            let text = error.to_string();
+            assert!(text.contains(&format!("{host} is an Agent Stream, not an Agent Gateway")), "{text}");
+            assert!(!text.contains(GIVEN_TOKEN), "{text}");
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST]);
+            let probe = requests.lock().unwrap()[0].to_ascii_lowercase();
+            assert!(!probe.contains("authorization"), "{probe}");
+            assert!(!probe.contains(GIVEN_TOKEN), "{probe}");
+            assert!(!path.exists());
+            assert_eq!(
+                credentials
+                    .get_token("production")
+                    .unwrap(),
+                None
             );
         }
 
@@ -18947,6 +19082,13 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer agpat_secret")
         );
+    }
+
+    #[test]
+    fn an_empty_gateway_token_is_still_called_a_bearer_token() {
+        let error = non_empty_token(" \n".to_owned(), &GATEWAY_SHELL_TEXT).expect_err("an empty token");
+
+        assert_eq!(error.to_string(), "bearer token must not be empty");
     }
 
     #[tokio::test]

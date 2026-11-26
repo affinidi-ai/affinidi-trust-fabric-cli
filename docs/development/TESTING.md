@@ -79,13 +79,16 @@ A build with the `agent-stream` Cargo feature sometimes sends
 `GET /api/v1/permissions/public` first, to ask the host which product it is. A build
 without the feature never sends it. The request goes out before:
 
-- a command or `whoami` given `--host` or `FABRIC_HOST`, unless its token starts with a
-  product prefix (`agpat_`, `aspat_`, or `atgpat_`);
-- a `login` that is not `--pat`, unless it was given a token that starts with a product
-  prefix.
+- a command or `whoami` given `--host` or `FABRIC_HOST`, unless its token starts with
+  the other product's prefix, which is refused without a request;
+- every `login`, `--pat` included, unless it was given a token that starts with the
+  other product's prefix.
 
-A test that scripts an answer for that request, or asserts that a command was stopped,
-only holds with the feature, so it goes in a module marked
+A test that runs in both builds and sends a gateway command to a typed host counts that
+request with `GATEWAY_PROBES` (1 with the feature, 0 without) and scripts its answer with
+`after_gateway_probe`, both in the `tests` module of `commands.rs`. A test that scripts
+an answer the build without the feature never asks for, or asserts that a command was
+stopped, only holds with the feature, so it goes in a module marked
 `#[cfg(feature = "agent-stream")]`, such as `with_the_agent_stream_feature` in the
 `tests` module of `commands.rs`. A test of what the build without the feature sends goes
 in a module marked `#[cfg(not(feature = "agent-stream"))]`, such as
