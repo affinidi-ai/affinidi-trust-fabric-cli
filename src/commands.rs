@@ -11802,7 +11802,7 @@ fn surfaces_carrying_key<'a>(
 /// Prints the outcome of a delete or an update: the confirmation line in table
 /// mode, even when the gateway sent a document back, and the gateway's own
 /// answer with `--output json`.
-fn print_outcome(
+pub(crate) fn print_outcome(
     value: &Value,
     output: Output,
     confirmation: &str,
@@ -13216,7 +13216,7 @@ fn answer_is_yes(answer: &str) -> bool {
 }
 
 /// Seconds since the Unix epoch.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -13273,7 +13273,7 @@ fn require_scopes_and_expiry_of(
 }
 
 /// `seconds` since the Unix epoch as an RFC 3339 UTC timestamp.
-fn rfc3339_utc(seconds: u64) -> String {
+pub(crate) fn rfc3339_utc(seconds: u64) -> String {
     let days = (seconds / 86_400) as i64;
     let remainder = seconds % 86_400;
     // Civil date from a day count (Howard Hinnant's algorithm).
@@ -16906,7 +16906,7 @@ pub(crate) async fn run_api(
         .await
 }
 
-fn read_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_json(path: &Path) -> Result<Value> {
     let body = if path == Path::new("-") {
         let mut contents = String::new();
         io::stdin()
@@ -16927,7 +16927,7 @@ fn checked_body(body: Value) -> Result<Value> {
     Ok(body)
 }
 
-fn entity_path(
+pub(crate) fn entity_path(
     base: &str,
     id: &str,
 ) -> String {
@@ -17221,7 +17221,7 @@ fn delete_confirmation(command: &Command) -> Option<String> {
 /// The one line every delete, revoke, create or update prints in table mode,
 /// such as `Deleted issuer 'i-1'`. The id may be what the user typed, so it is
 /// cleaned with [`tables::flatten`] and never cut.
-fn confirmation_line(
+pub(crate) fn confirmation_line(
     verb: &str,
     kind: &str,
     id: &str,

@@ -32,7 +32,8 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 
 | Term | Meaning |
 | --- | --- |
-| **Agent Surface** (_surface_) | The configuration for one managed agent: one access point, one target, and zero or more transit points. Most `surfaces` commands accept a surface's name as well as its ID. |
+| **Agent Surface** (_surface_) | The configuration for one managed agent: one access point, one target, and zero or more transit points. Most `fabric agent-gateway surfaces` commands accept a surface's name as well as its ID. |
+| **Agent Stream surface** | A surface of an Agent Stream, managed with `fabric agent-stream surfaces` (only in builds with the `agent-stream` feature). Agent Stream's API calls it a _pipe_ and serves it at `/v1/pipes`; the CLI says surface. These commands take a surface's ID only. |
 | **Access point** | The inbound side of a surface: the route and protocol callers use to reach the managed agent. |
 | **Target** | The managed-agent side of a surface: the endpoint inbound traffic is forwarded to, with its credentials and policies. Exactly one per surface. Its endpoint is set with `--target-endpoint` or in the surface document. |
 | **Transit point** | An outbound route the managed agent uses to reach an external destination, known on its surface by an alias. Added with `surfaces add-transit-point`. |
@@ -41,15 +42,15 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 | **Placement** | Where on a surface a feature is set: an edge, a direction, and, for a transit point, its alias. The CLI works it out from the feature name unless the feature can go in more than one place. |
 | **Edge** | The leg of a surface's traffic a placement applies to: `ap-ma` (access point to managed agent), `ma-external` (managed agent to external destinations, surface-wide), or `ma-tp` (managed agent to a transit point, and the target leg of trust-check). |
 | **Tool gate** | A rule in a surface's MCP tool gating that allows or denies tools by pattern. `surfaces tool-gate-preview` evaluates gates on this machine before they are saved. |
-| **Path syntax** | The dot-separated field paths `surfaces update` takes with `--set`, `--unset`, `--add`, and `--remove`, such as `access_point.rate_limit.requests`, with square brackets to pick one gate or transit point. |
-| **Dry run** | `--dry-run` on surface edits: the change is checked on this machine and by the gateway, and the result is shown without saving. |
+| **Path syntax** | The dot-separated field paths `surfaces update` takes with `--set`, `--unset`, `--add`, and `--remove`, such as `access_point.rate_limit.requests`. On Agent Gateway, square brackets pick one gate or transit point; Agent Stream paths take no brackets. |
+| **Dry run** | `--dry-run` on surface edits: the change is checked and the result is shown without saving. Agent Gateway checks it on this machine and on the gateway. Agent Stream has no dry run of its own, so `fabric agent-stream surfaces` checks it on this machine only. |
 
 ## Output
 
 | Term | Meaning |
 | --- | --- |
-| **Table output** | The default output: one table for a list, one line for a create, update, or delete (`surfaces create` adds a short summary), and formatted JSON for a single record. |
-| **JSON output** | `--output json`: what the gateway returned, with masked values still masked, for scripts. |
+| **Table output** | The default output: one table for a list, one line for a create, update, or delete, and formatted JSON for a single record. Agent Gateway's `surfaces create` adds a short summary, and Agent Stream's `surfaces update` lists each changed field with its old and new value above its line. |
+| **JSON output** | `--output json`: what the gateway returned, with masked values still masked, for scripts. Agent Stream's `surfaces create --dry-run` and `surfaces update --dry-run` print a preview the CLI builds, `{dry_run, changes, after}`, and send nothing, and `surfaces update` prints the surface read back after the save. |
 | **Masked value** | A secret value, private key, or similar field the CLI hides in output unless `--reveal` is passed. A masked document must not be sent back, and the CLI refuses one that is. |
 | **Redaction** | Replacing credentials and personal data with `[redacted]`: always in error messages, and in audit and payment records unless `--reveal` is passed, so output can be logged safely. |
 
