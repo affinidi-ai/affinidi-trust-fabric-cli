@@ -610,6 +610,29 @@ fn settings_reset_without_force_and_with_a_typed_host_sends_nothing() {
 
 #[cfg(feature = "agent-stream")]
 #[test]
+fn metrics_and_logs_truncate_without_yes_and_with_a_typed_host_send_nothing() {
+    for (group, refusal) in [
+        ("metrics", "pass --yes to confirm truncating stored metrics; this cannot be undone"),
+        ("logs", "pass --yes to confirm deleting every rotated log file; this cannot be undone"),
+    ] {
+        let (host, requests) = agent_stream_host();
+
+        let output = fabric_in_fresh_home(
+            &["agent-stream", "--host", &host, group, "truncate"],
+            &[],
+            &[("FABRIC_TOKEN", SESSION_TOKEN)],
+            "",
+        );
+
+        let text = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{group}: {text}");
+        assert!(text.contains(refusal), "{group}: {text}");
+        assert!(request_lines(&requests).is_empty(), "{group}: {:?}", request_lines(&requests));
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
 fn users_update_and_delete_of_the_reserved_integrations_route_with_a_typed_host_send_nothing() {
     for (verb, extra, refusal) in [
         (
@@ -673,10 +696,7 @@ fn identities_get_hides_a_key_pair_with_a_note_that_names_no_flag() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!stdout(&output).contains("private-scalar"), "{}", stdout(&output));
-    assert_eq!(
-        stderr_beyond_the_environment_note(&output),
-        "note: hid 'key_pair', which carries this identity's private key.\n"
-    );
+    assert_eq!(stderr_beyond_the_environment_note(&output), "note: hid 'key_pair'.\n");
 }
 
 #[cfg(feature = "agent-stream")]

@@ -483,19 +483,21 @@ async fn run_command(
 /// Fails for a shared command that is refused before the host is asked which
 /// product it is, so a refused command sends nothing at all: an API key
 /// revoke, rotate, or delete that would ask for a confirmation nobody can
-/// give, a `settings reset` without --force, and a `users update` or `users
-/// delete` naming the reserved `integrations` route.
+/// give, a `settings reset` without --force, a `users update` or `users
+/// delete` naming the reserved `integrations` route, and a `metrics truncate`
+/// or `logs truncate` without --yes. Only refusals that need neither the host
+/// nor a file belong here; the ones that do are checked as the command runs.
 fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
     match command {
         SharedCommand::ApiKeys(command) => command.refuse_without_terminal(),
         SharedCommand::Settings(command) => command.refuse_unforced_reset(Product::AgentStream),
         SharedCommand::Users(command) => command.refuse_reserved_route(Product::AgentStream),
+        SharedCommand::Metrics(command) => command.refuse_unconfirmed_truncate(),
+        SharedCommand::Logs(command) => command.refuse_unconfirmed_truncate(),
         SharedCommand::Secrets { .. }
         | SharedCommand::Identities(_)
         | SharedCommand::Policies(_)
-        | SharedCommand::Audit(_)
-        | SharedCommand::Metrics(_)
-        | SharedCommand::Logs(_) => Ok(()),
+        | SharedCommand::Audit(_) => Ok(()),
     }
 }
 

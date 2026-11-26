@@ -11753,11 +11753,12 @@ async fn run_users(
 }
 
 /// Rejects `integrations` as the user id of an update. On Agent Stream,
-/// `/v1/users/integrations` is a static route that answers PUT by replacing
-/// the whole user-integration configuration, whose only field is defaulted, so
-/// any document sent there, a user record or `{}`, would clear every
-/// assignment and report success. Agent Gateway keeps the refusal it had
-/// before. The refusal names the `api` command of `product`.
+/// `/v1/users/integrations` is a separate route that answers PUT by replacing
+/// the whole user-integration configuration, so any document sent there, a
+/// user record or `{}`, would clear every assignment and report success.
+/// Agent Gateway had the same route until v1.0.1 removed it, and its refusal
+/// is left as it was on purpose. The refusal names the `api` command of
+/// `product`.
 fn reject_reserved_user_route(
     product: Product,
     user_id: &str,
@@ -11792,10 +11793,10 @@ impl UserCommand {
 }
 
 /// Rejects `integrations` as the user id of a delete on Agent Stream, where
-/// `/v1/users/integrations` is the static user-integrations route rather than
-/// a user. That route answers only GET and PUT, so a DELETE there could never
-/// remove a user. Agent Gateway has no such route, so its delete is sent as
-/// typed.
+/// `/v1/users/integrations` is the user-integrations route rather than a
+/// user. That route answers only GET and PUT, so a DELETE there could never
+/// remove a user. On Agent Gateway the delete is left as it was on purpose
+/// and is sent as typed.
 fn reject_reserved_user_delete(
     product: Product,
     user_id: &str,
@@ -12005,15 +12006,16 @@ fn trust_policy_body(
 }
 
 /// The note `identities get` prints on standard error once it has removed an
-/// identity's `key_pair`. Only Agent Gateway's `identities get` has --reveal;
-/// Agent Stream's has none, because Agent Stream never sends the private key,
-/// so its note names no flag.
+/// identity's `key_pair`. Agent Gateway sends the private key there, so its
+/// note says so and names --reveal. Agent Stream's `identities get` has no
+/// --reveal and sends the public key only, so its note only says the field was
+/// hidden.
 fn hidden_key_pair_note(product: Product) -> &'static str {
     match product {
         Product::AgentGateway => {
             "note: hid 'key_pair', which carries this identity's private key. Pass --reveal to include it."
         }
-        Product::AgentStream => "note: hid 'key_pair', which carries this identity's private key.",
+        Product::AgentStream => "note: hid 'key_pair'.",
     }
 }
 
@@ -12709,10 +12711,7 @@ mod identity_access_tests {
             hidden_key_pair_note(Product::AgentGateway),
             "note: hid 'key_pair', which carries this identity's private key. Pass --reveal to include it."
         );
-        assert_eq!(
-            hidden_key_pair_note(Product::AgentStream),
-            "note: hid 'key_pair', which carries this identity's private key."
-        );
+        assert_eq!(hidden_key_pair_note(Product::AgentStream), "note: hid 'key_pair'.");
     }
 
     #[test]
@@ -16059,11 +16058,31 @@ fn sort_payments_newest_first(rows: &mut [Value]) {
     });
 }
 
+impl MetricsCommand {
+    /// Fails for a `truncate` without --yes, which has no prompt to fall back
+    /// on. `run_metrics` checks it on both products, and an Agent Stream
+    /// command also checks it before the host is asked which product it is, so
+    /// a refused truncate sends nothing at all there.
+    pub(crate) fn refuse_unconfirmed_truncate(&self) -> Result<()> {
+        match self {
+            Self::Truncate { yes: false } => {
+                bail!("pass --yes to confirm truncating stored metrics; this cannot be undone")
+            }
+            Self::Config { .. }
+            | Self::Status
+            | Self::Scrape(_)
+            | Self::TestEndpoint { .. }
+            | Self::Truncate { yes: true } => Ok(()),
+        }
+    }
+}
+
 async fn run_metrics(
     client: &GatewayClient,
     command: MetricsCommand,
     output: Output,
 ) -> Result<()> {
+    command.refuse_unconfirmed_truncate()?;
     match command {
         MetricsCommand::Config {
             command: MetricsConfigCommand::Show,
@@ -16084,10 +16103,7 @@ async fn run_metrics(
         }
         MetricsCommand::Scrape(args) => scrape_metrics(client, args).await,
         MetricsCommand::TestEndpoint { url } => test_metrics_endpoint(client, &url, output).await,
-        MetricsCommand::Truncate { yes } => {
-            if !yes {
-                bail!("pass --yes to confirm truncating stored metrics; this cannot be undone");
-            }
+        MetricsCommand::Truncate { .. } => {
             let value = client
                 .request(Method::POST, "/v1/metrics/truncate", None)
                 .await?;
@@ -16276,11 +16292,27 @@ async fn test_metrics_endpoint(
     print_value(&value, output)
 }
 
+impl LogsCommand {
+    /// Fails for a `truncate` without --yes, which has no prompt to fall back
+    /// on. `run_logs` checks it on both products, and an Agent Stream command
+    /// also checks it before the host is asked which product it is, so a
+    /// refused truncate sends nothing at all there.
+    pub(crate) fn refuse_unconfirmed_truncate(&self) -> Result<()> {
+        match self {
+            Self::Truncate { yes: false } => {
+                bail!("pass --yes to confirm deleting every rotated log file; this cannot be undone")
+            }
+            Self::Download { .. } | Self::Truncate { yes: true } => Ok(()),
+        }
+    }
+}
+
 async fn run_logs(
     client: &GatewayClient,
     command: LogsCommand,
     output: Output,
 ) -> Result<()> {
+    command.refuse_unconfirmed_truncate()?;
     match command {
         LogsCommand::Download { output_file } => {
             let (status, body) = client
@@ -16291,10 +16323,7 @@ async fn run_logs(
             }
             write_response_body(&output_file, &body)
         }
-        LogsCommand::Truncate { yes } => {
-            if !yes {
-                bail!("pass --yes to confirm deleting every rotated log file; this cannot be undone");
-            }
+        LogsCommand::Truncate { .. } => {
             let value = client
                 .request(Method::POST, "/v1/logs/truncate", None)
                 .await?;
