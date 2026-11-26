@@ -514,6 +514,7 @@ mkdir -p "${sign_bin_dir}"
 sign_args=(--bin-dir "${sign_bin_dir}" --notary-dir "${work_dir}/notary")
 run_sign_macos() {
   (
+    # shellcheck disable=SC2030 # the subshell keeps this PATH to itself on purpose.
     export PATH="${testdata}/linux-bin:${PATH}"
     export CLI_MACOS_TEAM_ID=ABCDE12345
     export APPLE_SIGNING_IDENTITY="Developer ID Application: Example Ltd (ABCDE12345)"
