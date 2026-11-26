@@ -58,7 +58,7 @@ When a release is due, the release bot sets the new version in `Cargo.toml` and 
 
 Never edit `CHANGELOG.md`, the version in `Cargo.toml`, or the `v*` tags by hand. The first run of the workflow, before any `v*` tag exists, tags the version already in `Cargo.toml` (`v0.1.0`) at the commit that added its `CHANGELOG.md` section, then releases anything merged after it in the same run.
 
-If `main` has moved on by the time the checks pass on a commit, that run releases nothing, and the newer commit releases both once its own checks pass. To retry a failed release, run the `version` workflow by hand on `main`. If the release commit `chore: release vX.Y.Z` reached `main` but its tag didn't, that run first tags the release commit, so the version isn't made twice.
+If `main` has moved on by the time the checks pass on a commit, that run releases nothing, and the newer commit releases both once its own checks pass. To retry a failed release, run the `version` workflow by hand on `main`. A run by hand releases only when the newest `checks` run of the push of `main`'s commit passed, because `main` doesn't need the checks to pass before a merge. If they failed, are still running, or never ran, it stops with an error that says which. Fix `main`, or re-run that push's checks, which also makes the audit use today's advisories when the merge was days ago; a run by hand reads only the checks of that push, not the daily run. `version` starts by itself when a `checks` run on `main` completes, so once they pass the release follows by itself; run `version` by hand only if it doesn't start. If the release commit `chore: release vX.Y.Z` reached `main` but its tag didn't, that run first tags the release commit, so the version isn't made twice.
 
 The one failure a re-run can't fix is a missing git note. semantic-release pushes `refs/notes/semantic-release-vX.Y.Z` last, after the release commit and the tag, and the `version` workflow pushes it again up to three times if GitHub refuses it. If every push fails, the run fails with `vX.Y.Z is released ..., but refs/notes/semantic-release-vX.Y.Z could not be pushed`. The release itself is out, and a re-run finds nothing to release and never pushes the note. Add it from a checkout with write access:
 
@@ -73,7 +73,7 @@ git push origin refs/notes/semantic-release-vX.Y.Z
 A repository admin sets these up once, before the release bot's secrets are added. Until both secrets are set, the `version` workflow passes with a notice and releases nothing.
 
 1. A `main` environment that only `main` can deploy to, holding the release bot app's ID as `RELEASE_BOT_APP_ID` and its private key as `RELEASE_BOT_PRIVATE_KEY`, both as secrets. If it doesn't exist yet, the first run of the `version` workflow creates it with no branch limit, so set it up first.
-2. The release bot app as a bypass actor on the `release-tags` tag ruleset, so it can push `v*` tags.
+2. The release bot app as a bypass actor on the `tags_managed` tag ruleset, so it can push `v*` tags.
 3. Rebase merging and merge commits turned off, so squash merging is the only merge method.
 4. A `macos-release` environment that only `v*` tags can deploy to, holding the secrets in [macOS signing](#macos-signing). If it doesn't exist yet, the first `v*` tag creates it with no tag limit, so set it up first.
 5. Immutable releases left off, because the macOS archives and their `SHA256SUMS` lines are added after the release is published.

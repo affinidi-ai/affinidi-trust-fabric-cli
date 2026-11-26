@@ -6,9 +6,11 @@ name: version
 # to main through the GitHub API, which signs it, with the new version in
 # Cargo.toml and Cargo.lock and the notes in CHANGELOG.md. It then pushes the
 # tag `v<version>` on that commit, which starts the release workflow. See
-# scripts/release.sh. Run it by hand to retry a failed release, except when
-# only the release's git note is missing; CONTRIBUTING.md under Releasing has
-# the command for that.
+# scripts/release.sh. Run it by hand on main to retry a failed release, except
+# when only the release's git note is missing; CONTRIBUTING.md under Releasing
+# has the command for that. A run by hand first runs the checks-passed job,
+# and releases only when the checks passed on a push of main's commit, see
+# scripts/checks-passed.sh.
 on:
   workflow_run:
     workflows:
@@ -19,7 +21,9 @@ on:
       - main
   workflow_dispatch:
 
-# The job token can only read. Every write goes through the release bot's token.
+# Job tokens can only read the code unless a job asks for more. Only the
+# checks-passed job also reads workflow runs. Every write goes through the
+# release bot's token.
 permissions:
   contents: read
 
@@ -30,18 +34,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # main doesn't need the checks to pass before a merge, so a run by hand on
+  # main first checks that the newest checks run of the push of this commit to
+  # main passed. This job alone can read every workflow's runs, logs, and
+  # artifacts, and it stays outside the main environment, so it never sees the
+  # release bot's secrets. On a workflow_run it is skipped.
+  checks-passed:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # Only scripts/checks-passed.sh is needed from the checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check the checks passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/checks-passed.sh "${GITHUB_SHA}"
+
   release:
-    # Only checks that passed on a push to main in this repository count. The
-    # bot's own release commit starts the checks again and is skipped here;
-    # only a commit pushed by a bot is skipped, so a pull request title that
-    # looks like one still runs. A run by hand must be on main.
+    needs: checks-passed
+    # A run by hand releases only on main and only when the checks-passed job
+    # passed. Otherwise only checks that passed on a push to main in this
+    # repository count. The bot's own release commit starts the checks again
+    # and is skipped here; only a commit pushed by a bot is skipped, so a pull
+    # request title that looks like one still runs. `!cancelled()` keeps this
+    # job from being skipped along with checks-passed on a workflow_run, and
+    # this job's token can only read the code.
     if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      !cancelled() && (
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+      needs.checks-passed.result == 'success') ||
       (github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       !(startsWith(github.event.workflow_run.head_commit.message, 'chore: release v') &&
-      github.event.workflow_run.actor.type == 'Bot'))
+      github.event.workflow_run.actor.type == 'Bot')))
     runs-on: ubuntu-24.04
     # The release bot's secrets live in this environment, which only main can
     # use, so a workflow on another branch can't get the bot's token.
