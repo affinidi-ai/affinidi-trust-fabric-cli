@@ -5,13 +5,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, MetricsFileArgs, Output, SharedCommand, run_shared},
-};
+use crate::commands::{self, MetricsFileArgs};
 
 #[derive(Debug, Subcommand)]
 pub enum MetricsCommand {
@@ -24,7 +20,9 @@ pub enum MetricsCommand {
     ///
     /// When Agent Stream has Prometheus authentication on, pass --username and
     /// --password; they are sent as HTTP Basic credentials instead of the
-    /// bearer token.
+    /// bearer token. The CLI reads the same FABRIC_METRICS_USERNAME and
+    /// FABRIC_METRICS_PASSWORD for every product, so a password exported for
+    /// another appliance is sent to this Agent Stream too.
     ///
     /// On standard output, control characters are removed from the
     /// exposition; a file named with --output-file gets it exactly as sent.
@@ -130,15 +128,6 @@ pub struct MetricsScrapeArgs {
     output_file: PathBuf,
 }
 
-/// Runs one `metrics` command on the Agent Stream behind `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: MetricsCommand,
-    output: Output,
-) -> Result<()> {
-    run_shared(client, SharedCommand::Metrics(command.into()), output).await
-}
-
 impl From<MetricsCommand> for commands::MetricsCommand {
     fn from(command: MetricsCommand) -> Self {
         match command {
@@ -170,7 +159,8 @@ mod tests {
     use super::*;
     use crate::{
         agent_stream::test_support::{scripted_agent_stream, start_lines},
-        commands::Cli,
+        client::GatewayClient,
+        commands::{Cli, Output, SharedCommand, run_shared},
     };
 
     const TOKEN: &str = "aspat_test";
@@ -223,7 +213,7 @@ mod tests {
             },
             MetricsCommand::Truncate { yes: true },
         ] {
-            run(&client, command, Output::Json)
+            run_shared(&client, SharedCommand::Metrics(command.into()), Output::Json)
                 .await
                 .expect("the command succeeds");
         }
@@ -257,10 +247,10 @@ mod tests {
             })
         };
 
-        let anonymous = run(&client, scrape(None), Output::Json)
+        let anonymous = run_shared(&client, SharedCommand::Metrics(scrape(None).into()), Output::Json)
             .await
             .expect_err("credentials are needed");
-        let named = run(&client, scrape(Some("prom")), Output::Json)
+        let named = run_shared(&client, SharedCommand::Metrics(scrape(Some("prom")).into()), Output::Json)
             .await
             .expect_err("the credentials are wrong");
 
@@ -283,14 +273,17 @@ mod tests {
         let document = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(document.path(), r#"{"opentelemetry":{"enabled":true}}"#).expect("write the document");
 
-        let error = run(
+        let error = run_shared(
             &client(host),
-            MetricsCommand::Config {
-                command: MetricsConfigCommand::Set(MetricsFileArgs {
-                    file: document.path().to_path_buf(),
-                    force: false,
-                }),
-            },
+            SharedCommand::Metrics(
+                MetricsCommand::Config {
+                    command: MetricsConfigCommand::Set(MetricsFileArgs {
+                        file: document.path().to_path_buf(),
+                        force: false,
+                    }),
+                }
+                .into(),
+            ),
             Output::Json,
         )
         .await
@@ -327,7 +320,7 @@ mod tests {
     ) -> (String, String) {
         let (host, requests) = scripted_agent_stream(vec![("GET /api/v1/metrics/prometheus", status_line, body)]).await;
 
-        let error = run(&client(host), basic_scrape(), Output::Json)
+        let error = run_shared(&client(host), SharedCommand::Metrics(basic_scrape().into()), Output::Json)
             .await
             .expect_err("the scrape fails");
 

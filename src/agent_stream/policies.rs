@@ -3,13 +3,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, Output, SharedCommand, run_shared},
-};
+use crate::commands::{self};
 
 #[derive(Debug, Subcommand)]
 pub enum PolicyCommand {
@@ -119,15 +115,6 @@ const CREATE_EXAMPLES: &str = r#"Examples:
   See what uses it before changing or deleting it:
     fabric agent-stream policies impact block-pii"#;
 
-/// Runs one `policies` command on the Agent Stream behind `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: PolicyCommand,
-    output: Output,
-) -> Result<()> {
-    run_shared(client, SharedCommand::Policies(command.into()), output).await
-}
-
 impl From<PolicyType> for commands::PolicyType {
     fn from(policy_type: PolicyType) -> Self {
         match policy_type {
@@ -171,7 +158,8 @@ mod tests {
     use super::*;
     use crate::{
         agent_stream::test_support::{scripted_agent_stream, start_lines},
-        commands::Cli,
+        client::GatewayClient,
+        commands::{Cli, Output, SharedCommand, run_shared},
     };
 
     const TOKEN: &str = "aspat_test";
@@ -215,15 +203,18 @@ mod tests {
             scripted_agent_stream(vec![("POST /api/v1/policy-definitions", "HTTP/1.1 201 Created", r#"{"id":"p-1"}"#)])
                 .await;
 
-        run(
+        run_shared(
             &client(host),
-            PolicyCommand::Create {
-                id: "p-1".to_owned(),
-                name: "Block PII".to_owned(),
-                description: String::new(),
-                policy_type: PolicyType::Llm,
-                policy_file: rego.path().to_path_buf(),
-            },
+            SharedCommand::Policies(
+                PolicyCommand::Create {
+                    id: "p-1".to_owned(),
+                    name: "Block PII".to_owned(),
+                    description: String::new(),
+                    policy_type: PolicyType::Llm,
+                    policy_file: rego.path().to_path_buf(),
+                }
+                .into(),
+            ),
             Output::Json,
         )
         .await
@@ -269,7 +260,7 @@ mod tests {
             PolicyCommand::Impact { policy_id: id() },
             PolicyCommand::Delete { policy_id: id() },
         ] {
-            run(&client, command, Output::Json)
+            run_shared(&client, SharedCommand::Policies(command.into()), Output::Json)
                 .await
                 .expect("the command succeeds");
         }

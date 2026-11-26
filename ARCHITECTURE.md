@@ -489,7 +489,7 @@ Every file in [`src/`](src/) and what it owns.
 | Change login | `login_and_save` and `acquire_login_token` in `commands.rs`, `browser_login.rs` |
 | Change where connections or tokens are stored | `config.rs`, `credentials.rs` |
 | Add an Agent Stream command group | A new file under `src/agent_stream/`, declared in its `mod.rs` |
-| Change a group Agent Stream shares with Agent Gateway | The group's file under `src/agent_stream/` for its help and its mapping onto the shared enum, then the shared `run_*` function in `commands.rs`, reached through `SharedCommand` and `run_shared`. A refusal that must send nothing goes in the group's arm of `run_command` in `agent_stream/mod.rs`, before `connect` |
+| Change a group Agent Stream shares with Agent Gateway | The group's file under `src/agent_stream/` for its help and its mapping onto the shared enum, then the shared `run_*` function in `commands.rs`, reached through `SharedCommand` and `run_shared`. A refusal that must send nothing goes in `refuse_before_connecting` in `agent_stream/mod.rs`, which `run_command` calls before `connect` |
 | Add a surface feature | `FEATURES` in `features.rs` |
 | Change the `surfaces update` path syntax | `surface_patch.rs` |
 | Look a resource up by name | `Lookup`, `resolve_id`, and `resolve_surface_id` in `commands.rs` |

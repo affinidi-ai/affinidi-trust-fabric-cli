@@ -3,13 +3,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, ApiKeyCreateArgs, ApiKeySurfaceArgs, Output, SharedCommand, parse_label, run_shared},
-};
+use crate::commands::{self, ApiKeyCreateArgs, ApiKeySurfaceArgs, parse_label};
 
 #[derive(Debug, Subcommand)]
 pub enum ApiKeyCommand {
@@ -167,17 +163,6 @@ const DELETE_EXAMPLES: &str = r#"Examples:
   Name the key's Surface to skip the lookup:
     fabric agent-stream api-keys delete <key-id> --agent-id <surface-id> --yes"#;
 
-/// Runs one `api-keys` command, already turned into the shared form so the
-/// caller could refuse an unconfirmable one first, on the Agent Stream behind
-/// `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: commands::ApiKeyCommand,
-    output: Output,
-) -> Result<()> {
-    run_shared(client, SharedCommand::ApiKeys(command), output).await
-}
-
 impl From<SurfaceArgs> for ApiKeySurfaceArgs {
     fn from(SurfaceArgs { agent_id }: SurfaceArgs) -> Self {
         Self { agent_id }
@@ -222,7 +207,11 @@ impl From<ApiKeyCommand> for commands::ApiKeyCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_stream::test_support::{Route, scripted_agent_stream, start_lines};
+    use crate::{
+        agent_stream::test_support::{Route, scripted_agent_stream, start_lines},
+        client::GatewayClient,
+        commands::{Output, SharedCommand, run_shared},
+    };
 
     const TOKEN: &str = "aspat_test";
     const KEY_COLLECTION: Route = (
@@ -289,7 +278,7 @@ mod tests {
                 yes: true,
             },
         ] {
-            run(&client, command.into(), Output::Json)
+            run_shared(&client, SharedCommand::ApiKeys(command.into()), Output::Json)
                 .await
                 .expect("the command succeeds");
         }
@@ -324,15 +313,17 @@ mod tests {
         )])
         .await;
 
-        run(
+        run_shared(
             &client(host),
-            ApiKeyCommand::Create(CreateArgs {
-                agent_id: "pipe-1".to_owned(),
-                client_id: None,
-                labels: Vec::new(),
-                file: Some(file.path().to_path_buf()),
-            })
-            .into(),
+            SharedCommand::ApiKeys(
+                ApiKeyCommand::Create(CreateArgs {
+                    agent_id: "pipe-1".to_owned(),
+                    client_id: None,
+                    labels: Vec::new(),
+                    file: Some(file.path().to_path_buf()),
+                })
+                .into(),
+            ),
             Output::Json,
         )
         .await
@@ -347,10 +338,10 @@ mod tests {
         let (host, _) = scripted_agent_stream(vec![KEY_COLLECTION]).await;
         let client = client(host);
 
-        let missing = run(&client, by_key_id("ak_7").into(), Output::Json)
+        let missing = run_shared(&client, SharedCommand::ApiKeys(by_key_id("ak_7").into()), Output::Json)
             .await
             .expect_err("no Surface carries the key");
-        let collision = run(&client, by_key_id("ak_2").into(), Output::Json)
+        let collision = run_shared(&client, SharedCommand::ApiKeys(by_key_id("ak_2").into()), Output::Json)
             .await
             .expect_err("two Surfaces carry the key");
 
@@ -365,9 +356,10 @@ mod tests {
     async fn the_key_lookup_messages_show_a_typed_key_id_without_its_terminal_controls() {
         let (host, _) = scripted_agent_stream(vec![KEY_COLLECTION]).await;
 
-        let missing = run(&client(host), by_key_id("ak_\u{1b}[2J7").into(), Output::Json)
-            .await
-            .expect_err("no Surface carries the key");
+        let missing =
+            run_shared(&client(host), SharedCommand::ApiKeys(by_key_id("ak_\u{1b}[2J7").into()), Output::Json)
+                .await
+                .expect_err("no Surface carries the key");
 
         assert!(
             !missing
@@ -381,7 +373,7 @@ mod tests {
     async fn a_key_collection_that_is_not_a_list_names_agent_stream() {
         let (host, _) = scripted_agent_stream(vec![("GET /api/v1/api-keys", "HTTP/1.1 200 OK", "{}")]).await;
 
-        let not_a_list = run(&client(host), by_key_id("ak_1").into(), Output::Json)
+        let not_a_list = run_shared(&client(host), SharedCommand::ApiKeys(by_key_id("ak_1").into()), Output::Json)
             .await
             .expect_err("the collection is not a list");
 

@@ -1,13 +1,9 @@
 //! `fabric agent-stream audit`: the audit log of an Agent Stream, read
 //! through the audit command Agent Gateway uses.
 
-use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, Output, SharedCommand, run_shared},
-};
+use crate::commands::{self};
 
 #[derive(Debug, Subcommand)]
 pub enum AuditCommand {
@@ -122,15 +118,6 @@ pub enum AuditDecision {
     MissingEngine,
 }
 
-/// Runs one `audit` command on the Agent Stream behind `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: AuditCommand,
-    output: Output,
-) -> Result<()> {
-    run_shared(client, SharedCommand::Audit(command.into()), output).await
-}
-
 impl From<AuditFlow> for commands::AuditFlow {
     fn from(flow: AuditFlow) -> Self {
         match flow {
@@ -187,7 +174,8 @@ mod tests {
     use super::*;
     use crate::{
         agent_stream::test_support::{scripted_agent_stream, start_lines},
-        commands::Cli,
+        client::GatewayClient,
+        commands::{Cli, Output, SharedCommand, run_shared},
     };
 
     const TOKEN: &str = "aspat_test";
@@ -272,9 +260,12 @@ mod tests {
         )])
         .await;
 
-        run(
+        run_shared(
             &GatewayClient::for_agent_stream(host, TOKEN).expect("client"),
-            AuditCommand::List(list(&["--flow", "fabric", "--scope", "pipe", "--decision", "missing_engine"])),
+            SharedCommand::Audit(
+                AuditCommand::List(list(&["--flow", "fabric", "--scope", "pipe", "--decision", "missing_engine"]))
+                    .into(),
+            ),
             Output::Json,
         )
         .await
@@ -302,9 +293,13 @@ mod tests {
         let client = GatewayClient::for_agent_stream(host, TOKEN).expect("client");
 
         for (scope, _) in SCOPES {
-            run(&client, AuditCommand::List(list(&["--scope", scope])), Output::Json)
-                .await
-                .unwrap_or_else(|error| panic!("{scope}: {error:#}"));
+            run_shared(
+                &client,
+                SharedCommand::Audit(AuditCommand::List(list(&["--scope", scope])).into()),
+                Output::Json,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{scope}: {error:#}"));
         }
 
         assert_eq!(

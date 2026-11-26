@@ -48,10 +48,12 @@ every place on this list that applies to a command that changes a surface: all b
 - `secrets`, `users`, `identities`, `api-keys`, `policies`, `settings`, `audit`,
   `metrics`, and `logs` also run on Agent Stream, through their own enums in
   [`src/agent_stream/`](../../src/agent_stream/), which a `From` maps onto the Agent
-  Gateway enums. The compiler does not point at them, so a new Agent Gateway command in
-  one of these groups leaves Agent Stream silently without it.
+  Gateway enums. The compiler does not point at them, but
+  `each_shared_group_has_every_agent_gateway_subcommand_or_leaves_it_out_on_purpose` in
+  `agent_stream/mod.rs` fails for a new Agent Gateway subcommand in one of these groups.
   When Agent Stream has the route, add the variant to the Agent Stream enum and its
-  `From` too, with help that names Agent Stream. Any message the shared code prints at
+  `From` too, with help that names Agent Stream. When it has none, add the subcommand to
+  `LEFT_OUT_OF_AGENT_STREAM` in that test, as `metrics status` is. Any message the shared code prints at
   run time names the product through `client.product()` (`message_name`,
   `message_subject`, `command`, `surface_noun`), never a literal `gateway` or `fabric
   agent-gateway`.

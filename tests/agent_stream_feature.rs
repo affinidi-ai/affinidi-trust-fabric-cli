@@ -24,7 +24,7 @@ use fresh_home::fabric_in_fresh_home;
 #[cfg(feature = "agent-stream")]
 use fresh_home::fabric_in_home;
 #[cfg(feature = "agent-stream")]
-use recording_host::{PROBE_REQUEST, Requests, host_answering, request_lines, request_lowercase};
+use recording_host::{PROBE_REQUEST, Reply, Requests, host_answering, host_replying, request_lines, request_lowercase};
 
 /// Exit status clap uses for a command line it cannot parse.
 #[cfg(not(feature = "agent-stream"))]
@@ -274,78 +274,36 @@ const STREAM_TOKEN: &str = "aspat_feature-test";
 const STORED_SECRET: &str =
     r#"{"id":"s-1","secret_id":"stripe-live","name":"Stripe live","value":"sk_live_do_not_print"}"#;
 
-/// Starts an Agent Stream stand-in that answers each `(method and path,
-/// status, body)` reply, matched on the request line, until the test ends, and
-/// `404 Not Found` to anything else. It also answers the public permission
-/// list the CLI reads to confirm the host is an Agent Stream, unless a reply
-/// for that route is given. It records nothing, unlike the unit-test
-/// `scripted_agent_stream`. Returns its address.
+/// Starts an Agent Stream stand-in that answers each of `replies`, matched on
+/// the request line, and `404 Not Found` to anything else, until the test
+/// ends. It also answers the public permission list the CLI reads to confirm
+/// the host is an Agent Stream, unless `replies` answers that route. Returns
+/// its address and every request it received.
 #[cfg(feature = "agent-stream")]
-fn agent_stream_stand_in(replies: Vec<(&'static str, &'static str, &'static str)>) -> String {
-    use std::{
-        io::{Read, Write},
-        net::TcpListener,
-    };
+fn agent_stream_stand_in(mut replies: Vec<Reply>) -> (String, Requests) {
+    replies.push(("GET /api/v1/permissions/public", "200 OK", AGENT_STREAM_PERMISSIONS));
+    host_replying(replies, ("404 Not Found", ""))
+}
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = listener
-        .local_addr()
-        .expect("address");
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let read = stream
-                    .read(&mut chunk)
-                    .unwrap_or(0);
-                request.extend_from_slice(&chunk[..read]);
-                let text = String::from_utf8_lossy(&request);
-                let complete = text
-                    .split_once("\r\n\r\n")
-                    .is_some_and(|(head, body)| {
-                        let length = head
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| {
-                                        value
-                                            .trim()
-                                            .parse::<usize>()
-                                            .ok()
-                                    })
-                                    .flatten()
-                            })
-                            .unwrap_or(0);
-                        body.len() >= length
-                    });
-                if read == 0 || complete {
-                    break;
-                }
-            }
-            let text = String::from_utf8_lossy(&request).into_owned();
-            let (status, body) = replies
-                .iter()
-                .find(|(start, _, _)| text.starts_with(&format!("{start} ")))
-                .map_or_else(
-                    || {
-                        if text.starts_with("GET /api/v1/permissions/public ") {
-                            ("200 OK", r#"{"pipes.view":false}"#)
-                        } else {
-                            ("404 Not Found", "")
-                        }
-                    },
-                    |(_, status, body)| (*status, *body),
-                );
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    format!("http://{address}")
+/// The JSON body of the one request in `requests` whose request line starts
+/// with `start`, such as `POST /api/v1/api-keys/pipe-1`.
+#[cfg(feature = "agent-stream")]
+fn sent_body(
+    requests: &Requests,
+    start: &str,
+) -> serde_json::Value {
+    let requests = requests
+        .lock()
+        .expect("recorded requests");
+    let sent: Vec<&String> = requests
+        .iter()
+        .filter(|request| request.starts_with(&format!("{start} ")))
+        .collect();
+    assert_eq!(sent.len(), 1, "{start}: {requests:?}");
+    let (_, body) = sent[0]
+        .split_once("\r\n\r\n")
+        .expect("a request head");
+    serde_json::from_str(body).unwrap_or_else(|error| panic!("{start}: {error}: {body}"))
 }
 
 /// Runs `fabric agent-stream <args>` against the Agent Stream at `host`, with
@@ -367,7 +325,7 @@ fn fabric_on_stream(
 #[cfg(feature = "agent-stream")]
 #[test]
 fn secrets_get_create_and_update_hide_the_value_agent_stream_sends_unless_reveal_is_given() {
-    let host = agent_stream_stand_in(vec![
+    let (host, _) = agent_stream_stand_in(vec![
         ("GET /api/v1/secrets/s-1", "200 OK", STORED_SECRET),
         ("POST /api/v1/secrets/new", "201 Created", STORED_SECRET),
         ("PUT /api/v1/secrets/s-1", "200 OK", STORED_SECRET),
@@ -410,7 +368,7 @@ fn secrets_get_create_and_update_hide_the_value_agent_stream_sends_unless_reveal
 #[cfg(feature = "agent-stream")]
 #[test]
 fn secrets_update_and_delete_print_the_same_lines_as_on_agent_gateway() {
-    let host = agent_stream_stand_in(vec![
+    let (host, _) = agent_stream_stand_in(vec![
         ("PUT /api/v1/secrets/s-1", "200 OK", STORED_SECRET),
         ("DELETE /api/v1/secrets/s-1", "204 No Content", ""),
         ("GET /api/v1/secrets", "200 OK", r#"[{"id":"s-1","secret_id":"stripe-live","name":"Stripe live"}]"#),
@@ -426,7 +384,7 @@ fn secrets_update_and_delete_print_the_same_lines_as_on_agent_gateway() {
 #[cfg(feature = "agent-stream")]
 #[test]
 fn users_delete_says_whether_agent_stream_removed_or_kept_the_user() {
-    let host = agent_stream_stand_in(vec![
+    let (host, _) = agent_stream_stand_in(vec![
         ("DELETE /api/v1/users/u-removed", "200 OK", r#"{"outcome":"removed"}"#),
         ("DELETE /api/v1/users/u-kept", "200 OK", r#"{"outcome":"disabled"}"#),
     ]);
@@ -454,7 +412,7 @@ fn users_delete_says_whether_agent_stream_removed_or_kept_the_user() {
 #[cfg(feature = "agent-stream")]
 #[test]
 fn the_shared_lists_print_the_agent_gateway_tables() {
-    let host = agent_stream_stand_in(vec![
+    let (host, _) = agent_stream_stand_in(vec![
         (
             "GET /api/v1/policy-definitions",
             "200 OK",
@@ -491,24 +449,29 @@ fn the_shared_lists_print_the_agent_gateway_tables() {
 
 #[cfg(feature = "agent-stream")]
 #[test]
-fn api_keys_create_prints_the_secret_alone_on_standard_output() {
-    let host = agent_stream_stand_in(vec![(
+fn api_keys_create_sends_the_client_id_and_labels_and_prints_the_secret_alone() {
+    let (host, requests) = agent_stream_stand_in(vec![(
         "POST /api/v1/api-keys/pipe-1",
         "201 Created",
         r#"{"key_id":"ak_1","secret":"ask_shown_once","agent_id":"pipe-1","client_id":"billing"}"#,
     )]);
 
-    let output = fabric_on_stream(&host, &["api-keys", "create", "pipe-1", "--client-id", "billing"], "");
+    let output =
+        fabric_on_stream(&host, &["api-keys", "create", "pipe-1", "--client-id", "billing", "--label", "team=ops"], "");
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "ask_shown_once\n");
     assert!(stderr(&output).contains("Created API key 'ak_1'"), "{}", stderr(&output));
+    assert_eq!(
+        sent_body(&requests, "POST /api/v1/api-keys/pipe-1"),
+        serde_json::json!({"client_id": "billing", "labels": {"team": "ops"}})
+    );
 }
 
 #[cfg(feature = "agent-stream")]
 #[test]
 fn policies_create_and_delete_print_the_agent_gateway_lines() {
-    let host = agent_stream_stand_in(vec![
+    let (host, _) = agent_stream_stand_in(vec![
         ("POST /api/v1/policy-definitions", "201 Created", r#"{"id":"block-pii"}"#),
         ("DELETE /api/v1/policy-definitions/block-pii", "204 No Content", ""),
     ]);
@@ -550,7 +513,7 @@ const WITHHELD_NOTE: &str =
 #[cfg(feature = "agent-stream")]
 #[test]
 fn secrets_get_with_reveal_says_why_agent_stream_sent_no_value() {
-    let host = agent_stream_stand_in(vec![
+    let (host, _) = agent_stream_stand_in(vec![
         ("GET /api/v1/secrets/s-1", "200 OK", r#"{"id":"s-1","secret_id":"stripe-live","name":"Stripe live"}"#),
         ("GET /api/v1/secrets", "200 OK", r#"[{"id":"s-1","secret_id":"stripe-live","name":"Stripe live"}]"#),
     ]);
@@ -567,7 +530,7 @@ fn secrets_get_with_reveal_says_why_agent_stream_sent_no_value() {
 #[cfg(feature = "agent-stream")]
 #[test]
 fn api_keys_rotate_prints_the_new_secret_alone_and_names_the_new_key() {
-    let host = agent_stream_stand_in(vec![(
+    let (host, _) = agent_stream_stand_in(vec![(
         "POST /api/v1/api-keys/pipe-1/ak_1/rotate",
         "200 OK",
         r#"{"key_id":"ak_2","secret":"ask_new_secret","agent_id":"pipe-1","client_id":"billing"}"#,
@@ -583,17 +546,25 @@ fn api_keys_rotate_prints_the_new_secret_alone_and_names_the_new_key() {
 
 #[cfg(feature = "agent-stream")]
 #[test]
-fn api_keys_revoke_and_delete_print_one_line_each() {
-    let host = agent_stream_stand_in(vec![
+fn api_keys_revoke_sends_the_actor_and_revoke_and_delete_print_one_line_each() {
+    let (host, requests) = agent_stream_stand_in(vec![
         ("POST /api/v1/api-keys/pipe-1/ak_1/revoke", "204 No Content", ""),
         ("DELETE /api/v1/api-keys/pipe-1/ak_1", "204 No Content", ""),
     ]);
 
-    let revoke = fabric_on_stream(&host, &["api-keys", "revoke", "ak_1", "--agent-id", "pipe-1", "--yes"], "");
+    let revoke = fabric_on_stream(
+        &host,
+        &["api-keys", "revoke", "ak_1", "--agent-id", "pipe-1", "--actor", "ops-team", "--yes"],
+        "",
+    );
     let delete = fabric_on_stream(&host, &["api-keys", "delete", "ak_1", "--agent-id", "pipe-1", "--yes"], "");
 
     assert_eq!(stdout(&revoke), "Revoked API key 'ak_1'\n", "{}", stderr(&revoke));
     assert_eq!(stdout(&delete), "Deleted API key 'ak_1'\n", "{}", stderr(&delete));
+    assert_eq!(
+        sent_body(&requests, "POST /api/v1/api-keys/pipe-1/ak_1/revoke"),
+        serde_json::json!({"actor": "ops-team"})
+    );
 }
 
 #[cfg(feature = "agent-stream")]
@@ -639,10 +610,34 @@ fn settings_reset_without_force_and_with_a_typed_host_sends_nothing() {
 
 #[cfg(feature = "agent-stream")]
 #[test]
+fn users_update_and_delete_of_the_reserved_integrations_route_with_a_typed_host_send_nothing() {
+    for (verb, extra, refusal) in [
+        (
+            "update",
+            &["--file", "-"][..],
+            "'integrations' is a reserved route, not a user id; use `fabric agent-stream api put",
+        ),
+        ("delete", &[][..], "'integrations' is a reserved route, not a user id, so there is no user to delete"),
+    ] {
+        let (host, requests) = agent_stream_host();
+        let mut args = vec!["agent-stream", "--host", &host, "users", verb, "integrations"];
+        args.extend_from_slice(extra);
+
+        let output = fabric_in_fresh_home(&args, &[], &[("FABRIC_TOKEN", SESSION_TOKEN)], "{}");
+
+        let text = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{verb}: {text}");
+        assert!(text.contains(refusal), "{verb}: {text}");
+        assert!(request_lines(&requests).is_empty(), "{verb}: {:?}", request_lines(&requests));
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
 fn identities_create_update_and_deactivate_print_the_agent_gateway_lines() {
     let identity = r#"{"id":"i-1","did":"did:webvh:x:agents/a","version":1,"active":true}"#;
     let deactivated = r#"{"message":"Identity deactivated","id":"i-1","version_id":"2-QmHash","deactivated_at":"2026-11-01T00:00:00Z"}"#;
-    let host = agent_stream_stand_in(vec![
+    let (host, _) = agent_stream_stand_in(vec![
         ("POST /api/v1/identities/i-1/update", "200 OK", identity),
         ("POST /api/v1/identities", "201 Created", identity),
         ("DELETE /api/v1/identities/i-1", "200 OK", deactivated),
@@ -667,8 +662,27 @@ fn identities_create_update_and_deactivate_print_the_agent_gateway_lines() {
 
 #[cfg(feature = "agent-stream")]
 #[test]
+fn identities_get_hides_a_key_pair_with_a_note_that_names_no_flag() {
+    let (host, _) = agent_stream_stand_in(vec![(
+        "GET /api/v1/identities/i-1",
+        "200 OK",
+        r#"{"id":"i-1","did":"did:webvh:x:agents/a","key_pair":{"private_key":{"d":"private-scalar"}}}"#,
+    )]);
+
+    let output = fabric_on_stream(&host, &["identities", "get", "i-1"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("private-scalar"), "{}", stdout(&output));
+    assert_eq!(
+        stderr_beyond_the_environment_note(&output),
+        "note: hid 'key_pair', which carries this identity's private key.\n"
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
 fn users_delete_with_output_json_prints_a_removed_outcome() {
-    let host = agent_stream_stand_in(vec![("DELETE /api/v1/users/u-1", "200 OK", r#"{"outcome":"removed"}"#)]);
+    let (host, _) = agent_stream_stand_in(vec![("DELETE /api/v1/users/u-1", "200 OK", r#"{"outcome":"removed"}"#)]);
 
     let output = fabric_on_stream(&host, &["--output", "json", "users", "delete", "u-1"], "");
 
@@ -697,7 +711,7 @@ const AUDIT_PAGE: &str = r#"{"events":[{"timestamp":"2026-11-01T00:00:00Z","even
 #[cfg(feature = "agent-stream")]
 #[test]
 fn audit_list_prints_the_agent_gateway_table_with_no_truncation_note() {
-    let host = agent_stream_stand_in(vec![("GET /api/v1/audit?limit=100&page=1", "200 OK", AUDIT_PAGE)]);
+    let (host, _) = agent_stream_stand_in(vec![("GET /api/v1/audit?limit=100&page=1", "200 OK", AUDIT_PAGE)]);
 
     let table = fabric_on_stream(&host, &["audit", "list"], "");
     let json = fabric_on_stream(&host, &["--output", "json", "audit", "list"], "");
@@ -717,7 +731,7 @@ fn audit_list_prints_the_agent_gateway_table_with_no_truncation_note() {
 #[cfg(feature = "agent-stream")]
 #[test]
 fn settings_set_warns_about_the_agent_stream_audit_field_and_prints_the_read_back() {
-    let host = agent_stream_stand_in(vec![
+    let (host, _) = agent_stream_stand_in(vec![
         ("POST /api/v1/settings", "200 OK", r#"{"audit_enabled":true}"#),
         ("GET /api/v1/settings", "200 OK", r#"{"audit_enabled":true,"prometheus_auth_password_hash":""}"#),
     ]);
@@ -741,7 +755,7 @@ fn settings_set_warns_about_the_agent_stream_audit_field_and_prints_the_read_bac
 #[cfg(feature = "agent-stream")]
 #[test]
 fn metrics_test_endpoint_prints_no_latency_agent_stream_does_not_send() {
-    let host = agent_stream_stand_in(vec![(
+    let (host, _) = agent_stream_stand_in(vec![(
         "POST /api/v1/metrics/test-connection",
         "200 OK",
         r#"{"success":true,"message":"Reached the collector at collector.example:4317."}"#,
@@ -759,7 +773,7 @@ fn metrics_test_endpoint_prints_no_latency_agent_stream_does_not_send() {
 #[cfg(feature = "agent-stream")]
 #[test]
 fn logs_truncate_prints_what_agent_stream_removed() {
-    let host = agent_stream_stand_in(vec![(
+    let (host, _) = agent_stream_stand_in(vec![(
         "POST /api/v1/logs/truncate",
         "200 OK",
         r#"{"files_removed":2,"bytes_freed":2048,"current_log_kept":true}"#,
@@ -777,7 +791,7 @@ fn logs_truncate_prints_what_agent_stream_removed() {
 #[cfg(feature = "agent-stream")]
 #[test]
 fn audit_list_reports_an_audit_log_agent_stream_has_not_started_instead_of_an_empty_one() {
-    let host = agent_stream_stand_in(vec![(
+    let (host, _) = agent_stream_stand_in(vec![(
         "GET /api/v1/audit?limit=100&page=1",
         "503 Service Unavailable",
         "audit log temporarily unavailable: Audit logger not initialized",

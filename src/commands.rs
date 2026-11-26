@@ -2347,8 +2347,8 @@ async fn run_and_print(
     };
     let confirmation = match deleted_user {
         Some(user_id) => {
-            if matches!(output, Output::Table) && user_was_kept(&value) {
-                eprintln!("{USER_KEPT_NOTE}");
+            if let Some(note) = user_kept_note(client.product(), output, &value) {
+                eprintln!("{note}");
             }
             Some(user_delete_line(&user_id, &value))
         }
@@ -3554,19 +3554,32 @@ impl SettingsCommand {
 /// `appliance_id` on both products, and the Prometheus password it erases
 /// cannot be put back from a `settings show` backup: the hash is blanked on
 /// every read, and re-enabling authentication without a plaintext password is
-/// rejected. The message is built once for both products. Only the Agent
-/// Stream one names `appliance_id`, and it says that the audit settings gate
-/// only the recording of policy decisions there; the Agent Gateway one keeps
-/// its earlier wording, dash included.
+/// rejected. Each product has its own complete message. The Agent Gateway one
+/// keeps its earlier wording, dash included. The Agent Stream one also names
+/// `appliance_id`, and says the audit settings there gate only the recording
+/// of policy decisions.
 fn reject_settings_reset(product: Product) -> Result<()> {
-    let (audit, appliance_id, backup) = match product {
-        Product::AgentGateway => ("audit logging stops", "", " \u{2014}"),
-        Product::AgentStream => ("policy decisions are no longer recorded in the audit log", "'appliance_id'; ", ":"),
-    };
-    bail!(
-        "`settings reset` overwrites the whole appliance settings document with the built-in defaults. It clears: 'prometheus_auth_enabled', so /v1/metrics/prometheus stops checking credentials; 'prometheus_auth_username' and the stored password hash; 'audit_enabled' and 'audit_categories', so {audit}; {appliance_id}every entry in 'feature_flags'; and every window, interval and threshold. A `{} settings show` backup does not undo it{backup} the password hash is blanked on read, and re-enabling Prometheus authentication without a plaintext 'prometheus_auth_password' is refused with 400. Keep that password elsewhere, or re-run with --force",
-        product.command()
-    )
+    match product {
+        Product::AgentGateway => bail!(
+            "`settings reset` overwrites the whole appliance settings document with the built-in defaults. It \
+             clears: 'prometheus_auth_enabled', so /v1/metrics/prometheus stops checking credentials; \
+             'prometheus_auth_username' and the stored password hash; 'audit_enabled' and 'audit_categories', so \
+             audit logging stops; every entry in 'feature_flags'; and every window, interval and threshold. A \
+             `fabric agent-gateway settings show` backup does not undo it \u{2014} the password hash is blanked on \
+             read, and re-enabling Prometheus authentication without a plaintext 'prometheus_auth_password' is \
+             refused with 400. Keep that password elsewhere, or re-run with --force"
+        ),
+        Product::AgentStream => bail!(
+            "`settings reset` overwrites the whole appliance settings document with the built-in defaults. It \
+             clears: 'prometheus_auth_enabled', so /v1/metrics/prometheus stops checking credentials; \
+             'prometheus_auth_username' and the stored password hash; 'audit_enabled' and 'audit_categories', so \
+             policy decisions are no longer recorded in the audit log; 'appliance_id'; every entry in \
+             'feature_flags'; and every window, interval and threshold. A `fabric agent-stream settings show` \
+             backup does not undo it: the password hash is blanked on read, and re-enabling Prometheus \
+             authentication without a plaintext 'prometheus_auth_password' is refused with 400. Keep that password \
+             elsewhere, or re-run with --force"
+        ),
+    }
 }
 
 /// Names the parts of an appliance settings document `product` will not store
@@ -11714,6 +11727,7 @@ async fn run_users(
     client: &GatewayClient,
     command: UserCommand,
 ) -> Result<Value> {
+    command.refuse_reserved_route(client.product())?;
     match command {
         UserCommand::List => {
             client
@@ -11726,7 +11740,6 @@ async fn run_users(
                 .await
         }
         UserCommand::Update { user_id, file } => {
-            reject_reserved_user_route(client.product(), &user_id)?;
             client
                 .request(Method::PUT, &entity_path("/v1/users", &user_id), Some(read_json(&file)?))
                 .await
@@ -11739,12 +11752,12 @@ async fn run_users(
     }
 }
 
-/// Rejects the static `/v1/users/integrations` route as a user id, on Agent
-/// Gateway and Agent Stream alike. It answers PUT by replacing the appliance's
-/// whole user-integration configuration, whose only field is defaulted, so any
-/// document sent there, a user record or `{}`, would clear every assignment
-/// and report success. The refusal names the `api` command of
-/// `product`.
+/// Rejects `integrations` as the user id of an update. On Agent Stream,
+/// `/v1/users/integrations` is a static route that answers PUT by replacing
+/// the whole user-integration configuration, whose only field is defaulted, so
+/// any document sent there, a user record or `{}`, would clear every
+/// assignment and report success. Agent Gateway keeps the refusal it had
+/// before. The refusal names the `api` command of `product`.
 fn reject_reserved_user_route(
     product: Product,
     user_id: &str,
@@ -11755,6 +11768,40 @@ fn reject_reserved_user_route(
              <file>` to rewrite the assignments",
             product.command()
         );
+    }
+    Ok(())
+}
+
+impl UserCommand {
+    /// Fails, as [`reject_reserved_user_route`] and
+    /// [`reject_reserved_user_delete`] do, for an update or delete on `product`
+    /// that names the reserved `integrations` route as a user id. `run_users`
+    /// checks it on both products, and an Agent Stream command also checks it
+    /// before the host is asked which product it is, so a refused command
+    /// sends nothing at all there.
+    pub(crate) fn refuse_reserved_route(
+        &self,
+        product: Product,
+    ) -> Result<()> {
+        match self {
+            Self::Update { user_id, .. } => reject_reserved_user_route(product, user_id),
+            Self::Delete { user_id } => reject_reserved_user_delete(product, user_id),
+            Self::List | Self::Get { .. } => Ok(()),
+        }
+    }
+}
+
+/// Rejects `integrations` as the user id of a delete on Agent Stream, where
+/// `/v1/users/integrations` is the static user-integrations route rather than
+/// a user. That route answers only GET and PUT, so a DELETE there could never
+/// remove a user. Agent Gateway has no such route, so its delete is sent as
+/// typed.
+fn reject_reserved_user_delete(
+    product: Product,
+    user_id: &str,
+) -> Result<()> {
+    if product == Product::AgentStream && user_id == "integrations" {
+        bail!("'integrations' is a reserved route, not a user id, so there is no user to delete");
     }
     Ok(())
 }
@@ -11775,9 +11822,7 @@ async fn run_identities(
                 .request(Method::GET, &entity_path("/v1/identities", &id), None)
                 .await?;
             if !reveal && redact_key_pair(&mut value) {
-                eprintln!(
-                    "note: hid 'key_pair', which carries this identity's private key. Pass --reveal to include it."
-                );
+                eprintln!("{}", hidden_key_pair_note(client.product()));
             }
             Ok(value)
         }
@@ -11957,6 +12002,19 @@ fn trust_policy_body(
         );
     }
     Ok(body)
+}
+
+/// The note `identities get` prints on standard error once it has removed an
+/// identity's `key_pair`. Only Agent Gateway's `identities get` has --reveal;
+/// Agent Stream's has none, because Agent Stream never sends the private key,
+/// so its note names no flag.
+fn hidden_key_pair_note(product: Product) -> &'static str {
+    match product {
+        Product::AgentGateway => {
+            "note: hid 'key_pair', which carries this identity's private key. Pass --reveal to include it."
+        }
+        Product::AgentStream => "note: hid 'key_pair', which carries this identity's private key.",
+    }
 }
 
 /// Removes an identity's `key_pair`, reporting whether one was present.
@@ -12646,6 +12704,18 @@ mod identity_access_tests {
     }
 
     #[test]
+    fn only_the_agent_gateway_key_pair_note_names_reveal() {
+        assert_eq!(
+            hidden_key_pair_note(Product::AgentGateway),
+            "note: hid 'key_pair', which carries this identity's private key. Pass --reveal to include it."
+        );
+        assert_eq!(
+            hidden_key_pair_note(Product::AgentStream),
+            "note: hid 'key_pair', which carries this identity's private key."
+        );
+    }
+
+    #[test]
     fn redacting_reports_an_identity_that_carried_no_key_pair() {
         let mut identity = json!({"id": "i-1"});
         assert!(!redact_key_pair(&mut identity));
@@ -12796,6 +12866,18 @@ mod identity_access_tests {
                 .to_string()
                 .contains("other than a list")
         );
+    }
+
+    #[test]
+    fn only_agent_stream_refuses_to_delete_the_reserved_integrations_route() {
+        let refusal = reject_reserved_user_delete(Product::AgentStream, "integrations").expect_err("a reserved route");
+
+        assert_eq!(
+            refusal.to_string(),
+            "'integrations' is a reserved route, not a user id, so there is no user to delete"
+        );
+        assert!(reject_reserved_user_delete(Product::AgentGateway, "integrations").is_ok());
+        assert!(reject_reserved_user_delete(Product::AgentStream, "u-1").is_ok());
     }
 
     #[tokio::test]
@@ -12998,6 +13080,22 @@ mod identity_access_tests {
     fn a_user_delete_names_what_happened_to_the_record() {
         assert_eq!(user_delete_line("u-1", &json!({"outcome": "removed"})), "Deleted user 'u-1'");
         assert_eq!(user_delete_line("u-1", &json!({"outcome": "disabled"})), "Disabled user 'u-1'");
+    }
+
+    #[test]
+    fn only_an_agent_stream_table_gets_the_kept_user_note() {
+        let kept = json!({"outcome": "disabled"});
+
+        assert_eq!(
+            user_kept_note(Product::AgentStream, Output::Table, &kept),
+            Some(
+                "note: the user signs in through an identity provider, so Agent Stream keeps their record, \
+                 disabled, and refuses their sign-ins through that provider"
+            )
+        );
+        assert_eq!(user_kept_note(Product::AgentGateway, Output::Table, &kept), None);
+        assert_eq!(user_kept_note(Product::AgentStream, Output::Json, &kept), None);
+        assert_eq!(user_kept_note(Product::AgentStream, Output::Table, &json!({"outcome": "removed"})), None);
     }
 
     #[test]
@@ -17992,11 +18090,20 @@ fn user_was_kept(answer: &Value) -> bool {
         == Some("disabled")
 }
 
-/// What table output adds on standard error when Agent Stream kept a deleted
-/// user's record, which it does for a user who signs in through an OpenID or
-/// SAML provider.
-const USER_KEPT_NOTE: &str = "note: the user signs in through an identity provider, so Agent Stream keeps their \
-                              record, disabled, and refuses their sign-ins through that provider";
+/// The note table output adds on standard error when Agent Stream kept a
+/// deleted user's record, which it does for a user who signs in through an
+/// OpenID or SAML provider. Agent Gateway answers a delete with no body, so it
+/// never gets the note, and JSON output carries the `outcome` instead.
+fn user_kept_note(
+    product: Product,
+    output: Output,
+    answer: &Value,
+) -> Option<&'static str> {
+    (product == Product::AgentStream && matches!(output, Output::Table) && user_was_kept(answer)).then_some(
+        "note: the user signs in through an identity provider, so Agent Stream keeps their record, disabled, and \
+         refuses their sign-ins through that provider",
+    )
+}
 
 /// The one line every delete, revoke, create or update prints in table mode,
 /// such as `Deleted issuer 'i-1'`. The id may be what the user typed, so it is

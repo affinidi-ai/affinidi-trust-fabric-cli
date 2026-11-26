@@ -3,13 +3,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::Subcommand;
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, Output, SharedCommand, run_shared},
-};
+use crate::commands::{self};
 
 #[derive(Debug, Subcommand)]
 pub enum UserCommand {
@@ -48,7 +44,8 @@ pub enum UserCommand {
     /// record, disabled, and refuses their sign-ins through that provider.
     /// Table output then says `Disabled user` instead of `Deleted user`. With
     /// --output json the answer's `outcome` is `removed` or `disabled`. Agent
-    /// Stream refuses to delete an administrator or your own account.
+    /// Stream refuses to delete an administrator or your own account. The ID
+    /// `integrations` is refused: it is a reserved route, not a user.
     Delete {
         /// User's ID, as `list` prints it, not the username.
         user_id: String,
@@ -70,15 +67,6 @@ const UPDATE_EXAMPLES: &str = r#"Examples:
     echo '{"status": "disabled"}' | fabric agent-stream users update \
       <user-id> --file -"#;
 
-/// Runs one `users` command on the Agent Stream behind `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: UserCommand,
-    output: Output,
-) -> Result<()> {
-    run_shared(client, SharedCommand::Users(command.into()), output).await
-}
-
 impl From<UserCommand> for commands::UserCommand {
     fn from(command: UserCommand) -> Self {
         match command {
@@ -93,7 +81,11 @@ impl From<UserCommand> for commands::UserCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_stream::test_support::{scripted_agent_stream, start_lines};
+    use crate::{
+        agent_stream::test_support::{scripted_agent_stream, start_lines},
+        client::GatewayClient,
+        commands::{Output, SharedCommand, run_shared},
+    };
 
     const TOKEN: &str = "aspat_test";
 
@@ -124,7 +116,7 @@ mod tests {
             },
             UserCommand::Delete { user_id: "u-1".to_owned() },
         ] {
-            run(&client, command, Output::Json)
+            run_shared(&client, SharedCommand::Users(command.into()), Output::Json)
                 .await
                 .expect("the command succeeds");
         }
@@ -144,12 +136,15 @@ mod tests {
     async fn update_refuses_the_reserved_integrations_route_and_names_the_agent_stream_api_command() {
         let (host, requests) = scripted_agent_stream(vec![]).await;
 
-        let error = run(
+        let error = run_shared(
             &client(host),
-            UserCommand::Update {
-                user_id: "integrations".to_owned(),
-                file: PathBuf::from("/nonexistent/user.json"),
-            },
+            SharedCommand::Users(
+                UserCommand::Update {
+                    user_id: "integrations".to_owned(),
+                    file: PathBuf::from("/nonexistent/user.json"),
+                }
+                .into(),
+            ),
             Output::Table,
         )
         .await
@@ -159,6 +154,30 @@ mod tests {
             error.to_string(),
             "'integrations' is a reserved route, not a user id; use `fabric agent-stream api put \
              /v1/users/integrations --file <file>` to rewrite the assignments"
+        );
+        assert!(start_lines(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_the_reserved_integrations_route_and_sends_nothing() {
+        let (host, requests) = scripted_agent_stream(vec![]).await;
+
+        let error = run_shared(
+            &client(host),
+            SharedCommand::Users(
+                UserCommand::Delete {
+                    user_id: "integrations".to_owned(),
+                }
+                .into(),
+            ),
+            Output::Table,
+        )
+        .await
+        .expect_err("the route answers only GET and PUT");
+
+        assert_eq!(
+            error.to_string(),
+            "'integrations' is a reserved route, not a user id, so there is no user to delete"
         );
         assert!(start_lines(&requests).is_empty());
     }

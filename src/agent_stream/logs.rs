@@ -3,13 +3,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::Subcommand;
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, Output, SharedCommand, run_shared},
-};
+use crate::commands::{self};
 
 #[derive(Debug, Subcommand)]
 pub enum LogsCommand {
@@ -54,15 +50,6 @@ const TRUNCATE_EXAMPLES: &str = r#"Examples:
     fabric agent-stream logs download --output-file logs.zip
     fabric agent-stream logs truncate --yes"#;
 
-/// Runs one `logs` command on the Agent Stream behind `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: LogsCommand,
-    output: Output,
-) -> Result<()> {
-    run_shared(client, SharedCommand::Logs(command.into()), output).await
-}
-
 impl From<LogsCommand> for commands::LogsCommand {
     fn from(command: LogsCommand) -> Self {
         match command {
@@ -75,7 +62,11 @@ impl From<LogsCommand> for commands::LogsCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_stream::test_support::{scripted_agent_stream, start_lines};
+    use crate::{
+        agent_stream::test_support::{scripted_agent_stream, start_lines},
+        client::GatewayClient,
+        commands::{Output, SharedCommand, run_shared},
+    };
 
     const TOKEN: &str = "aspat_test";
 
@@ -101,7 +92,7 @@ mod tests {
             .join("logs.zip");
 
         for command in [LogsCommand::Download { output_file: archive.clone() }, LogsCommand::Truncate { yes: true }] {
-            run(&client, command, Output::Json)
+            run_shared(&client, SharedCommand::Logs(command.into()), Output::Json)
                 .await
                 .expect("the command succeeds");
         }
@@ -122,9 +113,13 @@ mod tests {
             .path()
             .join("logs.zip");
 
-        let error = run(&client(host), LogsCommand::Download { output_file: archive.clone() }, Output::Json)
-            .await
-            .expect_err("the role lacks logs.view");
+        let error = run_shared(
+            &client(host),
+            SharedCommand::Logs(LogsCommand::Download { output_file: archive.clone() }.into()),
+            Output::Json,
+        )
+        .await
+        .expect_err("the role lacks logs.view");
 
         assert!(
             error
@@ -139,9 +134,10 @@ mod tests {
     async fn truncate_without_yes_sends_nothing() {
         let (host, requests) = scripted_agent_stream(Vec::new()).await;
 
-        let error = run(&client(host), LogsCommand::Truncate { yes: false }, Output::Json)
-            .await
-            .expect_err("--yes is required");
+        let error =
+            run_shared(&client(host), SharedCommand::Logs(LogsCommand::Truncate { yes: false }.into()), Output::Json)
+                .await
+                .expect_err("--yes is required");
 
         assert_eq!(error.to_string(), "pass --yes to confirm deleting every rotated log file; this cannot be undone");
         assert!(start_lines(&requests).is_empty());

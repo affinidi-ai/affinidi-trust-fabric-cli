@@ -3,13 +3,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, Output, SecretCreateArgs, SharedCommand, run_shared},
-};
+use crate::commands::{self, SecretCreateArgs};
 
 #[derive(Debug, Subcommand)]
 pub enum SecretCommand {
@@ -143,21 +139,6 @@ pub struct CreateArgs {
     file: Option<PathBuf>,
 }
 
-/// Runs one `secrets` command on the Agent Stream behind `client`. Values
-/// are masked unless `reveal` is set.
-pub async fn run(
-    client: &GatewayClient,
-    command: SecretCommand,
-    reveal: bool,
-    output: Output,
-) -> Result<()> {
-    let command = SharedCommand::Secrets {
-        command: command.into(),
-        reveal,
-    };
-    run_shared(client, command, output).await
-}
-
 impl From<SecretCommand> for commands::SecretCommand {
     fn from(command: SecretCommand) -> Self {
         match command {
@@ -182,7 +163,11 @@ impl From<SecretCommand> for commands::SecretCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_stream::test_support::{Route, scripted_agent_stream, start_lines};
+    use crate::{
+        agent_stream::test_support::{Route, scripted_agent_stream, start_lines},
+        client::GatewayClient,
+        commands::{Output, SharedCommand, run_shared},
+    };
 
     const TOKEN: &str = "aspat_test";
     const SECRET_LIST: Route =
@@ -236,9 +221,16 @@ mod tests {
             },
             SecretCommand::Delete { secret: "s-1".to_owned() },
         ] {
-            run(&client, command, false, Output::Json)
-                .await
-                .expect("the command succeeds");
+            run_shared(
+                &client,
+                SharedCommand::Secrets {
+                    command: command.into(),
+                    reveal: false,
+                },
+                Output::Json,
+            )
+            .await
+            .expect("the command succeeds");
         }
 
         assert_eq!(
@@ -260,9 +252,16 @@ mod tests {
     async fn an_unknown_secret_names_the_agent_stream_list_command() {
         let (host, _) = scripted_agent_stream(vec![SECRET_LIST]).await;
 
-        let error = run(&client(host), SecretCommand::Get { secret: "missing".to_owned() }, false, Output::Table)
-            .await
-            .expect_err("no secret has that reference");
+        let error = run_shared(
+            &client(host),
+            SharedCommand::Secrets {
+                command: SecretCommand::Get { secret: "missing".to_owned() }.into(),
+                reveal: false,
+            },
+            Output::Table,
+        )
+        .await
+        .expect_err("no secret has that reference");
 
         assert_eq!(
             error.to_string(),
@@ -275,9 +274,16 @@ mod tests {
     async fn a_secret_list_that_is_not_a_list_names_agent_stream() {
         let (host, _) = scripted_agent_stream(vec![("GET /api/v1/secrets", "HTTP/1.1 200 OK", "{}")]).await;
 
-        let error = run(&client(host), SecretCommand::Get { secret: "stripe".to_owned() }, false, Output::Table)
-            .await
-            .expect_err("the list is not an array");
+        let error = run_shared(
+            &client(host),
+            SharedCommand::Secrets {
+                command: SecretCommand::Get { secret: "stripe".to_owned() }.into(),
+                reveal: false,
+            },
+            Output::Table,
+        )
+        .await
+        .expect_err("the list is not an array");
 
         assert_eq!(error.to_string(), "Agent Stream's secret list is not a JSON array");
     }
@@ -287,13 +293,16 @@ mod tests {
         let (host, requests) = scripted_agent_stream(vec![SECRET_LIST]).await;
         let update = json_file(r#"{"value":"sk_new"}"#);
 
-        let error = run(
+        let error = run_shared(
             &client(host),
-            SecretCommand::Update {
-                secret: "s-1".to_owned(),
-                file: update.path().to_path_buf(),
+            SharedCommand::Secrets {
+                command: SecretCommand::Update {
+                    secret: "s-1".to_owned(),
+                    file: update.path().to_path_buf(),
+                }
+                .into(),
+                reveal: false,
             },
-            false,
             Output::Table,
         )
         .await

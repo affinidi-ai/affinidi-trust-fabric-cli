@@ -1,13 +1,9 @@
 //! `fabric agent-stream settings`: the appliance-wide settings of an Agent
 //! Stream, run through the settings commands Agent Gateway uses.
 
-use anyhow::Result;
 use clap::Subcommand;
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, JsonFileArgs, Output, SharedCommand, run_shared},
-};
+use crate::commands::{self, JsonFileArgs};
 
 #[derive(Debug, Subcommand)]
 pub enum SettingsCommand {
@@ -70,17 +66,6 @@ const RESET_EXAMPLES: &str = r#"Examples:
     fabric agent-stream settings show --output json > settings-backup.json
     fabric agent-stream settings reset --force"#;
 
-/// Runs one `settings` command, already turned into the shared form so the
-/// caller could refuse an unforced reset first, on the Agent Stream behind
-/// `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: commands::SettingsCommand,
-    output: Output,
-) -> Result<()> {
-    run_shared(client, SharedCommand::Settings(command), output).await
-}
-
 impl From<SettingsCommand> for commands::SettingsCommand {
     fn from(command: SettingsCommand) -> Self {
         match command {
@@ -94,7 +79,11 @@ impl From<SettingsCommand> for commands::SettingsCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_stream::test_support::{scripted_agent_stream, start_lines};
+    use crate::{
+        agent_stream::test_support::{scripted_agent_stream, start_lines},
+        client::GatewayClient,
+        commands::{Output, SharedCommand, run_shared},
+    };
 
     const TOKEN: &str = "aspat_test";
 
@@ -127,7 +116,7 @@ mod tests {
             SettingsCommand::Set(JsonFileArgs { file: set.path().to_path_buf() }),
             SettingsCommand::Reset { force: true },
         ] {
-            run(&client, command.into(), Output::Json)
+            run_shared(&client, SharedCommand::Settings(command.into()), Output::Json)
                 .await
                 .expect("the command succeeds");
         }
@@ -153,9 +142,13 @@ mod tests {
         .await;
         let set = document(r#"{"feature_flags":{"terms":true}}"#);
 
-        run(&client(host), SettingsCommand::Set(JsonFileArgs { file: set.path().to_path_buf() }).into(), Output::Json)
-            .await
-            .expect("the flag is written");
+        run_shared(
+            &client(host),
+            SharedCommand::Settings(SettingsCommand::Set(JsonFileArgs { file: set.path().to_path_buf() }).into()),
+            Output::Json,
+        )
+        .await
+        .expect("the flag is written");
 
         assert_eq!(start_lines(&requests)[0], "POST /api/v1/settings HTTP/1.1");
     }
@@ -164,9 +157,13 @@ mod tests {
     async fn an_unforced_reset_names_what_agent_stream_clears_and_sends_nothing() {
         let (host, requests) = scripted_agent_stream(Vec::new()).await;
 
-        let error = run(&client(host), SettingsCommand::Reset { force: false }.into(), Output::Json)
-            .await
-            .expect_err("an unforced reset");
+        let error = run_shared(
+            &client(host),
+            SharedCommand::Settings(SettingsCommand::Reset { force: false }.into()),
+            Output::Json,
+        )
+        .await
+        .expect_err("an unforced reset");
 
         assert_eq!(
             error.to_string(),

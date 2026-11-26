@@ -3,13 +3,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::Subcommand;
 
-use crate::{
-    client::GatewayClient,
-    commands::{self, Output, SharedCommand, run_shared},
-};
+use crate::commands::{self};
 
 #[derive(Debug, Subcommand)]
 pub enum IdentityCommand {
@@ -197,15 +193,6 @@ const TRUST_POLICY_SET_EXAMPLES: &str = r#"Examples:
     fabric agent-stream identities trust-policy set <id> \
       --file trust-policy.json"#;
 
-/// Runs one `identities` command on the Agent Stream behind `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: IdentityCommand,
-    output: Output,
-) -> Result<()> {
-    run_shared(client, SharedCommand::Identities(command.into()), output).await
-}
-
 impl From<IdentityCommand> for commands::IdentityCommand {
     fn from(command: IdentityCommand) -> Self {
         match command {
@@ -236,7 +223,8 @@ mod tests {
     use super::*;
     use crate::{
         agent_stream::test_support::{scripted_agent_stream, start_lines},
-        commands::Cli,
+        client::GatewayClient,
+        commands::{Cli, Output, SharedCommand, run_shared},
     };
 
     const TOKEN: &str = "aspat_test";
@@ -294,7 +282,7 @@ mod tests {
             },
             IdentityCommand::Deactivate { id: id() },
         ] {
-            run(&client, command, Output::Json)
+            run_shared(&client, SharedCommand::Identities(command.into()), Output::Json)
                 .await
                 .expect("the command succeeds");
         }
@@ -323,43 +311,52 @@ mod tests {
         let bare_key_pair = json_file(r#"{"public_key":{"x":"p"}}"#);
         let bare_policy = json_file(r#"{"minTrustScore":0.9}"#);
 
-        let create = run(
+        let create = run_shared(
             &client,
-            IdentityCommand::Create {
-                file: Some(
-                    bare_key_pair
-                        .path()
-                        .to_path_buf(),
-                ),
-            },
+            SharedCommand::Identities(
+                IdentityCommand::Create {
+                    file: Some(
+                        bare_key_pair
+                            .path()
+                            .to_path_buf(),
+                    ),
+                }
+                .into(),
+            ),
             Output::Table,
         )
         .await
         .expect_err("an unwrapped key pair");
-        let rotate = run(
+        let rotate = run_shared(
             &client,
-            IdentityCommand::RotateKeys {
-                id: "i-1".to_owned(),
-                file: Some(
-                    bare_key_pair
-                        .path()
-                        .to_path_buf(),
-                ),
-            },
-            Output::Table,
-        )
-        .await
-        .expect_err("an unwrapped key pair");
-        let trust_policy = run(
-            &client,
-            IdentityCommand::TrustPolicy {
-                command: TrustPolicyCommand::Set {
+            SharedCommand::Identities(
+                IdentityCommand::RotateKeys {
                     id: "i-1".to_owned(),
-                    file: bare_policy
-                        .path()
-                        .to_path_buf(),
-                },
-            },
+                    file: Some(
+                        bare_key_pair
+                            .path()
+                            .to_path_buf(),
+                    ),
+                }
+                .into(),
+            ),
+            Output::Table,
+        )
+        .await
+        .expect_err("an unwrapped key pair");
+        let trust_policy = run_shared(
+            &client,
+            SharedCommand::Identities(
+                IdentityCommand::TrustPolicy {
+                    command: TrustPolicyCommand::Set {
+                        id: "i-1".to_owned(),
+                        file: bare_policy
+                            .path()
+                            .to_path_buf(),
+                    },
+                }
+                .into(),
+            ),
             Output::Table,
         )
         .await

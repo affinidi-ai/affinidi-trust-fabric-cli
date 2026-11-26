@@ -31,9 +31,9 @@ use clap::{Args, Subcommand};
 use crate::{
     client::GatewayClient,
     commands::{
-        AccessTokenCommand, ApiArgs, ApiKeyCommand as SharedApiKeyCommand, CommandTarget, DEFAULT_CONNECTION,
-        HostFlags, Output, SettingsCommand as SharedSettingsCommand, ShellGlobals, ShellText, command_target,
-        given_host_and_token, new_hash_name_warnings, print_value, run_access_tokens, run_api, shell_prefix,
+        AccessTokenCommand, ApiArgs, CommandTarget, DEFAULT_CONNECTION, HostFlags, Output, SharedCommand, ShellGlobals,
+        ShellText, command_target, given_host_and_token, new_hash_name_warnings, print_value, run_access_tokens,
+        run_api, run_shared, shell_prefix,
     },
     config::Config,
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
@@ -428,6 +428,9 @@ async fn dispatch_with(
         .map_err(add_no_keyring_hint)
 }
 
+/// Runs one command. The groups Agent Stream shares with Agent Gateway all
+/// take one path: [`refuse_before_connecting`], then [`connect`], then
+/// [`run_shared`], so where their token goes is decided in one place.
 async fn run_command(
     command: AgentStreamCommand,
     globals: Globals,
@@ -435,66 +438,64 @@ async fn run_command(
     credentials: &impl CredentialStore,
     path: &Path,
 ) -> Result<()> {
-    match command {
+    let shared = match command {
         AgentStreamCommand::Shell => bail!("the interactive shell is already open"),
-        AgentStreamCommand::Config { command } => config::run(saved, credentials, command, path, globals.output),
-        AgentStreamCommand::Login(args) => login::login(saved, credentials, path, &globals, args).await,
-        AgentStreamCommand::Logout => login::logout(saved, credentials, path, globals.connection.as_deref()).await,
-        AgentStreamCommand::Whoami => whoami::whoami(saved, credentials, &globals).await,
+        AgentStreamCommand::Config { command } => {
+            return config::run(saved, credentials, command, path, globals.output);
+        }
+        AgentStreamCommand::Login(args) => return login::login(saved, credentials, path, &globals, args).await,
+        AgentStreamCommand::Logout => {
+            return login::logout(saved, credentials, path, globals.connection.as_deref()).await;
+        }
+        AgentStreamCommand::Whoami => return whoami::whoami(saved, credentials, &globals).await,
         AgentStreamCommand::Surfaces { command } => {
-            surfaces::run(command, globals.output, async || connect(saved, credentials, &globals).await).await
+            return surfaces::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
         }
         AgentStreamCommand::Tokens { command } => {
             let command = AccessTokenCommand::from(command);
             command.refuse_without_terminal()?;
             let client = connect(saved, credentials, &globals).await?;
-            run_access_tokens(&client, command, globals.output).await
-        }
-        AgentStreamCommand::Secrets { command, reveal } => {
-            let client = connect(saved, credentials, &globals).await?;
-            secrets::run(&client, command, reveal, globals.output).await
-        }
-        AgentStreamCommand::Users { command } => {
-            let client = connect(saved, credentials, &globals).await?;
-            users::run(&client, command, globals.output).await
-        }
-        AgentStreamCommand::Identities { command } => {
-            let client = connect(saved, credentials, &globals).await?;
-            identities::run(&client, command, globals.output).await
-        }
-        AgentStreamCommand::ApiKeys { command } => {
-            let command = SharedApiKeyCommand::from(command);
-            command.refuse_without_terminal()?;
-            let client = connect(saved, credentials, &globals).await?;
-            api_keys::run(&client, command, globals.output).await
-        }
-        AgentStreamCommand::Policies { command } => {
-            let client = connect(saved, credentials, &globals).await?;
-            policies::run(&client, command, globals.output).await
-        }
-        AgentStreamCommand::Settings { command } => {
-            let command = SharedSettingsCommand::from(command);
-            command.refuse_unforced_reset(Product::AgentStream)?;
-            let client = connect(saved, credentials, &globals).await?;
-            settings::run(&client, command, globals.output).await
-        }
-        AgentStreamCommand::Audit { command } => {
-            let client = connect(saved, credentials, &globals).await?;
-            audit::run(&client, command, globals.output).await
-        }
-        AgentStreamCommand::Metrics { command } => {
-            let client = connect(saved, credentials, &globals).await?;
-            metrics::run(&client, command, globals.output).await
-        }
-        AgentStreamCommand::Logs { command } => {
-            let client = connect(saved, credentials, &globals).await?;
-            logs::run(&client, command, globals.output).await
+            return run_access_tokens(&client, command, globals.output).await;
         }
         AgentStreamCommand::Api(args) => {
             let client = connect(saved, credentials, &globals).await?;
             let value = run_api(&client, args).await?;
-            print_value(&value, globals.output)
+            return print_value(&value, globals.output);
         }
+        AgentStreamCommand::Secrets { command, reveal } => SharedCommand::Secrets {
+            command: command.into(),
+            reveal,
+        },
+        AgentStreamCommand::Users { command } => SharedCommand::Users(command.into()),
+        AgentStreamCommand::Identities { command } => SharedCommand::Identities(command.into()),
+        AgentStreamCommand::ApiKeys { command } => SharedCommand::ApiKeys(command.into()),
+        AgentStreamCommand::Policies { command } => SharedCommand::Policies(command.into()),
+        AgentStreamCommand::Settings { command } => SharedCommand::Settings(command.into()),
+        AgentStreamCommand::Audit { command } => SharedCommand::Audit(command.into()),
+        AgentStreamCommand::Metrics { command } => SharedCommand::Metrics(command.into()),
+        AgentStreamCommand::Logs { command } => SharedCommand::Logs(command.into()),
+    };
+    refuse_before_connecting(&shared)?;
+    let client = connect(saved, credentials, &globals).await?;
+    run_shared(&client, shared, globals.output).await
+}
+
+/// Fails for a shared command that is refused before the host is asked which
+/// product it is, so a refused command sends nothing at all: an API key
+/// revoke, rotate, or delete that would ask for a confirmation nobody can
+/// give, a `settings reset` without --force, and a `users update` or `users
+/// delete` naming the reserved `integrations` route.
+fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
+    match command {
+        SharedCommand::ApiKeys(command) => command.refuse_without_terminal(),
+        SharedCommand::Settings(command) => command.refuse_unforced_reset(Product::AgentStream),
+        SharedCommand::Users(command) => command.refuse_reserved_route(Product::AgentStream),
+        SharedCommand::Secrets { .. }
+        | SharedCommand::Identities(_)
+        | SharedCommand::Policies(_)
+        | SharedCommand::Audit(_)
+        | SharedCommand::Metrics(_)
+        | SharedCommand::Logs(_) => Ok(()),
     }
 }
 
@@ -1413,6 +1414,85 @@ mod tests {
         texts
     }
 
+    /// The groups `fabric agent-stream` runs through the Agent Gateway
+    /// commands.
+    const SHARED_GROUPS: [&str; 9] =
+        ["secrets", "users", "identities", "api-keys", "policies", "settings", "audit", "metrics", "logs"];
+
+    /// The Agent Gateway subcommands of a shared group that Agent Stream
+    /// leaves out on purpose: `metrics status`, because Agent Stream has no
+    /// OpenTelemetry export status route.
+    const LEFT_OUT_OF_AGENT_STREAM: [(&str, &[&str]); 1] = [("metrics", &["status"])];
+
+    /// The path of every subcommand under `command`, at any depth, such as
+    /// `config show`, sorted.
+    fn subcommand_paths(command: &clap::Command) -> Vec<String> {
+        let mut paths = Vec::new();
+        for subcommand in command.get_subcommands() {
+            let name = subcommand.get_name();
+            paths.push(name.to_owned());
+            paths.extend(
+                subcommand_paths(subcommand)
+                    .into_iter()
+                    .map(|path| format!("{name} {path}")),
+            );
+        }
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn each_shared_group_has_every_agent_gateway_subcommand_or_leaves_it_out_on_purpose() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let gateway = command
+            .find_subcommand("agent-gateway")
+            .expect("agent-gateway");
+        let stream = command
+            .find_subcommand("agent-stream")
+            .expect("the feature build has agent-stream");
+
+        for group in SHARED_GROUPS {
+            let on_gateway = subcommand_paths(
+                gateway
+                    .find_subcommand(group)
+                    .unwrap_or_else(|| panic!("{group} on agent-gateway")),
+            );
+            let on_stream = subcommand_paths(
+                stream
+                    .find_subcommand(group)
+                    .unwrap_or_else(|| panic!("{group} on agent-stream")),
+            );
+            let left_out: Vec<&str> = LEFT_OUT_OF_AGENT_STREAM
+                .iter()
+                .filter(|(name, _)| *name == group)
+                .flat_map(|(_, paths)| paths.iter().copied())
+                .collect();
+
+            let missing: Vec<&str> = on_gateway
+                .iter()
+                .map(String::as_str)
+                .filter(|path| {
+                    !on_stream
+                        .iter()
+                        .any(|on| on == path)
+                })
+                .collect();
+            let extra: Vec<&str> = on_stream
+                .iter()
+                .map(String::as_str)
+                .filter(|path| {
+                    !on_gateway
+                        .iter()
+                        .any(|on| on == path)
+                })
+                .collect();
+            assert_eq!(missing, left_out, "{group}: an Agent Gateway subcommand Agent Stream does not have");
+            assert!(extra.is_empty(), "{group}: an Agent Stream subcommand Agent Gateway does not have: {extra:?}");
+        }
+    }
+
     #[test]
     fn the_shared_groups_help_never_names_agent_gateway() {
         use clap::CommandFactory;
@@ -1422,8 +1502,7 @@ mod tests {
             .find_subcommand("agent-stream")
             .expect("the feature build has agent-stream");
 
-        for group in ["secrets", "users", "identities", "api-keys", "policies", "settings", "audit", "metrics", "logs"]
-        {
+        for group in SHARED_GROUPS {
             let texts = help_texts(
                 stream
                     .find_subcommand(group)
