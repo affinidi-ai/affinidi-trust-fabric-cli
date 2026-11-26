@@ -399,6 +399,30 @@ is sent unchecked when the token cannot read the surface):
    `IncompleteDryRun` if only the local checks ran. A dry run never sends the patch
    without the query parameter.
 
+`fabric agent-stream surfaces` (in [`agent_stream/surfaces.rs`](src/agent_stream/surfaces.rs))
+reuses `surface_patch::build_patch`, `surface_validate::merge`, and
+`surface_validate::changes`, but not `check_surface`, which checks Agent Gateway fields.
+Agent Stream serves surfaces at `/v1/pipes`, has no `PATCH`, no dry run, and no version
+check, and drops a field it does not know without an error. So field names are checked
+before anything is sent. A top-level name must be in `SURFACE_FIELDS`, a copy of the
+field names of Agent Stream's `PipeConfig`, or in the stored surface. On `update`, from
+the flags or `--file`, a name inside an object the stored surface has must already be in
+that object unless `--allow-new-field` is given; a name inside an object the surface
+lacks, or inside a list item, is not checked. `create` has nothing stored to compare
+with, so it checks top-level names only. Flag paths with brackets or list positions,
+which only Agent Gateway paths use, and flags on `id`, `created_at`, `updated_at`,
+`tenant_id`, or `owner_user_id` are refused before the first read.
+
+`update` reads the surface, builds the whole new surface on this machine, reads the
+surface again, and sends it with `PUT` only when `updated_at` has not moved. A `--file`
+must carry the current `updated_at`, and its `status`, `created_at`, `tenant_id`, and
+`owner_user_id` are replaced with the stored ones. After the save, table output lists
+the changed fields, and `--output json` reads the surface once more and prints it,
+because Agent Stream answers a save with an `updated_at` its store then replaces, so
+only a fresh read can go back to `--file`. A dry run of `create` or `update` prints the
+same JSON shape (`dry_run`, `changes`, `after`), and `create --dry-run` runs before any
+connection is resolved, so it needs no saved login.
+
 ## Invariants
 
 Breaking one of these is a correctness bug, not a style question.
@@ -427,7 +451,7 @@ Every file in [`src/`](src/) and what it owns.
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
 | [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, and `remembering_probes`, which keeps a host's answer for the length of an interactive shell. |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, and `tokens.rs`, which maps onto the shared access token commands), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, and `tokens.rs`, which maps onto the shared access token commands), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |

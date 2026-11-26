@@ -6,12 +6,19 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use clap::Parser;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
-use crate::{credentials::CredentialStore, product::Product};
+use super::{AgentStreamArgs, dispatch_with};
+use crate::{
+    commands::Cli,
+    config::{Config, Connection},
+    credentials::CredentialStore,
+    product::Product,
+};
 
 /// An Agent Stream credential store kept in memory, so a test never reads or
 /// writes the OS keyring.
@@ -140,8 +147,10 @@ pub type Route = (&'static str, &'static str, &'static str);
 
 /// Answers each request with the route whose request start it begins with,
 /// and `404 Not Found` with an empty body to any other, until the test ends.
-/// Records each whole request, headers and body included. Returns its base URL
-/// and the recording.
+/// When several routes share one request start, the first request gets the
+/// first of them, the next request the next, and the last one answers every
+/// request after that. Records each whole request, headers and body included.
+/// Returns its base URL and the recording.
 pub async fn scripted_agent_stream(routes: Vec<Route>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -152,12 +161,24 @@ pub async fn scripted_agent_stream(routes: Vec<Route>) -> (String, Arc<Mutex<Vec
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
     tokio::spawn(async move {
+        let mut answered: HashMap<&'static str, usize> = HashMap::new();
         while let Ok((mut socket, _)) = listener.accept().await {
             let request = read_request(&mut socket).await;
-            let (status_line, body) = routes
+            let matching: Vec<&Route> = routes
                 .iter()
-                .find(|(start, _, _)| request.starts_with(&format!("{start} ")))
-                .map_or(("HTTP/1.1 404 Not Found", ""), |(_, status_line, body)| (*status_line, *body));
+                .filter(|(start, _, _)| request.starts_with(&format!("{start} ")))
+                .collect();
+            let (status_line, body) = match matching.first() {
+                Some((start, _, _)) => {
+                    let count = answered
+                        .entry(start)
+                        .or_default();
+                    let (_, status_line, body) = matching[(*count).min(matching.len() - 1)];
+                    *count += 1;
+                    (*status_line, *body)
+                }
+                None => ("HTTP/1.1 404 Not Found", ""),
+            };
             recorded
                 .lock()
                 .unwrap()
@@ -226,4 +247,81 @@ pub fn start_lines(requests: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// The body of a recorded request: what follows its head.
+pub fn request_body(request: &str) -> &str {
+    request
+        .split_once("\r\n\r\n")
+        .map_or("", |(_, body)| body)
+}
+
+/// The Agent Stream arguments of `fabric agent-stream <words>`.
+pub fn stream_args(words: &[&str]) -> AgentStreamArgs {
+    Cli::try_parse_from(
+        ["fabric", "agent-stream"]
+            .into_iter()
+            .chain(words.iter().copied()),
+    )
+    .unwrap_or_else(|error| panic!("{words:?}: {error}"))
+    .into_agent_stream()
+}
+
+/// One saved Agent Stream connection, `default`, current, at `host`, with
+/// `token` bound to that host.
+pub fn saved_login(
+    host: &str,
+    token: &str,
+) -> (Config, MemoryCredentials) {
+    let mut saved = Config {
+        current: Some("default".to_owned()),
+        ..Config::default()
+    };
+    saved
+        .connections
+        .insert("default".to_owned(), Connection::new(host.to_owned()));
+    let credentials = MemoryCredentials::default();
+    credentials
+        .set_token("default", token)
+        .unwrap();
+    credentials
+        .set_bound_host("default", host)
+        .unwrap();
+    (saved, credentials)
+}
+
+/// Runs `fabric agent-stream <words>` against `saved` and `credentials`,
+/// with the connections file in a fresh directory.
+pub async fn run_stream(
+    words: &[&str],
+    saved: Config,
+    credentials: &impl CredentialStore,
+) -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    dispatch_with(
+        stream_args(words),
+        saved,
+        credentials,
+        &dir.path()
+            .join("agent-stream.toml"),
+    )
+    .await
+}
+
+/// Whether a recorded request carried `token` as its bearer token.
+pub fn sends_bearer(
+    request: &str,
+    token: &str,
+) -> bool {
+    request
+        .to_ascii_lowercase()
+        .contains(&format!("authorization: bearer {}", token.to_ascii_lowercase()))
+}
+
+/// Writes `contents` to a temporary JSON file kept alive by the returned
+/// handle.
+pub fn json_file(contents: &str) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().expect("temp file");
+    std::fs::write(file.path(), contents).expect("write JSON file");
+    file
 }

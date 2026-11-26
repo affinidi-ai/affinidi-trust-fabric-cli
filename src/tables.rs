@@ -162,6 +162,21 @@ pub static SURFACES: Layout = Layout {
     ],
 };
 
+/// The surfaces of an Agent Stream, as `fabric agent-stream surfaces list`
+/// shows them.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_SURFACES: Layout = Layout {
+    empty: "No surfaces yet.",
+    columns: &[
+        id(&["id"]),
+        whole("NAME", &["name"]),
+        col("TYPE", &["pipe_type.type"]),
+        col("STATUS", &["status"]),
+        col("ROUTE", &["route"]),
+        col("UPDATED", &["updated_at"]),
+    ],
+};
+
 pub static POLICIES: Layout = Layout {
     empty: "No policies yet.",
     columns: &[

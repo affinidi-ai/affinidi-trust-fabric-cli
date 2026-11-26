@@ -8,6 +8,7 @@
 
 mod config;
 mod login;
+mod surfaces;
 #[cfg(test)]
 mod test_support;
 mod tokens;
@@ -146,6 +147,14 @@ enum AgentStreamCommand {
     Config {
         #[command(subcommand)]
         command: config::ConfigCommand,
+    },
+    /// Manage surfaces.
+    ///
+    /// Agent Stream's API calls a surface a pipe and serves surfaces at
+    /// `/v1/pipes`.
+    Surfaces {
+        #[command(subcommand)]
+        command: surfaces::SurfaceCommand,
     },
     /// Manage access tokens.
     Tokens {
@@ -361,6 +370,9 @@ async fn run_command(
         AgentStreamCommand::Login(args) => login::login(saved, credentials, path, &globals, args).await,
         AgentStreamCommand::Logout => login::logout(saved, credentials, path, globals.connection.as_deref()).await,
         AgentStreamCommand::Whoami => whoami::whoami(saved, credentials, &globals).await,
+        AgentStreamCommand::Surfaces { command } => {
+            surfaces::run(command, globals.output, async || connect(saved, credentials, &globals).await).await
+        }
         AgentStreamCommand::Tokens { command } => {
             let command = AccessTokenCommand::from(command);
             command.refuse_without_terminal()?;
@@ -411,7 +423,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::test_support::NoKeyring;
     use super::{
-        test_support::{MemoryCredentials, Route, UnusedKeyring, scripted_agent_stream, start_lines},
+        test_support::{
+            MemoryCredentials, Route, UnusedKeyring, run_stream, saved_login, scripted_agent_stream, sends_bearer,
+            start_lines, stream_args,
+        },
         *,
     };
     use crate::{commands::Cli, config::Connection};
@@ -444,68 +459,6 @@ mod tests {
     const NOT_SIGNED_IN: Route =
         ("GET /api/auth/check", "HTTP/1.1 200 OK", r#"{"authenticated":false,"username":null,"terms_enabled":false}"#);
     const TOKEN_LIST: Route = ("GET /api/v1/access-tokens", "HTTP/1.1 200 OK", r#"{"access_tokens":[]}"#);
-
-    /// The Agent Stream arguments of `fabric agent-stream <words>`.
-    fn stream_args(words: &[&str]) -> AgentStreamArgs {
-        Cli::try_parse_from(
-            ["fabric", "agent-stream"]
-                .into_iter()
-                .chain(words.iter().copied()),
-        )
-        .unwrap_or_else(|error| panic!("{words:?}: {error}"))
-        .into_agent_stream()
-    }
-
-    /// One saved Agent Stream connection, `default`, current, at `host`, with
-    /// `token` bound to that host.
-    fn saved_login(
-        host: &str,
-        token: &str,
-    ) -> (Config, MemoryCredentials) {
-        let mut saved = Config {
-            current: Some("default".to_owned()),
-            ..Config::default()
-        };
-        saved
-            .connections
-            .insert("default".to_owned(), Connection::new(host.to_owned()));
-        let credentials = MemoryCredentials::default();
-        credentials
-            .set_token("default", token)
-            .unwrap();
-        credentials
-            .set_bound_host("default", host)
-            .unwrap();
-        (saved, credentials)
-    }
-
-    /// Runs `fabric agent-stream <words>` against `saved` and `credentials`,
-    /// with the connections file in a fresh directory.
-    async fn run_stream(
-        words: &[&str],
-        saved: Config,
-        credentials: &impl CredentialStore,
-    ) -> Result<()> {
-        let dir = tempfile::tempdir().unwrap();
-        dispatch_with(
-            stream_args(words),
-            saved,
-            credentials,
-            &dir.path()
-                .join("agent-stream.toml"),
-        )
-        .await
-    }
-
-    /// Whether a recorded request carried `token` as its bearer token.
-    fn sends_bearer(
-        request: &str,
-        token: &str,
-    ) -> bool {
-        request
-            .to_ascii_lowercase()
-            .contains(&format!("authorization: bearer {}", token.to_ascii_lowercase()))
-    }
 
     #[tokio::test]
     async fn login_with_an_access_token_asks_the_host_reads_the_profile_and_saves_the_token_in_the_store_only() {
@@ -1177,7 +1130,7 @@ mod tests {
         let gateway_line = cli
             .interactive_prefix()
             .into_iter()
-            .chain(["surfaces".to_owned(), "list".to_owned()]);
+            .chain(["policies".to_owned(), "list".to_owned()]);
         assert!(Cli::try_parse_from(gateway_line).is_err(), "an Agent Gateway command is not an Agent Stream one");
     }
 
