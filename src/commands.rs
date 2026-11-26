@@ -27,7 +27,7 @@ use crate::{
 const PAT_TOKEN_PREFIX: &str = product::AGENT_GATEWAY_PAT_PREFIX;
 
 /// Connection name `login` saves under when --connection is not supplied.
-const DEFAULT_CONNECTION: &str = "default";
+pub(crate) const DEFAULT_CONNECTION: &str = "default";
 
 #[derive(Debug, Parser)]
 #[command(name = "fabric", version, about = "Manage Affinidi appliances", args_override_self = true)]
@@ -45,7 +45,7 @@ enum Appliance {
     /// Manage Affinidi Agent Stream.
     #[cfg(feature = "agent-stream")]
     #[command(name = "agent-stream")]
-    AgentStream(crate::agent_stream::AgentStreamArgs),
+    AgentStream(Box<crate::agent_stream::AgentStreamArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -120,67 +120,169 @@ impl Cli {
         }
     }
 
-    /// Whether this is `fabric agent-gateway shell`, the one command that opens
-    /// the interactive shell.
+    /// The Agent Stream arguments of a command line that tests parsed for
+    /// Agent Stream.
+    #[cfg(all(test, feature = "agent-stream"))]
+    pub(crate) fn into_agent_stream(self) -> crate::agent_stream::AgentStreamArgs {
+        match self.appliance {
+            Appliance::AgentStream(args) => *args,
+            Appliance::AgentGateway(_) => panic!("the test parsed an Agent Gateway command"),
+        }
+    }
+
+    /// Whether this is the `shell` command of an appliance, which opens the
+    /// interactive shell.
     pub fn is_interactive(&self) -> bool {
-        matches!(
-            self.agent_gateway_args()
-                .map(|gateway| &gateway.command),
-            Some(Command::Shell)
-        )
+        match &self.appliance {
+            Appliance::AgentGateway(gateway) => matches!(gateway.command, Command::Shell),
+            #[cfg(feature = "agent-stream")]
+            Appliance::AgentStream(stream) => stream.is_shell(),
+        }
+    }
+
+    /// What the interactive shell opened by this command shows: its banner,
+    /// prompt and token prompt name the appliance the shell runs commands on.
+    pub fn shell_text(&self) -> &'static ShellText {
+        match &self.appliance {
+            Appliance::AgentGateway(_) => &GATEWAY_SHELL_TEXT,
+            #[cfg(feature = "agent-stream")]
+            Appliance::AgentStream(_) => &crate::agent_stream::SHELL_TEXT,
+        }
     }
 
     /// Arguments every line typed in the interactive shell is parsed after:
-    /// `fabric agent-gateway`, the one appliance with a shell, plus the global
-    /// flags the shell was started with.
+    /// the appliance the shell was opened for, `fabric agent-gateway` or
+    /// `fabric agent-stream`, plus the global flags the shell was started with.
     pub fn interactive_prefix(&self) -> Vec<String> {
-        let mut args = vec!["fabric".to_owned(), "agent-gateway".to_owned()];
+        #[cfg(feature = "agent-stream")]
+        if let Appliance::AgentStream(stream) = &self.appliance {
+            return stream.interactive_prefix();
+        }
         let Some(gateway) = self.agent_gateway_args() else {
-            return args;
+            return vec!["fabric".to_owned(), "agent-gateway".to_owned()];
         };
-        if let Some(connection) = &gateway.connection {
-            args.extend(["--connection".to_owned(), connection.clone()]);
-        }
-        if let Some(host) = &gateway.host {
-            args.extend(["--host".to_owned(), host.clone()]);
-        }
-        if let Some(token) = &gateway.token {
-            args.extend(["--token".to_owned(), token.clone()]);
-        }
-        if gateway.allow_http {
-            args.push("--allow-http".to_owned());
-        }
-        if gateway.allow_host_override {
-            args.push("--allow-host-override".to_owned());
-        }
-        args.extend([
-            "--output".to_owned(),
-            gateway
-                .output
-                .as_str()
-                .to_owned(),
-        ]);
-        args
-    }
-
-    pub fn login_wants_paste_prompt(&self) -> bool {
-        matches!(
-            self.agent_gateway_args()
-                .map(|gateway| &gateway.command),
-            Some(Command::Login(args)) if args.paste && args.token.is_none() && !args.token_stdin
+        shell_prefix(
+            Product::AgentGateway,
+            ShellGlobals {
+                connection: gateway.connection.as_deref(),
+                host: gateway.host.as_deref(),
+                token: gateway.token.as_deref(),
+                flags: HostFlags {
+                    allow_http: gateway.allow_http,
+                    allow_host_override: gateway.allow_host_override,
+                },
+                output: gateway.output,
+            },
         )
     }
 
+    /// Whether this is `login --paste` with no token given, which the
+    /// interactive shell asks for at its own prompt.
+    pub fn login_wants_paste_prompt(&self) -> bool {
+        match &self.appliance {
+            Appliance::AgentGateway(gateway) => {
+                matches!(&gateway.command, Command::Login(args) if args.paste && args.token.is_none() && !args.token_stdin)
+            }
+            #[cfg(feature = "agent-stream")]
+            Appliance::AgentStream(stream) => stream.login_wants_paste_prompt(),
+        }
+    }
+
+    /// Gives a `login` the token the interactive shell read for it.
     pub fn set_login_token(
         &mut self,
         token: String,
     ) {
-        if let Appliance::AgentGateway(gateway) = &mut self.appliance
-            && let Command::Login(args) = &mut gateway.command
-        {
-            args.token = Some(token);
+        match &mut self.appliance {
+            Appliance::AgentGateway(gateway) => {
+                if let Command::Login(args) = &mut gateway.command {
+                    args.token = Some(token);
+                }
+            }
+            #[cfg(feature = "agent-stream")]
+            Appliance::AgentStream(stream) => stream.set_login_token(token),
         }
     }
+}
+
+/// What the interactive shell of one appliance shows, and how its `login`
+/// asks for a token on the terminal.
+pub struct ShellText {
+    /// The appliance the shell runs commands on.
+    pub product: Product,
+    /// The line printed when the shell opens.
+    pub banner: &'static str,
+    /// The prompt before every typed line.
+    pub prompt: &'static str,
+    /// The note for `shell` typed inside the shell.
+    pub already_open: &'static str,
+    /// The prompt for the token of `login --paste`, and of a `login` that
+    /// asks on the terminal.
+    pub paste_prompt: &'static str,
+    /// What messages about a token typed at [`Self::paste_prompt`] call it.
+    pub token_name: &'static str,
+}
+
+/// What the interactive shell shows when it was opened with
+/// `fabric agent-gateway shell`, and how `fabric agent-gateway login` asks for a token
+/// on the terminal.
+pub(crate) const GATEWAY_SHELL_TEXT: ShellText = ShellText {
+    product: Product::AgentGateway,
+    banner: "Fabric Agent Gateway interactive shell. Type `help` for commands; `exit` or `quit` to leave.",
+    prompt: "fabric agent-gateway> ",
+    already_open: "note: already in the interactive shell; type a command such as `surfaces list`",
+    paste_prompt: "Gateway bearer token: ",
+    token_name: "bearer token",
+};
+
+/// The global flags of an appliance that the interactive shell passes to
+/// every typed line.
+pub(crate) struct ShellGlobals<'a> {
+    pub(crate) connection: Option<&'a str>,
+    pub(crate) host: Option<&'a str>,
+    pub(crate) token: Option<&'a str>,
+    pub(crate) flags: HostFlags,
+    pub(crate) output: Output,
+}
+
+/// Arguments every line typed in the interactive shell of `product` is parsed
+/// after: its command group, such as `fabric agent-gateway`, then the
+/// `globals` the shell was started with, each that was given, and `--output`.
+pub(crate) fn shell_prefix(
+    product: Product,
+    globals: ShellGlobals<'_>,
+) -> Vec<String> {
+    let mut args: Vec<String> = product
+        .command()
+        .split(' ')
+        .map(str::to_owned)
+        .collect();
+    if let Some(connection) = globals.connection {
+        args.extend(["--connection".to_owned(), connection.to_owned()]);
+    }
+    if let Some(host) = globals.host {
+        args.extend(["--host".to_owned(), host.to_owned()]);
+    }
+    if let Some(token) = globals.token {
+        args.extend(["--token".to_owned(), token.to_owned()]);
+    }
+    if globals.flags.allow_http {
+        args.push("--allow-http".to_owned());
+    }
+    if globals
+        .flags
+        .allow_host_override
+    {
+        args.push("--allow-host-override".to_owned());
+    }
+    args.extend([
+        "--output".to_owned(),
+        globals
+            .output
+            .as_str()
+            .to_owned(),
+    ]);
+    args
 }
 
 /// How a command that returns data prints it.
@@ -191,7 +293,7 @@ pub(crate) enum Output {
 }
 
 impl Output {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Json => "json",
             Self::Table => "table",
@@ -696,7 +798,7 @@ struct LoginArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum ConfigCommand {
+pub(crate) enum ConfigCommand {
     /// List saved gateway profiles, with their hosts and which one is current.
     List,
     /// Select the default gateway profile.
@@ -1563,7 +1665,7 @@ struct FeaturePlacementArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum AccessTokenCommand {
+pub(crate) enum AccessTokenCommand {
     /// List personal access tokens.
     ///
     /// STATUS is REVOKED for a token that has been revoked or has expired, and
@@ -1653,59 +1755,59 @@ const TOKENS_ROTATE_EXAMPLES: &str = r#"Examples:
     PAT=$(fabric agent-gateway tokens rotate <token-id> --yes)"#;
 
 #[derive(Debug, Args)]
-struct AccessTokenRevokeArgs {
+pub(crate) struct AccessTokenRevokeArgs {
     /// ID of the personal access token to revoke.
-    id: String,
+    pub(crate) id: String,
     /// Skip the confirmation prompt. Required when running non-interactively.
     #[arg(short, long)]
-    yes: bool,
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug, Args)]
-struct AccessTokenRotateArgs {
+pub(crate) struct AccessTokenRotateArgs {
     /// ID of the personal access token to rotate.
-    id: String,
+    pub(crate) id: String,
     /// Skip the confirmation prompt. Required when running non-interactively.
     #[arg(short, long)]
-    yes: bool,
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug, Args)]
-struct AccessTokenCreateArgs {
+pub(crate) struct AccessTokenCreateArgs {
     /// Token name. Required unless --file is given.
     #[arg(long, required_unless_present = "file")]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     /// What the token is for.
     #[arg(long, default_value = "")]
-    description: String,
+    pub(crate) description: String,
     /// Scope to grant the token. Repeat for multiple scopes. Required unless
     /// --full-role is given; run `fabric agent-gateway tokens scopes` to see
     /// what you can grant.
     #[arg(long = "scope")]
-    scopes: Vec<String>,
+    pub(crate) scopes: Vec<String>,
     /// Give the token everything your own role can do, instead of listing
     /// scopes. Use it only when a limited token will not do.
     #[arg(long, conflicts_with = "scopes")]
-    full_role: bool,
+    pub(crate) full_role: bool,
     /// RFC 3339 expiry timestamp, for example 2027-01-01T00:00:00Z. Defaults
     /// to 90 days from now.
     #[arg(long)]
-    expires_at: Option<String>,
+    pub(crate) expires_at: Option<String>,
     /// Resource the token is limited to, as
     /// TENANT:${header}:<resource-kind>:<id-pattern>, where ${header} names
     /// one of the --required-header flags. Omit for an appliance-wide token.
     #[arg(long)]
-    resource_pattern: Option<String>,
+    pub(crate) resource_pattern: Option<String>,
     /// Header the caller must send, as name=pattern, where pattern is a regex
     /// the whole header value must match. Repeat for more headers. The header
     /// named in --resource-pattern must normally be one exact value, such as
     /// acme.
     #[arg(long = "required-header", value_parser = parse_required_header)]
-    required_headers: Vec<(String, String)>,
+    pub(crate) required_headers: Vec<(String, String)>,
     /// JSON request body, or - for standard input. Other creation flags except
     /// --full-role are ignored when set.
     #[arg(short, long)]
-    file: Option<PathBuf>,
+    pub(crate) file: Option<PathBuf>,
 }
 
 /// How long a token lives when `tokens create` is not told.
@@ -1714,7 +1816,7 @@ const DEFAULT_TOKEN_LIFETIME_DAYS: u64 = 90;
 /// Parses a `--required-header` occurrence of the form `name=pattern` into
 /// its two non-empty parts, rejecting malformed input before it ever reaches
 /// the gateway.
-fn parse_required_header(raw: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_required_header(raw: &str) -> Result<(String, String), String> {
     let (name, pattern) = raw
         .split_once('=')
         .ok_or_else(|| format!("expected name=pattern, got '{raw}'"))?;
@@ -1821,22 +1923,22 @@ enum PolicyType {
 }
 
 #[derive(Debug, Args)]
-struct ApiArgs {
+pub(crate) struct ApiArgs {
     /// HTTP method.
     #[arg(value_enum)]
-    method: ApiMethod,
+    pub(crate) method: ApiMethod,
     /// API path such as /v1/limits.
-    path: String,
+    pub(crate) path: String,
     /// Inline JSON request body.
     #[arg(long, conflicts_with = "file")]
-    data: Option<String>,
+    pub(crate) data: Option<String>,
     /// JSON request body file. Use '-' for standard input.
     #[arg(short, long)]
-    file: Option<PathBuf>,
+    pub(crate) file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum ApiMethod {
+pub(crate) enum ApiMethod {
     Get,
     Post,
     Put,
@@ -1905,21 +2007,27 @@ pub fn inline_secret_warnings(args: &[String]) -> Vec<String> {
 /// from environment variables, so a token set in a shell profile and a host set
 /// by a project's `.envrc` do not meet without a word. A token or host typed on
 /// the command line, or a host that comes from the saved connection, is the
-/// user's own choice and gets no note. `matches` is the parsed command line.
+/// user's own choice and gets no note. `matches` is the parsed command line,
+/// of either appliance; only Agent Gateway's `login` has a host and token of
+/// its own besides the global ones.
 pub fn env_token_and_host_note(matches: &ArgMatches) -> Option<String> {
-    let gateway = matches.subcommand_matches("agent-gateway")?;
-    let login = gateway.subcommand_matches("login");
+    let (appliance, login) = match matches.subcommand()? {
+        ("agent-gateway", gateway) => (gateway, gateway.subcommand_matches("login")),
+        #[cfg(feature = "agent-stream")]
+        ("agent-stream", stream) => (stream, None),
+        _ => return None,
+    };
     let source = |id: &str| {
         login
             .and_then(|login| login.value_source(id))
-            .or_else(|| gateway.value_source(id))
+            .or_else(|| appliance.value_source(id))
     };
     if source("token") != Some(ValueSource::EnvVariable) || source("host") != Some(ValueSource::EnvVariable) {
         return None;
     }
     let host = login
         .and_then(|login| login.get_one::<String>("host"))
-        .or_else(|| gateway.get_one::<String>("host"))?;
+        .or_else(|| appliance.get_one::<String>("host"))?;
     Some(format!(
         "note: sending the token from FABRIC_TOKEN to the host from FABRIC_HOST ({})",
         sanitize_for_terminal(host)
@@ -1952,7 +2060,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
             .map_err(add_terms_hint),
         #[cfg(feature = "agent-stream")]
-        Appliance::AgentStream(args) => crate::agent_stream::dispatch(args),
+        Appliance::AgentStream(args) => crate::agent_stream::dispatch(*args).await,
     }
 }
 
@@ -1994,7 +2102,9 @@ async fn dispatch_with(
             login(&mut config, credentials, connection, args, cli.allow_http).await
         }
         Command::Logout(args) => logout(&mut config, credentials, cli.connection.as_deref(), args.revoke_token).await,
-        Command::Config { command } => run_config(&mut config, credentials, command, cli.output),
+        Command::Config { command } => {
+            run_config(&mut config, credentials, command, &crate::config::config_path()?, cli.output)
+        }
         Command::Whoami => {
             whoami(
                 &config,
@@ -2149,9 +2259,9 @@ async fn dispatch_with(
 
 /// What a command may do about the host it sends a token to.
 #[derive(Clone, Copy, Default)]
-struct HostFlags {
-    allow_http: bool,
-    allow_host_override: bool,
+pub(crate) struct HostFlags {
+    pub(crate) allow_http: bool,
+    pub(crate) allow_host_override: bool,
 }
 
 /// The warnings already shown in this process, so the interactive shell, which
@@ -2210,7 +2320,7 @@ fn skips_the_credential_store(cli: &AgentGatewayArgs) -> bool {
 
 /// The host and token given for this run (`--host`/FABRIC_HOST and
 /// `--token`/FABRIC_TOKEN), when both were.
-fn given_host_and_token<'a>(
+pub(crate) fn given_host_and_token<'a>(
     host: Option<&'a str>,
     token: Option<&'a str>,
 ) -> Option<(&'a str, &'a str)> {
@@ -2226,24 +2336,25 @@ fn no_saved_connection_selected(
     connection.is_none() && config.current.is_none()
 }
 
-/// The gateway a command talks to and the token it sends there.
-struct CommandTarget {
+/// The appliance a command talks to and the token it sends there.
+pub(crate) struct CommandTarget {
     /// The saved connection used, or `None` when the run uses only the host
     /// and token it was given.
-    connection: Option<String>,
-    host: String,
-    token: Option<String>,
+    pub(crate) connection: Option<String>,
+    pub(crate) host: String,
+    pub(crate) token: Option<String>,
     /// Whether `token` was read from the credential store, rather than given
     /// with `--token`/FABRIC_TOKEN.
-    token_stored: bool,
+    pub(crate) token_stored: bool,
 }
 
 /// Works out where a command goes and with which token. With no saved
 /// connection selected and both a host and a token given, those two are used
 /// as they are and the credential store is never touched. Otherwise the
-/// selected saved connection supplies whatever was not given, and a saved
-/// token is only sent to the host it was saved for (see [`check_token_host`]).
-fn command_target(
+/// selected saved connection of the product whose connections `credentials`
+/// keeps supplies whatever was not given, and a saved token is only sent to
+/// the host it was saved for (see [`check_token_host`]).
+pub(crate) fn command_target(
     config: &Config,
     credentials: &impl CredentialStore,
     connection: Option<&str>,
@@ -2261,7 +2372,7 @@ fn command_target(
             token_stored: false,
         });
     }
-    let (name, saved) = config.resolve(connection)?;
+    let (name, saved) = config.resolve_for(credentials.product(), connection)?;
     let host = command_host(saved, host_override, flags.allow_http)?;
     let (token, token_stored) = match token_override {
         Some(token) => (Some(token.to_owned()), false),
@@ -2305,7 +2416,8 @@ fn command_host(
 /// the host beside the token; a connection saved before that falls back to the
 /// host in the configuration, and that host is recorded on its first use so a
 /// later edit of the configuration cannot move the token. `allow_host_override`
-/// lets the token go anyway, with a warning.
+/// lets the token go anyway, with a warning. The messages name the file and the
+/// `login` command of the product whose connections `credentials` keeps.
 fn check_token_host(
     credentials: &impl CredentialStore,
     name: &str,
@@ -2330,12 +2442,7 @@ fn check_token_host(
             if let Err(error) = credentials.set_bound_host(name, &bound)
                 && first_warning_for(format!("bound-host:{name}"))
             {
-                eprintln!(
-                    "warning: could not save the host for connection '{}' ({}); its token keeps following the \
-                     host in config.toml",
-                    sanitize_whole(name),
-                    sanitize_for_terminal(&error.to_string())
-                );
+                eprintln!("{}", bound_host_not_saved_warning(credentials.product(), name, &error));
             }
         }
         return Ok(());
@@ -2346,8 +2453,27 @@ fn check_token_host(
     }
     bail!(
         "the token saved for connection '{name}' belongs to {bound}, so it was not sent to {requested}; to log in \
-         there run `fabric agent-gateway login --connection {name} --host {requested}`, or pass \
-         --allow-host-override to send the saved token anyway"
+         there run `{} login --connection {name} --host {requested}`, or pass --allow-host-override to send the \
+         saved token anyway",
+        credentials
+            .product()
+            .command()
+    )
+}
+
+/// The warning for a connection of `product` called `name` whose bound host
+/// could not be recorded because of `error`: its token keeps following the
+/// host in that product's connections file.
+fn bound_host_not_saved_warning(
+    product: Product,
+    name: &str,
+    error: &anyhow::Error,
+) -> String {
+    format!(
+        "warning: could not save the host for connection '{}' ({}); its token keeps following the host in {}",
+        sanitize_whole(name),
+        sanitize_for_terminal(&error.to_string()),
+        product.config_file_name()
     )
 }
 
@@ -2395,13 +2521,7 @@ async fn login_and_save(
     allow_http: bool,
     config_path: &Path,
 ) -> Result<Option<String>> {
-    let connection = connection.trim();
-    if connection.is_empty() {
-        bail!("--connection must not be empty or only whitespace");
-    }
-    if connection.contains('#') {
-        bail!("--connection must not contain '#'");
-    }
+    let connection = checked_connection_name(connection)?;
     let host = normalize_user_host(
         &args
             .host
@@ -2427,22 +2547,53 @@ async fn login_and_save(
             .await
             .context("validate login")?;
     }
+    save_login(config, credentials, connection, &host, &token, config_path)
+}
+
+/// The name a login saves its connection under, trimmed. A name that is
+/// empty once trimmed, or that contains `#`, is refused, because the host a
+/// token is bound to is kept under `<name>#bound-host`.
+pub(crate) fn checked_connection_name(connection: &str) -> Result<&str> {
+    let connection = connection.trim();
+    if connection.is_empty() {
+        bail!("--connection must not be empty or only whitespace");
+    }
+    if connection.contains('#') {
+        bail!("--connection must not contain '#'");
+    }
+    Ok(connection)
+}
+
+/// Saves a checked login for either product: `token` and the `host` it is
+/// bound to go into `credentials`, and the connection, now current, into
+/// `config`, which is then written to the file at `config_path`. When either
+/// write fails, the token and bound host the connection had before are put
+/// back. Returns a note to show the user when the login replaced a connection
+/// that already existed.
+pub(crate) fn save_login(
+    config: &mut Config,
+    credentials: &impl CredentialStore,
+    connection: &str,
+    host: &str,
+    token: &str,
+    config_path: &Path,
+) -> Result<Option<String>> {
     let previous_token = credentials.get_token(connection)?;
     let previous_host = credentials.get_bound_host(connection)?;
-    credentials.set_token(connection, &token)?;
-    if let Err(error) = credentials.set_bound_host(connection, &host) {
+    credentials.set_token(connection, token)?;
+    if let Err(error) = credentials.set_bound_host(connection, host) {
         restore_credentials(credentials, connection, previous_token, previous_host)?;
         return Err(error);
     }
     let previous = config
         .connections
-        .insert(connection.to_owned(), Connection::new(host.clone()));
+        .insert(connection.to_owned(), Connection::new(host.to_owned()));
     config.current = Some(connection.to_owned());
     if let Err(error) = config.save_to(config_path) {
         restore_credentials(credentials, connection, previous_token, previous_host)?;
         return Err(error);
     }
-    Ok(previous.map(|previous| replaced_connection_note(connection, &previous.host, &host)))
+    Ok(previous.map(|previous| replaced_connection_note(connection, &previous.host, host)))
 }
 
 /// Puts back the token and bound host a failed login replaced, or removes
@@ -2496,7 +2647,7 @@ async fn acquire_login_token(
         return read_stdin_token();
     }
     if args.paste {
-        return prompt_token();
+        return prompt_token(&GATEWAY_SHELL_TEXT);
     }
     if !io::stdin().is_terminal() {
         // Piped input without an explicit mode is treated as the token so
@@ -2535,7 +2686,7 @@ async fn acquire_pat_token(args: &LoginArgs) -> Result<String> {
     Ok(token)
 }
 
-fn read_stdin_token() -> Result<String> {
+pub(crate) fn read_stdin_token() -> Result<String> {
     let mut value = String::new();
     io::stdin()
         .read_to_string(&mut value)
@@ -2543,17 +2694,21 @@ fn read_stdin_token() -> Result<String> {
     non_empty_token(value)
 }
 
-fn prompt_token() -> Result<String> {
-    let token = rpassword::prompt_password("Gateway bearer token: ").map_err(|error| {
+/// Asks for a token on the terminal, without echo, at the paste prompt of
+/// `text`, for a `login` of the appliance `text` belongs to.
+pub(crate) fn prompt_token(text: &ShellText) -> Result<String> {
+    let token = rpassword::prompt_password(text.paste_prompt).map_err(|error| {
         anyhow::anyhow!(
-            "could not read the bearer token from this terminal ({error}). Run `fabric agent-gateway \
-             shell` for the interactive shell, pipe the token with --token-stdin, or set FABRIC_TOKEN."
+            "could not read the {} from this terminal ({error}). Run `{} shell` for the interactive shell, pipe the \
+             token with --token-stdin, or set FABRIC_TOKEN.",
+            text.token_name,
+            text.product.command()
         )
     })?;
     non_empty_token(token)
 }
 
-fn non_empty_token(token: String) -> Result<String> {
+pub(crate) fn non_empty_token(token: String) -> Result<String> {
     let token = token.trim().to_owned();
     if token.is_empty() {
         bail!("bearer token must not be empty");
@@ -2794,8 +2949,9 @@ async fn insert_token_details(
     }
 }
 
-/// What the `whoami` table shows when the gateway did not give its version.
-const UNKNOWN_GATEWAY_VERSION: &str = "unknown";
+/// What the `whoami` table of either product shows when the appliance did not
+/// give its version.
+const UNKNOWN_VERSION: &str = "unknown";
 
 fn print_info_table(value: &Value) {
     for line in info_table_lines(value) {
@@ -2807,28 +2963,43 @@ fn print_info_table(value: &Value) {
 /// the user typed, so each is stripped of control characters first. A
 /// `gateway_version` of `null` shows as `unknown`.
 fn info_table_lines(value: &Value) -> Vec<String> {
-    const ORDER: &[&str] = &[
-        "connection",
-        "host",
-        "gateway_version",
-        "token_stored",
-        "authenticated",
-        "username",
-        "role",
-        "email",
-        "user_id",
-        "token_id",
-        "token_name",
-        "first_name",
-        "last_name",
-        "scopes",
-        "error",
-    ];
+    whoami_table_lines(value, GATEWAY_WHOAMI_ORDER, "gateway_version")
+}
+
+/// The fields of the Agent Gateway `whoami` table, in the order it shows them.
+const GATEWAY_WHOAMI_ORDER: &[&str] = &[
+    "connection",
+    "host",
+    "gateway_version",
+    "token_stored",
+    "authenticated",
+    "username",
+    "role",
+    "email",
+    "user_id",
+    "token_id",
+    "token_name",
+    "first_name",
+    "last_name",
+    "scopes",
+    "error",
+];
+
+/// A `whoami` table as lines, for either product: one `key: value` line for
+/// each key of `order` that `value` has, in that order. Every value came from
+/// the appliance or from what the user typed, so each is stripped of control
+/// characters first. A `connection` of `null` is left out, and a
+/// `version_key` of `null` shows as `unknown`.
+pub(crate) fn whoami_table_lines(
+    value: &Value,
+    order: &[&str],
+    version_key: &str,
+) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return vec![value.to_string()];
     };
     let mut lines = Vec::new();
-    for key in ORDER {
+    for key in order {
         if let Some(field) = object
             .get(*key)
             .filter(|field| *key != "connection" || !field.is_null())
@@ -2841,7 +3012,7 @@ fn info_table_lines(value: &Value) -> Vec<String> {
                     .map(tables::flatten_capped)
                     .collect::<Vec<_>>()
                     .join(", "),
-                Value::Null if *key == "gateway_version" => UNKNOWN_GATEWAY_VERSION.to_owned(),
+                Value::Null if *key == version_key => UNKNOWN_VERSION.to_owned(),
                 other => other.to_string(),
             };
             lines.push(format!("{key}: {}", sanitize_for_terminal(&rendered)));
@@ -2964,7 +3135,15 @@ async fn end_remote_credential(
             },
         );
     }
-    Some(match client.end_session().await {
+    Some(end_session_note(&client).await)
+}
+
+/// Ends the session behind the session token of `client` on its host, and
+/// returns the line to show about it. Best effort: a host that cannot be
+/// reached or will not end the session gets a warning, never an error.
+pub(crate) async fn end_session_note(client: &GatewayClient) -> String {
+    let host = client.host();
+    match client.end_session().await {
         Ok(()) => format!("note: ended the session on {host}"),
         Err(error) if response_status(&error).is_none() => {
             format!("warning: could not reach {host} to end the session, so it stays valid there until it expires")
@@ -2973,7 +3152,7 @@ async fn end_remote_credential(
             "warning: {host} would not end the session ({}), so it stays valid there until it expires",
             sanitize_for_terminal(&error.to_string())
         ),
-    })
+    }
 }
 
 /// What to tell a user who logged out of a connection whose saved token was
@@ -3027,8 +3206,13 @@ fn pat_still_valid_note(
     }
 }
 
-/// Removes a connection and its token from this machine only.
-fn remove_connection(
+/// Removes a connection and its token from this machine only, for either
+/// product: `config` holds the connections saved in the file at
+/// `config_path`, and `credentials` is the same product's store, whose product
+/// the error for an unknown name is worded for. The keyring entries go first,
+/// so an entry left behind by a connection that is already gone from the file
+/// is cleaned up too.
+pub(crate) fn remove_connection(
     config: &mut Config,
     credentials: &impl CredentialStore,
     name: &str,
@@ -3041,7 +3225,12 @@ fn remove_connection(
         .remove(name)
         .is_none()
     {
-        bail!("gateway connection '{name}' does not exist");
+        bail!(
+            "{} '{name}' does not exist",
+            credentials
+                .product()
+                .connection_noun()
+        );
     }
     if config.current.as_deref() == Some(name) {
         config.current = config
@@ -3055,30 +3244,41 @@ fn remove_connection(
     Ok(())
 }
 
-fn run_config(
+/// Runs one `config` command, for either product, on `config`, the
+/// connections saved in the file at `config_path`. `credentials` is the same
+/// product's store, and its product decides how `config list` shows the
+/// connections (see [`tables::connections`]) and how the error for an unknown
+/// name is worded. These commands never contact an appliance.
+pub(crate) fn run_config(
     config: &mut Config,
     credentials: &impl CredentialStore,
     command: ConfigCommand,
+    config_path: &Path,
     output: Output,
 ) -> Result<()> {
     match command {
         ConfigCommand::List => {
             let rows: Vec<Value> = config.connections.iter().map(|(name, connection)| json!({"name": name, "host": connection.host, "current": config.current.as_deref() == Some(name)})).collect();
-            print_list(&Value::Array(rows), output, &tables::CONNECTION_SETTINGS, Scope::All)
+            print_list(&Value::Array(rows), output, tables::connections(credentials.product()), Scope::All)
         }
         ConfigCommand::Use { name } => {
             if !config
                 .connections
                 .contains_key(&name)
             {
-                bail!("gateway connection '{name}' does not exist");
+                bail!(
+                    "{} '{name}' does not exist",
+                    credentials
+                        .product()
+                        .connection_noun()
+                );
             }
             config.current = Some(name.clone());
-            config.save()?;
+            config.save_to(config_path)?;
             println!("Using '{name}'");
             Ok(())
         }
-        ConfigCommand::Remove { name } => remove_connection(config, credentials, &name, &crate::config::config_path()?),
+        ConfigCommand::Remove { name } => remove_connection(config, credentials, &name, config_path),
     }
 }
 
@@ -7535,6 +7735,10 @@ mod gateway_config_tests {
     struct NoCredentials;
 
     impl CredentialStore for NoCredentials {
+        fn product(&self) -> Product {
+            Product::AgentGateway
+        }
+
         fn get_token(
             &self,
             _connection: &str,
@@ -12749,13 +12953,14 @@ mod identity_access_tests {
     }
 }
 
-/// Runs an `access-tokens` command and prints the result. `list` renders the
-/// shared table, `revoke` prints a confirmation line, `create` and `rotate`
-/// print the new secret alone with their confirmation on standard error, `get`
-/// uses the shared value printer and `scopes` prints one grantable scope per
-/// line. `--output json` always emits the raw gateway response (or, for
+/// Runs an `access-tokens` command and prints the result, for the product
+/// `client` talks to, whose `tokens scopes` command the hints name. `list`
+/// renders the shared table, `revoke` prints a confirmation line, `create` and
+/// `rotate` print the new secret alone with their confirmation on standard
+/// error, `get` uses the shared value printer and `scopes` prints one grantable
+/// scope per line. `--output json` always emits the raw response (or, for
 /// `scopes`, the filtered scope array).
-async fn run_access_tokens(
+pub(crate) async fn run_access_tokens(
     client: &GatewayClient,
     command: AccessTokenCommand,
     output: Output,
@@ -12819,7 +13024,8 @@ async fn run_access_tokens(
             } else {
                 access_token_body(args)?
             };
-            if let Some(expires_at) = require_scopes_and_expiry(&mut body, full_role, unix_now())? {
+            if let Some(expires_at) = require_scopes_and_expiry_of(client.product(), &mut body, full_role, unix_now())?
+            {
                 eprintln!(
                     "note: no expiry was given, so this token expires on {expires_at} ({DEFAULT_TOKEN_LIFETIME_DAYS} days from now)"
                 );
@@ -12827,7 +13033,7 @@ async fn run_access_tokens(
             let value = client
                 .request(Method::POST, "/v1/access-tokens", Some(body))
                 .await
-                .map_err(add_unknown_scope_hint)?;
+                .map_err(|error| add_unknown_scope_hint_of(client.product(), error))?;
             print_issued(&value, output, "Created", "access token", None, Some("token"))?;
         }
         AccessTokenCommand::Scopes => {
@@ -12952,12 +13158,24 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
 }
 
+/// [`require_scopes_and_expiry_of`] for an Agent Gateway token.
+#[cfg(test)]
+fn require_scopes_and_expiry(
+    body: &mut Value,
+    full_role: bool,
+    now: u64,
+) -> Result<Option<String>> {
+    require_scopes_and_expiry_of(Product::AgentGateway, body, full_role, now)
+}
+
 /// Checks a new token's request body before it is sent. A token with no scopes
 /// holds the creator's whole role on the whole appliance, so that has to be
-/// asked for with `--full-role`. A body with no expiry gets one
+/// asked for with `--full-role`, and the refusal names the `tokens scopes`
+/// command of `product`. A body with no expiry gets one
 /// [`DEFAULT_TOKEN_LIFETIME_DAYS`] days after `now`, which is returned so the
 /// caller can say so.
-fn require_scopes_and_expiry(
+fn require_scopes_and_expiry_of(
+    product: Product,
     body: &mut Value,
     full_role: bool,
     now: u64,
@@ -12968,8 +13186,9 @@ fn require_scopes_and_expiry(
         .is_some_and(|scopes| !scopes.is_empty());
     if !has_scopes && !full_role {
         bail!(
-            "a token with no scopes would hold your whole role, so name what it may do with --scope (see `fabric \
-             agent-gateway tokens scopes`), or pass --full-role if that is what you want"
+            "a token with no scopes would hold your whole role, so name what it may do with --scope (see `{} tokens \
+             scopes`), or pass --full-role if that is what you want",
+            product.command()
         );
     }
     let object = body
@@ -13047,12 +13266,21 @@ fn access_token_body(args: AccessTokenCreateArgs) -> Result<Value> {
     Ok(body)
 }
 
-/// Appends a hint pointing at `fabric agent-gateway tokens scopes` when the gateway rejects
-/// a token creation request for an unknown scope.
+/// [`add_unknown_scope_hint_of`] for an Agent Gateway answer.
+#[cfg(test)]
 fn add_unknown_scope_hint(error: anyhow::Error) -> anyhow::Error {
+    add_unknown_scope_hint_of(Product::AgentGateway, error)
+}
+
+/// Appends a hint pointing at the `tokens scopes` command of `product` when it
+/// rejects a token creation request for an unknown scope.
+fn add_unknown_scope_hint_of(
+    product: Product,
+    error: anyhow::Error,
+) -> anyhow::Error {
     let message = error.to_string();
     if message.contains("unknown scope") {
-        return anyhow::anyhow!("{message} (see `fabric agent-gateway tokens scopes`)");
+        return anyhow::anyhow!("{message} (see `{} tokens scopes`)", product.command());
     }
     error
 }
@@ -16591,7 +16819,7 @@ mod observability_tests {
     }
 }
 
-async fn run_api(
+pub(crate) async fn run_api(
     client: &GatewayClient,
     args: ApiArgs,
 ) -> Result<Value> {
@@ -16678,7 +16906,7 @@ fn print_json_or_else(
     Ok(())
 }
 
-fn print_value(
+pub(crate) fn print_value(
     value: &Value,
     output: Output,
 ) -> Result<()> {
@@ -17079,6 +17307,10 @@ mod tests {
     struct MemoryCredentials(Mutex<HashMap<String, String>>);
 
     impl CredentialStore for MemoryCredentials {
+        fn product(&self) -> Product {
+            Product::AgentGateway
+        }
+
         fn get_token(
             &self,
             connection: &str,
@@ -17703,6 +17935,10 @@ mod tests {
     struct UnreachableKeyring;
 
     impl CredentialStore for UnreachableKeyring {
+        fn product(&self) -> Product {
+            Product::AgentGateway
+        }
+
         fn get_token(
             &self,
             connection: &str,
@@ -18789,6 +19025,10 @@ mod tests {
     struct UnwritableCredentials(MemoryCredentials);
 
     impl CredentialStore for UnwritableCredentials {
+        fn product(&self) -> Product {
+            Product::AgentGateway
+        }
+
         fn get_token(
             &self,
             connection: &str,
@@ -18901,6 +19141,116 @@ mod tests {
         assert!(note.contains("still valid on https://gateway.example.com"), "{note}");
         assert!(note.contains("`fabric agent-gateway tokens list`"), "{note}");
         assert!(note.ends_with("fabric agent-gateway tokens revoke <token-id>"), "{note}");
+    }
+
+    #[test]
+    fn config_use_makes_a_saved_gateway_connection_current_in_the_given_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = config_with_connection("default", "https://gateway.example.com");
+        config
+            .connections
+            .insert("staging".to_owned(), Connection::new("https://staging.example.com".to_owned()));
+
+        run_config(
+            &mut config,
+            &MemoryCredentials::default(),
+            ConfigCommand::Use { name: "staging".to_owned() },
+            &path,
+            Output::Table,
+        )
+        .expect("staging is saved");
+
+        assert_eq!(config.current.as_deref(), Some("staging"));
+        let written = Config::load_from(&path).unwrap();
+        assert_eq!(written.current.as_deref(), Some("staging"));
+        assert_eq!(
+            written
+                .connections
+                .keys()
+                .collect::<Vec<_>>(),
+            ["default", "staging"]
+        );
+    }
+
+    #[test]
+    fn config_use_of_an_unknown_gateway_connection_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = config_with_connection("default", "https://gateway.example.com");
+
+        let error = run_config(
+            &mut config,
+            &MemoryCredentials::default(),
+            ConfigCommand::Use { name: "ghost".to_owned() },
+            &path,
+            Output::Table,
+        )
+        .expect_err("ghost is not saved");
+
+        assert_eq!(error.to_string(), "gateway connection 'ghost' does not exist");
+        assert_eq!(config.current.as_deref(), Some("default"));
+        assert!(!path.exists(), "nothing is written for a refused name");
+    }
+
+    #[test]
+    fn the_bound_host_warning_names_the_connections_file_of_each_product() {
+        let error = anyhow::anyhow!("store is read-only");
+
+        assert_eq!(
+            bound_host_not_saved_warning(Product::AgentGateway, "default", &error),
+            "warning: could not save the host for connection 'default' (store is read-only); its token keeps \
+             following the host in config.toml"
+        );
+        assert_eq!(
+            bound_host_not_saved_warning(Product::AgentStream, "default", &error),
+            "warning: could not save the host for connection 'default' (store is read-only); its token keeps \
+             following the host in agent-stream.toml"
+        );
+    }
+
+    #[test]
+    fn the_agent_gateway_shell_prefix_keeps_every_startup_flag_in_its_released_order() {
+        let cli = Cli::try_parse_from([
+            "fabric",
+            "agent-gateway",
+            "--connection",
+            "production",
+            "--host",
+            "https://gateway.example.com",
+            "--token",
+            "agpat_secret",
+            "--allow-http",
+            "--allow-host-override",
+            "--output",
+            "json",
+            "shell",
+        ])
+        .expect("shell parses with every global flag");
+
+        assert_eq!(
+            cli.interactive_prefix(),
+            [
+                "fabric",
+                "agent-gateway",
+                "--connection",
+                "production",
+                "--host",
+                "https://gateway.example.com",
+                "--token",
+                "agpat_secret",
+                "--allow-http",
+                "--allow-host-override",
+                "--output",
+                "json",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_list_shows_the_connections_of_the_product_the_store_keeps() {
+        assert!(std::ptr::eq(tables::connections(Product::AgentGateway), &tables::CONNECTION_SETTINGS));
+        assert!(std::ptr::eq(tables::connections(Product::AgentStream), &tables::AGENT_STREAM_CONNECTIONS));
     }
 
     #[test]

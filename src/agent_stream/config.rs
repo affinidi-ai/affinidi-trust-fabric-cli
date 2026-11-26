@@ -3,15 +3,13 @@
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Subcommand;
-use serde_json::{Value, json};
 
 use crate::{
-    commands::{Output, print_list},
+    commands::{self, Output},
     config::Config,
     credentials::CredentialStore,
-    tables::{AGENT_STREAM_CONNECTIONS, Scope},
 };
 
 #[derive(Debug, Subcommand)]
@@ -39,7 +37,10 @@ pub enum ConfigCommand {
 }
 
 /// Runs one `config` command on `saved`, the Agent Stream connections read
-/// from the file at `path`, and the Agent Stream `credentials`.
+/// from the file at `path`, and the Agent Stream `credentials`, through the
+/// commands Agent Gateway uses, so the two products list, select, and remove
+/// connections the same way. Messages name the Agent Stream connections,
+/// because `credentials` is the Agent Stream store.
 pub fn run(
     saved: &mut Config,
     credentials: &impl CredentialStore,
@@ -47,72 +48,12 @@ pub fn run(
     path: &Path,
     output: Output,
 ) -> Result<()> {
-    match command {
-        ConfigCommand::List => {
-            let rows: Vec<Value> = saved
-                .connections
-                .iter()
-                .map(|(name, connection)| {
-                    json!({
-                        "name": name,
-                        "host": connection.host,
-                        "current": saved.current.as_deref() == Some(name),
-                    })
-                })
-                .collect();
-            print_list(&Value::Array(rows), output, &AGENT_STREAM_CONNECTIONS, Scope::All)
-        }
-        ConfigCommand::Use { name } => {
-            if !saved
-                .connections
-                .contains_key(&name)
-            {
-                bail!("{}", missing_connection(&name));
-            }
-            saved.current = Some(name.clone());
-            saved.save_to(path)?;
-            println!("Using '{name}'");
-            Ok(())
-        }
-        ConfigCommand::Remove { name } => remove_connection(saved, credentials, &name, path),
-    }
-}
-
-/// Removes an Agent Stream connection and its token from this machine only.
-/// The keyring entries go first, so an entry left behind by a connection that
-/// is already gone from the file is cleaned up too.
-fn remove_connection(
-    saved: &mut Config,
-    credentials: &impl CredentialStore,
-    name: &str,
-    path: &Path,
-) -> Result<()> {
-    credentials.delete_token(name)?;
-    credentials.delete_bound_host(name)?;
-    if saved
-        .connections
-        .remove(name)
-        .is_none()
-    {
-        bail!("{}", missing_connection(name));
-    }
-    if saved.current.as_deref() == Some(name) {
-        saved.current = saved
-            .connections
-            .keys()
-            .next()
-            .cloned();
-    }
-    saved.save_to(path)?;
-    println!("Removed local credentials for '{name}'");
-    Ok(())
-}
-
-/// The error for a name that is not a saved Agent Stream connection, which
-/// says which product's store was searched, since the same name may well be
-/// an Agent Gateway connection.
-fn missing_connection(name: &str) -> String {
-    format!("Agent Stream connection '{name}' does not exist")
+    let command = match command {
+        ConfigCommand::List => commands::ConfigCommand::List,
+        ConfigCommand::Use { name } => commands::ConfigCommand::Use { name },
+        ConfigCommand::Remove { name } => commands::ConfigCommand::Remove { name },
+    };
+    commands::run_config(saved, credentials, command, path, output)
 }
 
 #[cfg(test)]

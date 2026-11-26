@@ -7,8 +7,9 @@ use crate::{
     product::remembering_probes,
 };
 
-/// Opens the interactive shell and runs every typed line as a command, until
-/// `exit`, `quit` or the end of input. A host given with `--host` or
+/// Opens the interactive shell of the appliance `initial` is addressed to, and
+/// runs every typed line as a command of that appliance, until `exit`, `quit`
+/// or the end of input. A host given with `--host` or
 /// FABRIC_HOST is the same for every line, so a binary built with the
 /// `agent-stream` Cargo feature asks it which product it is once for the
 /// whole shell instead of before every line. A binary built without the
@@ -19,11 +20,12 @@ pub async fn run(initial: Cli) -> Result<()> {
 
 async fn read_lines(initial: Cli) -> Result<()> {
     let prefix = initial.interactive_prefix();
+    let text = initial.shell_text();
     let mut editor = DefaultEditor::new()?;
 
-    println!("Fabric Agent Gateway interactive shell. Type `help` for commands; `exit` or `quit` to leave.");
+    println!("{}", text.banner);
     loop {
-        match editor.readline("fabric agent-gateway> ") {
+        match editor.readline(text.prompt) {
             Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
@@ -44,15 +46,15 @@ async fn read_lines(initial: Cli) -> Result<()> {
                 }
                 match parse_line(&prefix, line) {
                     Ok(cli) if cli.is_interactive() => {
-                        eprintln!("note: already in the interactive shell; type a command such as `surfaces list`");
+                        eprintln!("{}", text.already_open);
                     }
                     Ok(mut cli) => {
                         if cli.login_wants_paste_prompt() {
-                            match rpassword::prompt_password("Gateway bearer token: ") {
+                            match rpassword::prompt_password(text.paste_prompt) {
                                 Ok(entry) => {
                                     let token = entry.trim().to_owned();
                                     if token.is_empty() {
-                                        eprintln!("error: bearer token must not be empty");
+                                        eprintln!("error: {} must not be empty", text.token_name);
                                         continue;
                                     }
                                     cli.set_login_token(token);
@@ -62,7 +64,7 @@ async fn read_lines(initial: Cli) -> Result<()> {
                                     continue;
                                 }
                                 Err(error) => {
-                                    eprintln!("error: could not read the bearer token without echo: {error}");
+                                    eprintln!("error: could not read the {} without echo: {error}", text.token_name);
                                     continue;
                                 }
                             }
@@ -143,5 +145,21 @@ mod tests {
         let help = error.to_string();
         assert!(help.contains("fabric agent-gateway"), "{help}");
         assert!(help.contains("surfaces"), "{help}");
+    }
+
+    #[test]
+    fn the_agent_gateway_shell_keeps_its_released_text() {
+        let text = Cli::try_parse_from(["fabric", "agent-gateway", "shell"])
+            .expect("shell should parse")
+            .shell_text();
+
+        assert_eq!(
+            text.banner,
+            "Fabric Agent Gateway interactive shell. Type `help` for commands; `exit` or `quit` to leave."
+        );
+        assert_eq!(text.prompt, "fabric agent-gateway> ");
+        assert_eq!(text.paste_prompt, "Gateway bearer token: ");
+        assert_eq!(text.already_open, "note: already in the interactive shell; type a command such as `surfaces list`");
+        assert_eq!(text.token_name, "bearer token");
     }
 }

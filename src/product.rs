@@ -55,7 +55,7 @@ pub enum Product {
 
 impl Product {
     /// The product's name as shown to the user.
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::AgentGateway => "Agent Gateway",
             Self::AgentStream => "Agent Stream",
@@ -63,10 +63,39 @@ impl Product {
     }
 
     /// The `fabric` command group that talks to this product.
-    fn command(self) -> &'static str {
+    pub(crate) fn command(self) -> &'static str {
         match self {
             Self::AgentGateway => "fabric agent-gateway",
             Self::AgentStream => "fabric agent-stream",
+        }
+    }
+
+    /// How a message about a request names the product that answered it:
+    /// `gateway`, the word the Agent Gateway messages used before there was a
+    /// second product, or `Agent Stream`.
+    pub(crate) fn message_name(self) -> &'static str {
+        match self {
+            Self::AgentGateway => "gateway",
+            Self::AgentStream => "Agent Stream",
+        }
+    }
+
+    /// How a message names one of this product's saved connections:
+    /// `gateway connection`, as the Agent Gateway messages always have, or
+    /// `Agent Stream connection`.
+    pub(crate) fn connection_noun(self) -> &'static str {
+        match self {
+            Self::AgentGateway => "gateway connection",
+            Self::AgentStream => "Agent Stream connection",
+        }
+    }
+
+    /// The name of the file this product's connections are saved in, under
+    /// the `fabric` configuration directory.
+    pub(crate) fn config_file_name(self) -> &'static str {
+        match self {
+            Self::AgentGateway => "config.toml",
+            Self::AgentStream => "agent-stream.toml",
         }
     }
 }

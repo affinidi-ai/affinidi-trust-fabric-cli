@@ -96,3 +96,27 @@ fn an_agent_stream_connection_with_a_hash_in_its_name_gets_the_warning() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stderr(&output).contains("warning: connection 'prod#1' has a '#' in its name"), "{}", stderr(&output));
 }
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn a_token_and_host_both_from_the_environment_get_the_note_on_an_agent_stream_command() {
+    let token = "aspat_secret-value";
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "config", "list"],
+        &[],
+        &[("FABRIC_TOKEN", token), ("FABRIC_HOST", "https://stream.example")],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output)
+            .matches("note: sending the token from FABRIC_TOKEN to the host from FABRIC_HOST (https://stream.example)")
+            .count(),
+        1,
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains(token), "{}", stderr(&output));
+    assert!(!stdout(&output).contains(token), "{}", stdout(&output));
+}
