@@ -9,11 +9,14 @@
 mod api_keys;
 mod audit;
 mod config;
+mod connection_points;
+mod connections;
 mod drift;
 mod governance;
 mod identities;
 mod login;
 mod logs;
+mod mediators;
 mod metrics;
 mod policies;
 mod prompt_content;
@@ -215,6 +218,35 @@ enum AgentStreamCommand {
     Policies {
         #[command(subcommand)]
         command: policies::PolicyCommand,
+    },
+    /// Manage Trust Fabric connections, the records of this Agent Stream and
+    /// the peers it connects to.
+    ///
+    /// These are the records under `/v1/gateways`, not the saved connections
+    /// of `fabric agent-stream config`. Reading them needs the `gateways.view`
+    /// permission, create and update `gateways.edit`, and delete
+    /// `gateways.delete`.
+    Connections {
+        #[command(subcommand)]
+        command: connections::ConnectionCommand,
+    },
+    /// Manage connection points, the DIDComm invitations other appliances use
+    /// to connect to this Agent Stream.
+    ///
+    /// Each one holds a secret that a peer must know to accept it, which only
+    /// the create answer carries.
+    #[command(name = "connection-points")]
+    ConnectionPoints {
+        #[command(subcommand)]
+        command: connection_points::ConnectionPointCommand,
+    },
+    /// Manage DIDComm mediator records.
+    ///
+    /// Reading them needs the `mediators.view` permission, create and update
+    /// `mediators.edit`, and delete `mediators.delete`.
+    Mediators {
+        #[command(subcommand)]
+        command: mediators::MediatorCommand,
     },
     /// Manage appliance-wide settings.
     Settings {
@@ -508,6 +540,9 @@ async fn run_command(
         AgentStreamCommand::Identities { command } => SharedCommand::Identities(command.into()),
         AgentStreamCommand::ApiKeys { command } => SharedCommand::ApiKeys(command.into()),
         AgentStreamCommand::Policies { command } => SharedCommand::policies(command),
+        AgentStreamCommand::Connections { command } => SharedCommand::Connections(command.into()),
+        AgentStreamCommand::ConnectionPoints { command } => SharedCommand::ConnectionPoints(command.into()),
+        AgentStreamCommand::Mediators { command } => SharedCommand::Mediators(command.into()),
         AgentStreamCommand::Settings { command } => SharedCommand::Settings(command.into()),
         AgentStreamCommand::Audit { command } => SharedCommand::Audit(command.into()),
         AgentStreamCommand::Metrics { command } => SharedCommand::Metrics(command.into()),
@@ -534,7 +569,12 @@ fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
         SharedCommand::Metrics(command) => command.refuse_unconfirmed_truncate(),
         SharedCommand::Logs(command) => command.refuse_unconfirmed_truncate(),
         SharedCommand::Policies { .. } => command.refuse_unconfirmed_policy_delete(),
-        SharedCommand::Secrets { .. } | SharedCommand::Identities(_) | SharedCommand::Audit(_) => Ok(()),
+        SharedCommand::Secrets { .. }
+        | SharedCommand::Identities(_)
+        | SharedCommand::Connections(_)
+        | SharedCommand::ConnectionPoints(_)
+        | SharedCommand::Mediators(_)
+        | SharedCommand::Audit(_) => Ok(()),
     }
 }
 
@@ -1455,8 +1495,20 @@ mod tests {
 
     /// The groups `fabric agent-stream` runs through the Agent Gateway
     /// commands.
-    const SHARED_GROUPS: [&str; 9] =
-        ["secrets", "users", "identities", "api-keys", "policies", "settings", "audit", "metrics", "logs"];
+    const SHARED_GROUPS: [&str; 12] = [
+        "secrets",
+        "users",
+        "identities",
+        "api-keys",
+        "policies",
+        "connections",
+        "connection-points",
+        "mediators",
+        "settings",
+        "audit",
+        "metrics",
+        "logs",
+    ];
 
     /// The Agent Gateway subcommands of a shared group that Agent Stream
     /// leaves out on purpose: `metrics status`, because Agent Stream has no
@@ -1549,11 +1601,21 @@ mod tests {
             );
             for text in texts {
                 // A field name in backticks, such as `gateways` in the
-                // `policies impact` answer, is what Agent Stream sends, but a
-                // command in backticks still never names the other product.
+                // `policies impact` answer, or quoted as a JSON key in an
+                // example document, such as "gateway_id", is what Agent
+                // Stream reads or sends, but a command in backticks still
+                // never names the other product.
                 let prose: String = text
                     .split('`')
                     .step_by(2)
+                    .collect::<String>()
+                    .split('"')
+                    .filter(|part| {
+                        part.is_empty()
+                            || !part
+                                .chars()
+                                .all(|character| character.is_ascii_lowercase() || character == '_')
+                    })
                     .collect();
                 let lower = prose.to_ascii_lowercase();
                 assert!(!lower.contains("gateway"), "{group}: {text}");
@@ -1576,10 +1638,15 @@ mod tests {
             ("GET /api/v1/identities", "HTTP/1.1 200 OK", r#"{"identities":[],"count":0}"#),
             ("GET /api/v1/api-keys", "HTTP/1.1 200 OK", "[]"),
             ("GET /api/v1/policy-definitions", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/gateways", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/connection-points", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/mediators", "HTTP/1.1 200 OK", "[]"),
         ])
         .await;
 
-        for group in ["secrets", "users", "identities", "api-keys", "policies"] {
+        for group in
+            ["secrets", "users", "identities", "api-keys", "policies", "connections", "connection-points", "mediators"]
+        {
             let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
             run_stream(&[group, "list"], saved, &credentials)
                 .await
@@ -1594,6 +1661,9 @@ mod tests {
                 "GET /api/v1/identities HTTP/1.1",
                 "GET /api/v1/api-keys HTTP/1.1",
                 "GET /api/v1/policy-definitions HTTP/1.1",
+                "GET /api/v1/gateways HTTP/1.1",
+                "GET /api/v1/connection-points HTTP/1.1",
+                "GET /api/v1/mediators HTTP/1.1",
             ]
         );
         assert!(

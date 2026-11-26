@@ -45,10 +45,11 @@ every place on this list that applies to a command that changes a surface: all b
   check on each line, and keeps a line that trips it out of its history.
 - The interactive shell parses each line with the same `Cli`, so a new command needs no
   shell wiring.
-- `secrets`, `users`, `identities`, `api-keys`, `policies`, `settings`, `audit`,
-  `metrics`, and `logs` also run on Agent Stream, through their own enums in
+- `secrets`, `users`, `identities`, `api-keys`, `policies`, `connections`,
+  `connection-points`, `mediators`, `settings`, `audit`, `metrics`, and `logs` also run
+  on Agent Stream, through their own enums in
   [`src/agent_stream/`](../../src/agent_stream/), which a `From` maps onto the Agent
-  Gateway enums. The compiler does not point at them, but
+  Gateway enums (`CrudCommand` for `connections`, `connection-points`, and `mediators`). The compiler does not point at them, but
   `each_shared_group_has_every_agent_gateway_subcommand_or_leaves_it_out_on_purpose` in
   `agent_stream/mod.rs` fails for a new Agent Gateway subcommand in one of these groups.
   When Agent Stream has the route, add the variant to the Agent Stream enum and its

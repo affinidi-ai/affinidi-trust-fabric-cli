@@ -1149,7 +1149,7 @@ struct SendWelcomeArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum CrudCommand {
+pub(crate) enum CrudCommand {
     /// List entities.
     List,
     /// Get an entity by ID.
@@ -2216,6 +2216,9 @@ pub(crate) enum SharedCommand {
         command: PolicyCommand,
         ask_first: bool,
     },
+    Connections(CrudCommand),
+    ConnectionPoints(CrudCommand),
+    Mediators(CrudCommand),
     Settings(SettingsCommand),
     Audit(AuditCommand),
     Metrics(MetricsCommand),
@@ -2231,6 +2234,9 @@ impl From<SharedCommand> for Command {
             SharedCommand::Identities(command) => Self::Identities { command },
             SharedCommand::ApiKeys(command) => Self::ApiKeys { command },
             SharedCommand::Policies { command, .. } => Self::Policies { command },
+            SharedCommand::Connections(command) => Self::Connections { command },
+            SharedCommand::ConnectionPoints(command) => Self::ConnectionPoints { command },
+            SharedCommand::Mediators(command) => Self::Mediators { command },
             SharedCommand::Settings(command) => Self::Settings { command },
             SharedCommand::Audit(command) => Self::Audit { command },
             SharedCommand::Metrics(command) => Self::Metrics { command },
@@ -13664,6 +13670,8 @@ mod identity_access_tests {
         for (arguments, line) in [
             (vec!["issuers", "update", "i-1", "-f", "x.json"], "Updated issuer 'i-1'"),
             (vec!["connections", "update", "c-1", "-f", "x.json"], "Updated connection 'c-1'"),
+            (vec!["connection-points", "update", "cp-1", "-f", "x.json"], "Updated connection point 'cp-1'"),
+            (vec!["mediators", "update", "m-1", "-f", "x.json"], "Updated mediator 'm-1'"),
             (vec!["mcp-proxies", "update", "m-1", "-f", "x.json"], "Updated MCP proxy 'm-1'"),
             (
                 vec!["jwt-verification-strategies", "update", "j-1", "-f", "x.json"],
