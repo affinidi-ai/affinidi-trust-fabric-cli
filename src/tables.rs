@@ -3,7 +3,10 @@
 
 use serde_json::Value;
 
-use crate::client::{sanitize_for_terminal, sanitize_whole};
+use crate::{
+    client::{sanitize_for_terminal, sanitize_whole},
+    product::Product,
+};
 
 /// Longest a normal cell gets before it is cut short with `...`.
 const NORMAL_WIDTH: usize = 40;
@@ -359,11 +362,18 @@ pub static CONNECTION_SETTINGS: Layout = Layout {
 };
 
 /// The saved Agent Stream connections, as `fabric agent-stream config list` shows them.
-#[cfg(feature = "agent-stream")]
 pub static AGENT_STREAM_CONNECTIONS: Layout = Layout {
     empty: "No Agent Stream connections yet.",
     columns: &[whole("NAME", &["name"]), whole("HOST", &["host"]), col("CURRENT", &["current"])],
 };
+
+/// How `config list` of `product` shows its saved connections.
+pub fn connections(product: Product) -> &'static Layout {
+    match product {
+        Product::AgentGateway => &CONNECTION_SETTINGS,
+        Product::AgentStream => &AGENT_STREAM_CONNECTIONS,
+    }
+}
 
 /// Renders a list as a header row and one row per entry, or the layout's
 /// "nothing yet" line when the list is empty. Rows that are not objects are

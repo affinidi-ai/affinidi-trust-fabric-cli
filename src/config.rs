@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::credentials::{CredentialStore, add_no_keyring_migration_hint};
+use crate::{
+    credentials::{CredentialStore, add_no_keyring_migration_hint},
+    product::Product,
+};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -30,10 +33,6 @@ impl Config {
         Self::load_from(&config_path()?)
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.save_to(&config_path()?)
-    }
-
     pub fn migrate_legacy_tokens(
         &mut self,
         credentials: &impl CredentialStore,
@@ -42,22 +41,37 @@ impl Config {
         self.migrate_legacy_tokens_to(credentials, &path)
     }
 
+    /// [`Self::resolve_for`] on Agent Gateway connections.
+    #[cfg(test)]
     pub fn resolve(
         &self,
         name: Option<&str>,
     ) -> Result<(&str, &Connection)> {
+        self.resolve_for(Product::AgentGateway, name)
+    }
+
+    /// The saved connection called `name`, or the current one when `name` is
+    /// `None`, with the name as it is saved. `product` is whose connections
+    /// these are, so an error names that product's connections and tells the
+    /// user to run its `login`.
+    pub fn resolve_for(
+        &self,
+        product: Product,
+        name: Option<&str>,
+    ) -> Result<(&str, &Connection)> {
+        let noun = product.connection_noun();
         let name = name
             .or(self.current.as_deref())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no gateway connection configured; run `fabric agent-gateway login --host <URL>`, or set both \
-                     FABRIC_HOST and FABRIC_TOKEN"
+                    "no {noun} configured; run `{} login --host <URL>`, or set both FABRIC_HOST and FABRIC_TOKEN",
+                    product.command()
                 )
             })?;
         let (stored_name, connection) = self
             .connections
             .get_key_value(name)
-            .ok_or_else(|| anyhow::anyhow!("gateway connection '{name}' does not exist"))?;
+            .ok_or_else(|| anyhow::anyhow!("{noun} '{name}' does not exist"))?;
         Ok((stored_name, connection))
     }
 
@@ -226,7 +240,7 @@ fn is_loopback_host(url: &url::Url) -> bool {
 /// The file the Agent Gateway connections are saved in. It predates the Agent
 /// Stream file, so it carries no product name.
 pub(crate) fn config_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("config.toml"))
+    Ok(config_dir()?.join(Product::AgentGateway.config_file_name()))
 }
 
 /// The file the Agent Stream connections are saved in, beside the Agent
@@ -234,7 +248,7 @@ pub(crate) fn config_path() -> Result<PathBuf> {
 /// other, and a CLI from before this file ignores it.
 #[cfg(feature = "agent-stream")]
 pub(crate) fn agent_stream_config_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("agent-stream.toml"))
+    Ok(config_dir()?.join(Product::AgentStream.config_file_name()))
 }
 
 /// The `fabric` directory under the user configuration directory.
@@ -266,6 +280,10 @@ mod tests {
     struct FailingCredentials;
 
     impl CredentialStore for MemoryCredentials {
+        fn product(&self) -> Product {
+            Product::AgentGateway
+        }
+
         fn get_token(
             &self,
             connection: &str,
@@ -303,6 +321,10 @@ mod tests {
     }
 
     impl CredentialStore for FailingCredentials {
+        fn product(&self) -> Product {
+            Product::AgentGateway
+        }
+
         fn get_token(
             &self,
             _connection: &str,
@@ -533,6 +555,10 @@ token = "only-copy"
 
     #[cfg(target_os = "linux")]
     impl CredentialStore for NoSecretService {
+        fn product(&self) -> Product {
+            Product::AgentGateway
+        }
+
         fn get_token(
             &self,
             _connection: &str,

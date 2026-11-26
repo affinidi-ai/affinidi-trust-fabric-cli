@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use crate::product::Product;
+
 /// Keyring service the Agent Gateway connections are saved under. It predates
 /// the Agent Stream service, so it carries no product suffix.
 const AGENT_GATEWAY_SERVICE: &str = "affinidi-trust-fabric-cli";
@@ -11,6 +13,12 @@ const AGENT_GATEWAY_SERVICE: &str = "affinidi-trust-fabric-cli";
 const AGENT_STREAM_SERVICE: &str = "affinidi-trust-fabric-cli/agent-stream";
 
 pub trait CredentialStore {
+    /// The product whose connections this store keeps. Messages about a
+    /// connection read it, so they name that product's connections and its
+    /// `fabric` command group. It has no default, so a new store has to name
+    /// its product.
+    fn product(&self) -> Product;
+
     fn get_token(
         &self,
         connection: &str,
@@ -60,18 +68,25 @@ fn bound_host_key(connection: &str) -> String {
 /// connections of two products never share an entry.
 pub struct OsCredentialStore {
     service: &'static str,
+    product: Product,
 }
 
 impl OsCredentialStore {
     /// The store of the Agent Gateway connections.
     pub fn new() -> Self {
-        Self { service: AGENT_GATEWAY_SERVICE }
+        Self {
+            service: AGENT_GATEWAY_SERVICE,
+            product: Product::AgentGateway,
+        }
     }
 
     /// The store of the Agent Stream connections.
     #[cfg(feature = "agent-stream")]
     pub fn agent_stream() -> Self {
-        Self { service: AGENT_STREAM_SERVICE }
+        Self {
+            service: AGENT_STREAM_SERVICE,
+            product: Product::AgentStream,
+        }
     }
 
     fn entry(
@@ -193,6 +208,10 @@ fn is_unreachable_keyring(_error: &keyring::Error) -> bool {
 }
 
 impl CredentialStore for OsCredentialStore {
+    fn product(&self) -> Product {
+        self.product
+    }
+
     fn get_token(
         &self,
         connection: &str,
@@ -241,6 +260,10 @@ mod tests {
     struct MemoryStore(Mutex<HashMap<String, String>>);
 
     impl CredentialStore for MemoryStore {
+        fn product(&self) -> Product {
+            Product::AgentGateway
+        }
+
         fn get_token(
             &self,
             connection: &str,
@@ -479,5 +502,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn each_os_store_names_the_product_whose_connections_it_keeps() {
+        assert_eq!(OsCredentialStore::new().product(), Product::AgentGateway);
+        #[cfg(feature = "agent-stream")]
+        assert_eq!(OsCredentialStore::agent_stream().product(), Product::AgentStream);
     }
 }

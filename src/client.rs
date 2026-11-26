@@ -7,6 +7,8 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use reqwest::{Method, RequestBuilder, StatusCode, redirect};
 use serde_json::Value;
 
+use crate::product::{self, Product};
+
 /// Stand-in printed for a credential or a credential-bearing field.
 pub(crate) const REDACTED: &str = "[redacted]";
 
@@ -46,32 +48,60 @@ pub(crate) const MAX_VERSION_CHARS: usize = 64;
 /// anything bigger is refused before it is held in memory.
 pub(crate) const MAX_VERSION_BODY_BYTES: usize = 4 * 1024;
 
+/// The client of one appliance's management API. Its messages name the
+/// product it talks to: `gateway` for Agent Gateway, as they always have, and
+/// `Agent Stream` for Agent Stream.
 #[derive(Clone)]
 pub struct GatewayClient {
     host: String,
     token: String,
+    product: Product,
     http: reqwest::Client,
     total_timeout: Duration,
     version_timeout: Duration,
 }
 
 impl GatewayClient {
+    /// A client of the Agent Gateway at `host`, sending `token`.
     pub fn new(
+        host: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self> {
+        Self::of(Product::AgentGateway, host, token)
+    }
+
+    /// A client of the Agent Stream at `host`, sending `token`.
+    #[cfg(feature = "agent-stream")]
+    pub fn for_agent_stream(
+        host: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self> {
+        Self::of(Product::AgentStream, host, token)
+    }
+
+    fn of(
+        product: Product,
         host: impl Into<String>,
         token: impl Into<String>,
     ) -> Result<Self> {
         Ok(Self {
             host: host.into(),
             token: token.into(),
+            product,
             http: build_http_client()?,
             total_timeout: TOTAL_TIMEOUT,
             version_timeout: VERSION_TIMEOUT,
         })
     }
 
-    /// The gateway address every request of this client goes to.
+    /// The appliance address every request of this client goes to.
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// The product this client talks to.
+    pub fn product(&self) -> Product {
+        self.product
     }
 
     pub async fn check_auth(&self) -> Result<()> {
@@ -124,9 +154,10 @@ impl GatewayClient {
     /// `version` is missing, not text, or empty once filtered.
     pub async fn gateway_version(&self) -> Result<String> {
         let url = self.url("/v1/version")?;
+        let name = self.product.message_name();
         let read_error = |error: reqwest::Error, action: &str| {
             if error.is_timeout() {
-                anyhow::anyhow!("the gateway version request timed out after {:?}", self.version_timeout)
+                anyhow::anyhow!("the {name} version request timed out after {:?}", self.version_timeout)
             } else {
                 anyhow::Error::new(error).context(format!("{action} {url}"))
             }
@@ -140,9 +171,9 @@ impl GatewayClient {
             .map_err(|error| read_error(error, "request"))?;
         let status = response.status();
         if status != StatusCode::OK {
-            return Err(status_error(status, format!("gateway answered {status}")));
+            return Err(status_error(status, format!("{name} answered {status}")));
         }
-        let too_large = || anyhow::anyhow!("gateway version answer too large (over {MAX_VERSION_BODY_BYTES} bytes)");
+        let too_large = || anyhow::anyhow!("{name} version answer too large (over {MAX_VERSION_BODY_BYTES} bytes)");
         if response
             .content_length()
             .is_some_and(|length| length > MAX_VERSION_BODY_BYTES as u64)
@@ -160,7 +191,8 @@ impl GatewayClient {
             }
             body.extend_from_slice(&chunk);
         }
-        let body: Value = serde_json::from_slice(&body).context("gateway version answer is not JSON")?;
+        let body: Value =
+            serde_json::from_slice(&body).with_context(|| format!("{name} version answer is not JSON"))?;
         let version: String = body
             .get("version")
             .and_then(Value::as_str)
@@ -170,7 +202,7 @@ impl GatewayClient {
             .take(MAX_VERSION_CHARS)
             .collect();
         if version.is_empty() {
-            bail!("gateway version answer has no version text");
+            bail!("{name} version answer has no version text");
         }
         Ok(version)
     }
@@ -266,19 +298,20 @@ impl GatewayClient {
             .with_context(|| format!("request {url}"))?;
         let status = response.status();
         let headers = response.headers().clone();
+        let name = self.product.message_name();
         let text = response
             .text()
             .await
-            .context("read gateway response")?;
+            .with_context(|| format!("read {name} response"))?;
         if !status.is_success() {
-            return Err(gateway_error(status, text.as_bytes(), &self.secrets(RawAuth::Bearer)));
+            return Err(self.response_error(status, text.as_bytes()));
         }
         if text.trim().is_empty() {
             return Ok((Value::Null, headers));
         }
         let value = serde_json::from_str(&text).with_context(|| {
             let secrets = self.secrets(RawAuth::Bearer);
-            format!("gateway returned non-JSON content: {}", sanitize_for_terminal(&redact(&text, &secrets)))
+            format!("{name} returned non-JSON content: {}", sanitize_for_terminal(&redact(&text, &secrets)))
         })?;
         Ok((value, headers))
     }
@@ -342,8 +375,20 @@ impl GatewayClient {
         let body = response
             .bytes()
             .await
-            .context("read gateway response")?;
+            .with_context(|| format!("read {} response", self.product.message_name()))?;
         Ok((status, body.to_vec()))
+    }
+
+    /// The error for a non-success answer to a bearer request of this client:
+    /// [`gateway_error`] for Agent Gateway, and the same message worded for
+    /// Agent Stream otherwise (see [`product_error`]).
+    pub fn response_error(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> anyhow::Error {
+        let access_token = product::token_product(&self.token).is_some();
+        product_error(self.product, access_token, status, body, &self.secrets(RawAuth::Bearer))
     }
 
     /// The credentials a request made with `auth` carries in its
@@ -513,7 +558,7 @@ impl std::fmt::Display for GatewayStatusError {
 
 impl std::error::Error for GatewayStatusError {}
 
-fn status_error(
+pub(crate) fn status_error(
     status: StatusCode,
     message: String,
 ) -> anyhow::Error {
@@ -539,12 +584,34 @@ pub enum RawAuth<'a> {
     Basic { username: &'a str, password: &'a str },
 }
 
-/// Build the error every failed response reports, whether it was read as JSON
-/// by [`GatewayClient::request`] or as raw bytes by
+/// Build the error every failed Agent Gateway response reports, whether it was
+/// read as JSON by [`GatewayClient::request`] or as raw bytes by
 /// [`GatewayClient::request_bytes`], so both produce one consistent message.
 /// `secrets` are the credentials the request carried, from
 /// [`GatewayClient::secrets`]; each is replaced wherever the body repeats it.
 pub fn gateway_error(
+    status: StatusCode,
+    body: &[u8],
+    secrets: &[String],
+) -> anyhow::Error {
+    product_error(Product::AgentGateway, false, status, body, secrets)
+}
+
+/// [`gateway_error`] for an answer of `product`. The message is the server's
+/// own reason when it gave one, else the status. Three answers read
+/// differently on Agent Stream. A 401, which comes with an empty body, says
+/// what to do next, which depends on whether the request carried an access
+/// token (`access_token`) or a session token, whose session Agent Stream ends
+/// after a while without use and, by default, 12 hours after sign-in. A 403
+/// with the code `TERMS_ACCEPTANCE_REQUIRED` and no message of its own says to
+/// accept the Terms and Conditions in the Agent Stream dashboard. A 403 with an
+/// empty body names its causes: the role or the access token's scopes do not
+/// allow the request, or a resource-scoped access token was sent without a
+/// header it requires. A 403 whose body names the missing permission, or gives
+/// a message, reads the same on both products.
+fn product_error(
+    product: Product,
+    access_token: bool,
     status: StatusCode,
     body: &[u8],
     secrets: &[String],
@@ -599,17 +666,77 @@ pub fn gateway_error(
                 sanitized_body
             }
         });
+    let server_said = message.is_some() || !body_is_empty;
     if status == StatusCode::UNAUTHORIZED {
-        return status_error(status, format!("gateway rejected the bearer token: {detail}"));
+        return status_error(
+            status,
+            match product {
+                Product::AgentGateway => format!("gateway rejected the bearer token: {detail}"),
+                Product::AgentStream => agent_stream_unauthorized(access_token, server_said.then_some(detail.as_str())),
+            },
+        );
+    }
+    if status == StatusCode::FORBIDDEN && product == Product::AgentStream {
+        let terms_required = message.is_none()
+            && parsed
+                .as_ref()
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str)
+                == Some(TERMS_ACCEPTANCE_REQUIRED);
+        if terms_required {
+            return status_error(status, AGENT_STREAM_TERMS_REQUIRED.to_owned());
+        }
+        if !server_said {
+            return status_error(
+                status,
+                format!(
+                    "Agent Stream answered {status}, so your role or the scopes of the access token in use do not \
+                     allow this request, or the access token is limited to a resource and the request lacks a \
+                     header it requires; `fabric agent-stream tokens scopes` lists the scopes this login holds"
+                ),
+            );
+        }
     }
     // A real server message (JSON `message`/`error`/`details`, or a
     // non-empty plain-text body) already reads as a full sentence on its
     // own ("unknown scope: X"); only prefix the HTTP status when there
     // was nothing better for the server to say.
-    if message.is_some() || !body_is_empty {
+    if server_said {
         return status_error(status, detail);
     }
-    status_error(status, format!("gateway returned {status}: {detail}"))
+    status_error(status, format!("{} returned {status}: {detail}", product.message_name()))
+}
+
+/// The `code` Agent Stream answers with when the signed-in user has not
+/// accepted its current Terms and Conditions.
+const TERMS_ACCEPTANCE_REQUIRED: &str = "TERMS_ACCEPTANCE_REQUIRED";
+
+/// What a [`TERMS_ACCEPTANCE_REQUIRED`] answer from Agent Stream means, when
+/// Agent Stream sent no message of its own.
+const AGENT_STREAM_TERMS_REQUIRED: &str = "Agent Stream refused the request because the signed-in user has not \
+                                           accepted its Terms and Conditions; accept them in the Agent Stream \
+                                           dashboard, then run the command again";
+
+/// What a 401 from Agent Stream means: an access token that it does not
+/// accept, because it is revoked or expired or its owner is no longer
+/// approved, or a session that has ended. `detail` is what the server said,
+/// already cleaned, when it said anything.
+fn agent_stream_unauthorized(
+    access_token: bool,
+    detail: Option<&str>,
+) -> String {
+    let message = if access_token {
+        "Agent Stream did not accept the access token, which happens once it is revoked or expires, or once its \
+         owner is no longer approved; log in again with a valid one using `fabric agent-stream login`"
+    } else {
+        "Agent Stream did not accept the session token, so the session has ended (Agent Stream ends a session after \
+         a while without use, and by default 12 hours after sign-in); log in again with `fabric agent-stream login`, \
+         or use an `aspat_` access token, which lasts until it expires or is revoked"
+    };
+    match detail {
+        Some(detail) => format!("{message} (Agent Stream said: {detail})"),
+        None => message.to_owned(),
+    }
 }
 
 /// The reason to report out of a gateway error body. The handlers use two
@@ -2126,5 +2253,166 @@ mod tests {
             .to_ascii_lowercase();
         assert!(request.starts_with("post /api/auth/logout http/1.1"), "{request}");
         assert!(request.contains("authorization: bearer session-token"), "{request}");
+    }
+
+    #[test]
+    fn an_agent_stream_session_refused_with_401_says_the_session_ended_and_suggests_an_access_token() {
+        let error = product_error(Product::AgentStream, false, StatusCode::UNAUTHORIZED, b"", &[]);
+
+        assert_eq!(
+            error.to_string(),
+            "Agent Stream did not accept the session token, so the session has ended (Agent Stream ends a session \
+             after a while without use, and by default 12 hours after sign-in); log in again with `fabric \
+             agent-stream login`, or use an `aspat_` access token, which lasts until it expires or is revoked"
+        );
+        assert_eq!(response_status(&error), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn an_agent_stream_access_token_refused_with_401_says_to_log_in_again_and_keeps_what_the_server_said() {
+        let secrets = vec!["aspat_secret".to_owned()];
+        let error =
+            product_error(Product::AgentStream, true, StatusCode::UNAUTHORIZED, b"bad token aspat_secret", &secrets);
+
+        let text = error.to_string();
+        assert!(text.starts_with("Agent Stream did not accept the access token"), "{text}");
+        assert!(text.ends_with("(Agent Stream said: bad token [redacted])"), "{text}");
+    }
+
+    #[test]
+    fn an_access_token_agent_stream_refuses_with_401_names_an_owner_no_longer_approved() {
+        let error = product_error(Product::AgentStream, true, StatusCode::UNAUTHORIZED, b"", &[]);
+
+        assert_eq!(
+            error.to_string(),
+            "Agent Stream did not accept the access token, which happens once it is revoked or expires, or once its \
+             owner is no longer approved; log in again with a valid one using `fabric agent-stream login`"
+        );
+    }
+
+    #[test]
+    fn an_agent_stream_403_without_a_reason_names_the_role_the_scopes_and_a_missing_required_header() {
+        let error = product_error(Product::AgentStream, true, StatusCode::FORBIDDEN, b"", &[]);
+
+        assert_eq!(
+            error.to_string(),
+            "Agent Stream answered 403 Forbidden, so your role or the scopes of the access token in use do not \
+             allow this request, or the access token is limited to a resource and the request lacks a header it \
+             requires; `fabric agent-stream tokens scopes` lists the scopes this login holds"
+        );
+    }
+
+    #[test]
+    fn an_agent_stream_403_for_terms_without_a_message_says_to_accept_them_in_the_dashboard() {
+        let error = product_error(
+            Product::AgentStream,
+            false,
+            StatusCode::FORBIDDEN,
+            br#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#,
+            &[],
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "Agent Stream refused the request because the signed-in user has not accepted its Terms and Conditions; \
+             accept them in the Agent Stream dashboard, then run the command again"
+        );
+        assert_eq!(response_status(&error), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn an_agent_stream_403_with_another_code_and_no_message_shows_the_body() {
+        let error = product_error(Product::AgentStream, false, StatusCode::FORBIDDEN, br#"{"code":"OTHER"}"#, &[]);
+
+        assert_eq!(error.to_string(), r#"{"code":"OTHER"}"#);
+    }
+
+    #[test]
+    fn a_gateway_403_for_terms_keeps_the_raw_body_for_its_own_hint() {
+        let error = product_error(
+            Product::AgentGateway,
+            false,
+            StatusCode::FORBIDDEN,
+            br#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#,
+            &[],
+        );
+
+        assert_eq!(error.to_string(), r#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#);
+    }
+
+    #[test]
+    fn an_agent_stream_403_that_names_the_permission_or_gives_a_reason_shows_it() {
+        let named = product_error(
+            Product::AgentStream,
+            true,
+            StatusCode::FORBIDDEN,
+            br#"{"required_permission":"access_tokens.view"}"#,
+            &[],
+        );
+        assert_eq!(named.to_string(), "missing required scope 'access_tokens.view'");
+
+        let terms = product_error(
+            Product::AgentStream,
+            true,
+            StatusCode::FORBIDDEN,
+            br#"{"code":"TERMS_ACCEPTANCE_REQUIRED","message":"Sign in to Agent Stream and accept the terms."}"#,
+            &[],
+        );
+        assert_eq!(terms.to_string(), "Sign in to Agent Stream and accept the terms.");
+    }
+
+    #[test]
+    fn an_agent_stream_answer_with_nothing_to_say_names_agent_stream() {
+        let error = product_error(Product::AgentStream, true, StatusCode::BAD_GATEWAY, b"", &[]);
+
+        assert_eq!(error.to_string(), "Agent Stream returned 502 Bad Gateway: no additional detail from server");
+    }
+
+    #[test]
+    fn a_gateway_answer_keeps_its_wording_whatever_the_token() {
+        for access_token in [false, true] {
+            assert_eq!(
+                product_error(Product::AgentGateway, access_token, StatusCode::UNAUTHORIZED, b"", &[]).to_string(),
+                "gateway rejected the bearer token: no additional detail from server"
+            );
+            assert_eq!(
+                product_error(Product::AgentGateway, access_token, StatusCode::FORBIDDEN, b"", &[]).to_string(),
+                "gateway returned 403 Forbidden: no additional detail from server"
+            );
+        }
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[tokio::test]
+    async fn an_agent_stream_client_names_agent_stream_in_the_errors_of_its_requests() {
+        let host = one_shot_server("HTTP/1.1 401 Unauthorized").await;
+        let client = GatewayClient::for_agent_stream(host, "aspat_secret").expect("client");
+
+        let error = client
+            .request(Method::GET, "/v1/access-tokens", None)
+            .await
+            .expect_err("401");
+
+        assert_eq!(client.product(), Product::AgentStream);
+        assert!(
+            error
+                .to_string()
+                .starts_with("Agent Stream did not accept the access token"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[tokio::test]
+    async fn an_agent_stream_client_names_agent_stream_when_its_version_cannot_be_read() {
+        let host = one_shot_server("HTTP/1.1 500 Internal Server Error").await;
+        let client = GatewayClient::for_agent_stream(host, "").expect("client");
+
+        let error = client
+            .gateway_version()
+            .await
+            .expect_err("500");
+
+        assert_eq!(error.to_string(), "Agent Stream answered 500 Internal Server Error");
     }
 }
