@@ -3,8 +3,9 @@
 //! its saved connections stay apart from the Agent Gateway ones, what its
 //! commands send when the host or the token comes from the environment, and,
 //! against an Agent Stream stand-in, that the groups it shares with Agent
-//! Gateway print the same tables and lines, keep secret values hidden, and
-//! report what Agent Stream did with a deleted user.
+//! Gateway print the same tables and lines, keep secret values hidden, report
+//! what Agent Stream did with a deleted user, and warn about the settings
+//! fields Agent Stream stores its own way.
 
 // The runner and the recording host are taken from `common`, but not its
 // saved-connection helper, which is for Agent Gateway commands and would go
@@ -631,4 +632,120 @@ fn users_delete_with_output_json_prints_a_removed_outcome() {
     let printed: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON");
     assert_eq!(printed, serde_json::json!({"outcome": "removed"}));
     assert!(!stderr(&output).contains("record"), "{}", stderr(&output));
+}
+
+/// What a command printed on standard error, less the note every
+/// [`fabric_on_stream`] run gets for taking both the host and the token from
+/// the environment.
+#[cfg(feature = "agent-stream")]
+fn stderr_beyond_the_environment_note(output: &Output) -> String {
+    stderr(output)
+        .lines()
+        .filter(|line| !line.starts_with("note: sending the token from FABRIC_TOKEN"))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// An Agent Stream audit page: no `truncated`, `dropped_records`,
+/// `history_bytes`, or `soft_cap_bytes`, which only Agent Gateway sends.
+#[cfg(feature = "agent-stream")]
+const AUDIT_PAGE: &str = r#"{"events":[{"timestamp":"2026-11-01T00:00:00Z","event":{"policy_decision":{"scope":"pipe","flow":"access_point","policy_id":"data.llm.policy.allow","decision":"deny","surface_id":"pipe-1"}},"vp_jwt":"eyJ.secret.jwt"}],"total":1,"page":1,"page_size":100,"total_pages":1,"category_counts":{"policy_decision":1}}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn audit_list_prints_the_agent_gateway_table_with_no_truncation_note() {
+    let host = agent_stream_stand_in(vec![("GET /api/v1/audit?limit=100&page=1", "200 OK", AUDIT_PAGE)]);
+
+    let table = fabric_on_stream(&host, &["audit", "list"], "");
+    let json = fabric_on_stream(&host, &["--output", "json", "audit", "list"], "");
+
+    assert_eq!(
+        stdout(&table),
+        "TIMESTAMP             EVENT            SURFACE  DECISION  DETAIL\n\
+         2026-11-01T00:00:00Z  policy_decision  pipe-1   deny      -\n",
+        "{}",
+        stderr(&table)
+    );
+    assert_eq!(stderr_beyond_the_environment_note(&table), "");
+    assert!(json.status.success(), "{}", stderr(&json));
+    assert!(!stdout(&json).contains("eyJ.secret.jwt"), "{}", stdout(&json));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn settings_set_warns_about_the_agent_stream_audit_field_and_prints_the_read_back() {
+    let host = agent_stream_stand_in(vec![
+        ("POST /api/v1/settings", "200 OK", r#"{"audit_enabled":true}"#),
+        ("GET /api/v1/settings", "200 OK", r#"{"audit_enabled":true,"prometheus_auth_password_hash":""}"#),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["--output", "json", "settings", "set", "--file", "-"],
+        r#"{"audit_enabled":true,"audit_categories":{"policies":true}}"#,
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stderr_beyond_the_environment_note(&output),
+        "warning: 'audit_categories' replaces the stored categories; any category missing from this document is \
+         switched off\n"
+    );
+    let printed: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON");
+    assert_eq!(printed, serde_json::json!({"audit_enabled": true, "prometheus_auth_password_hash": ""}));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn metrics_test_endpoint_prints_no_latency_agent_stream_does_not_send() {
+    let host = agent_stream_stand_in(vec![(
+        "POST /api/v1/metrics/test-connection",
+        "200 OK",
+        r#"{"success":true,"message":"Reached the collector at collector.example:4317."}"#,
+    )]);
+
+    let output = fabric_on_stream(&host, &["metrics", "test-endpoint", "https://collector.example:4317"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "{\n  \"message\": \"Reached the collector at collector.example:4317.\",\n  \"success\": true\n}\n"
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn logs_truncate_prints_what_agent_stream_removed() {
+    let host = agent_stream_stand_in(vec![(
+        "POST /api/v1/logs/truncate",
+        "200 OK",
+        r#"{"files_removed":2,"bytes_freed":2048,"current_log_kept":true}"#,
+    )]);
+
+    let output = fabric_on_stream(&host, &["logs", "truncate", "--yes"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "{\n  \"bytes_freed\": 2048,\n  \"current_log_kept\": true,\n  \"files_removed\": 2\n}\n"
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn audit_list_reports_an_audit_log_agent_stream_has_not_started_instead_of_an_empty_one() {
+    let host = agent_stream_stand_in(vec![(
+        "GET /api/v1/audit?limit=100&page=1",
+        "503 Service Unavailable",
+        "audit log temporarily unavailable: Audit logger not initialized",
+    )]);
+
+    let output = fabric_on_stream(&host, &["audit", "list"], "");
+
+    assert!(!output.status.success());
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr_beyond_the_environment_note(&output),
+        "error: audit log temporarily unavailable: Audit logger not initialized\n"
+    );
 }

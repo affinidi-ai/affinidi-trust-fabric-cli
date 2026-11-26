@@ -7,11 +7,15 @@
 //! so each product can have a connection named `default`.
 
 mod api_keys;
+mod audit;
 mod config;
 mod identities;
 mod login;
+mod logs;
+mod metrics;
 mod policies;
 mod secrets;
+mod settings;
 mod surfaces;
 #[cfg(test)]
 mod test_support;
@@ -206,6 +210,27 @@ enum AgentStreamCommand {
     Policies {
         #[command(subcommand)]
         command: policies::PolicyCommand,
+    },
+    /// Manage appliance-wide settings.
+    Settings {
+        #[command(subcommand)]
+        command: settings::SettingsCommand,
+    },
+    /// Read the Agent Stream audit log.
+    Audit {
+        #[command(subcommand)]
+        command: audit::AuditCommand,
+    },
+    /// Manage the metrics configuration, scrape metrics, check an OTLP
+    /// endpoint, and delete old stored metrics.
+    Metrics {
+        #[command(subcommand)]
+        command: metrics::MetricsCommand,
+    },
+    /// Download and truncate Agent Stream log files.
+    Logs {
+        #[command(subcommand)]
+        command: logs::LogsCommand,
     },
     /// Call any Agent Stream management API endpoint.
     ///
@@ -444,6 +469,22 @@ async fn run_command(
         AgentStreamCommand::Policies { command } => {
             let client = connect(saved, credentials, &globals).await?;
             policies::run(&client, command, globals.output).await
+        }
+        AgentStreamCommand::Settings { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            settings::run(&client, command, globals.output).await
+        }
+        AgentStreamCommand::Audit { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            audit::run(&client, command, globals.output).await
+        }
+        AgentStreamCommand::Metrics { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            metrics::run(&client, command, globals.output).await
+        }
+        AgentStreamCommand::Logs { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            logs::run(&client, command, globals.output).await
         }
         AgentStreamCommand::Api(args) => {
             let client = connect(saved, credentials, &globals).await?;
@@ -1377,7 +1418,8 @@ mod tests {
             .find_subcommand("agent-stream")
             .expect("the feature build has agent-stream");
 
-        for group in ["secrets", "users", "identities", "api-keys", "policies"] {
+        for group in ["secrets", "users", "identities", "api-keys", "policies", "settings", "audit", "metrics", "logs"]
+        {
             let texts = help_texts(
                 stream
                     .find_subcommand(group)
@@ -1423,6 +1465,46 @@ mod tests {
                 "GET /api/v1/identities HTTP/1.1",
                 "GET /api/v1/api-keys HTTP/1.1",
                 "GET /api/v1/policy-definitions HTTP/1.1",
+            ]
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| sends_bearer(request, ACCESS_TOKEN))
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_audit_metrics_and_logs_reach_their_routes_with_the_saved_token() {
+        let (host, requests) = scripted_agent_stream(vec![
+            ("GET /api/v1/settings", "HTTP/1.1 200 OK", "{}"),
+            ("GET /api/v1/audit?limit=100&page=1", "HTTP/1.1 200 OK", r#"{"events":[],"total":0}"#),
+            ("GET /api/v1/metrics/config", "HTTP/1.1 200 OK", "{}"),
+            ("POST /api/v1/logs/truncate", "HTTP/1.1 200 OK", r#"{"files_removed":0}"#),
+        ])
+        .await;
+
+        for words in [
+            &["settings", "show"][..],
+            &["audit", "list"],
+            &["metrics", "config", "show"],
+            &["logs", "truncate", "--yes"],
+        ] {
+            let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+            run_stream(words, saved, &credentials)
+                .await
+                .unwrap_or_else(|error| panic!("{words:?}: {error:#}"));
+        }
+
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/settings HTTP/1.1",
+                "GET /api/v1/audit?limit=100&page=1 HTTP/1.1",
+                "GET /api/v1/metrics/config HTTP/1.1",
+                "POST /api/v1/logs/truncate HTTP/1.1",
             ]
         );
         assert!(

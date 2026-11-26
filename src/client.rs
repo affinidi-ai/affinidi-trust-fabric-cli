@@ -324,10 +324,10 @@ impl GatewayClient {
     ///
     /// The status is returned rather than turned into an error, because a
     /// caller may need to read it (an unmounted admin route answering 404 is
-    /// not a failure to report verbatim). Use [`gateway_error`], with
-    /// [`Self::secrets`] for the same `auth`, to build the same message
-    /// [`Self::request`] would produce; error bodies on these routes are JSON
-    /// even though their success bodies are not.
+    /// not a failure to report verbatim). Use [`Self::raw_response_error`]
+    /// with the same `auth` to build the same message [`Self::request`] would
+    /// produce; error bodies on these routes are JSON even though their
+    /// success bodies are not.
     pub async fn request_bytes(
         &self,
         method: Method,
@@ -387,8 +387,24 @@ impl GatewayClient {
         status: StatusCode,
         body: &[u8],
     ) -> anyhow::Error {
-        let access_token = product::token_product(&self.token).is_some();
-        product_error(self.product, access_token, status, body, &self.secrets(RawAuth::Bearer))
+        self.raw_response_error(status, body, RawAuth::Bearer)
+    }
+
+    /// [`Self::response_error`] for a request made with `auth` through
+    /// [`Self::request_bytes`], so the credentials it carried, Basic ones
+    /// included, are what the message replaces.
+    pub fn raw_response_error(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+        auth: RawAuth<'_>,
+    ) -> anyhow::Error {
+        let credential = match auth {
+            RawAuth::Basic { .. } => Credential::Basic,
+            RawAuth::Bearer if product::token_product(&self.token).is_some() => Credential::AccessToken,
+            RawAuth::Bearer => Credential::SessionToken,
+        };
+        product_error(self.product, credential, status, body, &self.secrets(auth))
     }
 
     /// The credentials a request made with `auth` carries in its
@@ -594,24 +610,39 @@ pub fn gateway_error(
     body: &[u8],
     secrets: &[String],
 ) -> anyhow::Error {
-    product_error(Product::AgentGateway, false, status, body, secrets)
+    product_error(Product::AgentGateway, Credential::SessionToken, status, body, secrets)
 }
 
-/// [`gateway_error`] for an answer of `product`. The message is the server's
-/// own reason when it gave one, else the status. Three answers read
-/// differently on Agent Stream. A 401, which comes with an empty body, says
-/// what to do next, which depends on whether the request carried an access
-/// token (`access_token`) or a session token, whose session Agent Stream ends
-/// after a while without use and, by default, 12 hours after sign-in. A 403
-/// with the code `TERMS_ACCEPTANCE_REQUIRED` and no message of its own says to
-/// accept the Terms and Conditions in the Agent Stream dashboard. A 403 with an
-/// empty body names its causes: the role or the access token's scopes do not
-/// allow the request, or a resource-scoped access token was sent without a
-/// header it requires. A 403 whose body names the missing permission, or gives
-/// a message, reads the same on both products.
+/// What the `Authorization` header of a request that failed carried, which
+/// decides how an Agent Stream 401 or 403 reads. Agent Gateway messages read
+/// the same for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Credential {
+    /// An access token, such as an `aspat_` one.
+    AccessToken,
+    /// The session token of a browser login.
+    SessionToken,
+    /// HTTP Basic credentials, which only the Prometheus route takes.
+    Basic,
+}
+
+/// [`gateway_error`] for an answer of `product` to a request that carried
+/// `credential`. The message is the server's own reason when it gave one, else
+/// the status. Three answers read differently on Agent Stream. A 401, which
+/// comes with an empty body, says what to do next, which depends on whether
+/// the request carried an access token or a session token, whose session Agent
+/// Stream ends after a while without use and, by default, 12 hours after
+/// sign-in. A 403 with the code `TERMS_ACCEPTANCE_REQUIRED` and no message of
+/// its own says to accept the Terms and Conditions in the Agent Stream
+/// dashboard. A 403 with an empty body to a request that carried a token names
+/// its causes: the role or the access token's scopes do not allow the request,
+/// or a resource-scoped access token was sent without a header it requires;
+/// one to a request with Basic credentials reports the status alone, because
+/// no role or scope applies to them. A 403 whose body names the missing
+/// permission, or gives a message, reads the same on both products.
 fn product_error(
     product: Product,
-    access_token: bool,
+    credential: Credential,
     status: StatusCode,
     body: &[u8],
     secrets: &[String],
@@ -672,7 +703,10 @@ fn product_error(
             status,
             match product {
                 Product::AgentGateway => format!("gateway rejected the bearer token: {detail}"),
-                Product::AgentStream => agent_stream_unauthorized(access_token, server_said.then_some(detail.as_str())),
+                Product::AgentStream => agent_stream_unauthorized(
+                    credential == Credential::AccessToken,
+                    server_said.then_some(detail.as_str()),
+                ),
             },
         );
     }
@@ -686,7 +720,7 @@ fn product_error(
         if terms_required {
             return status_error(status, AGENT_STREAM_TERMS_REQUIRED.to_owned());
         }
-        if !server_said {
+        if !server_said && credential != Credential::Basic {
             return status_error(
                 status,
                 format!(
@@ -2257,7 +2291,7 @@ mod tests {
 
     #[test]
     fn an_agent_stream_session_refused_with_401_says_the_session_ended_and_suggests_an_access_token() {
-        let error = product_error(Product::AgentStream, false, StatusCode::UNAUTHORIZED, b"", &[]);
+        let error = product_error(Product::AgentStream, Credential::SessionToken, StatusCode::UNAUTHORIZED, b"", &[]);
 
         assert_eq!(
             error.to_string(),
@@ -2271,8 +2305,13 @@ mod tests {
     #[test]
     fn an_agent_stream_access_token_refused_with_401_says_to_log_in_again_and_keeps_what_the_server_said() {
         let secrets = vec!["aspat_secret".to_owned()];
-        let error =
-            product_error(Product::AgentStream, true, StatusCode::UNAUTHORIZED, b"bad token aspat_secret", &secrets);
+        let error = product_error(
+            Product::AgentStream,
+            Credential::AccessToken,
+            StatusCode::UNAUTHORIZED,
+            b"bad token aspat_secret",
+            &secrets,
+        );
 
         let text = error.to_string();
         assert!(text.starts_with("Agent Stream did not accept the access token"), "{text}");
@@ -2281,7 +2320,7 @@ mod tests {
 
     #[test]
     fn an_access_token_agent_stream_refuses_with_401_names_an_owner_no_longer_approved() {
-        let error = product_error(Product::AgentStream, true, StatusCode::UNAUTHORIZED, b"", &[]);
+        let error = product_error(Product::AgentStream, Credential::AccessToken, StatusCode::UNAUTHORIZED, b"", &[]);
 
         assert_eq!(
             error.to_string(),
@@ -2292,7 +2331,7 @@ mod tests {
 
     #[test]
     fn an_agent_stream_403_without_a_reason_names_the_role_the_scopes_and_a_missing_required_header() {
-        let error = product_error(Product::AgentStream, true, StatusCode::FORBIDDEN, b"", &[]);
+        let error = product_error(Product::AgentStream, Credential::AccessToken, StatusCode::FORBIDDEN, b"", &[]);
 
         assert_eq!(
             error.to_string(),
@@ -2303,10 +2342,18 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_stream_403_without_a_reason_to_basic_credentials_reports_the_status_alone() {
+        let error = product_error(Product::AgentStream, Credential::Basic, StatusCode::FORBIDDEN, b"", &[]);
+
+        assert_eq!(error.to_string(), "Agent Stream returned 403 Forbidden: no additional detail from server");
+        assert_eq!(response_status(&error), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
     fn an_agent_stream_403_for_terms_without_a_message_says_to_accept_them_in_the_dashboard() {
         let error = product_error(
             Product::AgentStream,
-            false,
+            Credential::SessionToken,
             StatusCode::FORBIDDEN,
             br#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#,
             &[],
@@ -2322,7 +2369,13 @@ mod tests {
 
     #[test]
     fn an_agent_stream_403_with_another_code_and_no_message_shows_the_body() {
-        let error = product_error(Product::AgentStream, false, StatusCode::FORBIDDEN, br#"{"code":"OTHER"}"#, &[]);
+        let error = product_error(
+            Product::AgentStream,
+            Credential::SessionToken,
+            StatusCode::FORBIDDEN,
+            br#"{"code":"OTHER"}"#,
+            &[],
+        );
 
         assert_eq!(error.to_string(), r#"{"code":"OTHER"}"#);
     }
@@ -2331,7 +2384,7 @@ mod tests {
     fn a_gateway_403_for_terms_keeps_the_raw_body_for_its_own_hint() {
         let error = product_error(
             Product::AgentGateway,
-            false,
+            Credential::SessionToken,
             StatusCode::FORBIDDEN,
             br#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#,
             &[],
@@ -2344,7 +2397,7 @@ mod tests {
     fn an_agent_stream_403_that_names_the_permission_or_gives_a_reason_shows_it() {
         let named = product_error(
             Product::AgentStream,
-            true,
+            Credential::AccessToken,
             StatusCode::FORBIDDEN,
             br#"{"required_permission":"access_tokens.view"}"#,
             &[],
@@ -2353,7 +2406,7 @@ mod tests {
 
         let terms = product_error(
             Product::AgentStream,
-            true,
+            Credential::AccessToken,
             StatusCode::FORBIDDEN,
             br#"{"code":"TERMS_ACCEPTANCE_REQUIRED","message":"Sign in to Agent Stream and accept the terms."}"#,
             &[],
@@ -2363,20 +2416,20 @@ mod tests {
 
     #[test]
     fn an_agent_stream_answer_with_nothing_to_say_names_agent_stream() {
-        let error = product_error(Product::AgentStream, true, StatusCode::BAD_GATEWAY, b"", &[]);
+        let error = product_error(Product::AgentStream, Credential::AccessToken, StatusCode::BAD_GATEWAY, b"", &[]);
 
         assert_eq!(error.to_string(), "Agent Stream returned 502 Bad Gateway: no additional detail from server");
     }
 
     #[test]
     fn a_gateway_answer_keeps_its_wording_whatever_the_token() {
-        for access_token in [false, true] {
+        for credential in [Credential::AccessToken, Credential::SessionToken, Credential::Basic] {
             assert_eq!(
-                product_error(Product::AgentGateway, access_token, StatusCode::UNAUTHORIZED, b"", &[]).to_string(),
+                product_error(Product::AgentGateway, credential, StatusCode::UNAUTHORIZED, b"", &[]).to_string(),
                 "gateway rejected the bearer token: no additional detail from server"
             );
             assert_eq!(
-                product_error(Product::AgentGateway, access_token, StatusCode::FORBIDDEN, b"", &[]).to_string(),
+                product_error(Product::AgentGateway, credential, StatusCode::FORBIDDEN, b"", &[]).to_string(),
                 "gateway returned 403 Forbidden: no additional detail from server"
             );
         }

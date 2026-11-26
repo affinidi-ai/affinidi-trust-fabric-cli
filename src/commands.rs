@@ -900,7 +900,7 @@ impl RuntimeView {
 }
 
 #[derive(Debug, Subcommand)]
-enum SettingsCommand {
+pub(crate) enum SettingsCommand {
     /// Show the appliance-wide settings.
     ///
     /// The gateway blanks `prometheus_auth_password_hash` on every response,
@@ -1168,10 +1168,10 @@ enum CrudCommand {
 }
 
 #[derive(Debug, Args)]
-struct JsonFileArgs {
+pub(crate) struct JsonFileArgs {
     /// JSON request body. Use '-' to read from standard input.
     #[arg(short, long)]
-    file: PathBuf,
+    pub(crate) file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2207,6 +2207,10 @@ pub(crate) enum SharedCommand {
     Identities(IdentityCommand),
     ApiKeys(ApiKeyCommand),
     Policies(PolicyCommand),
+    Settings(SettingsCommand),
+    Audit(AuditCommand),
+    Metrics(MetricsCommand),
+    Logs(LogsCommand),
 }
 
 #[cfg(feature = "agent-stream")]
@@ -2218,6 +2222,10 @@ impl From<SharedCommand> for Command {
             SharedCommand::Identities(command) => Self::Identities { command },
             SharedCommand::ApiKeys(command) => Self::ApiKeys { command },
             SharedCommand::Policies(command) => Self::Policies { command },
+            SharedCommand::Settings(command) => Self::Settings { command },
+            SharedCommand::Audit(command) => Self::Audit { command },
+            SharedCommand::Metrics(command) => Self::Metrics { command },
+            SharedCommand::Logs(command) => Self::Logs { command },
         }
     }
 }
@@ -3488,8 +3496,13 @@ async fn run_settings(
         }
         SettingsCommand::Set(args) => {
             let body = read_json(&args.file)?;
-            reject_runtime_terms_flag(&body, "settings show")?;
-            warn_each(settings_write_warnings(&body));
+            let product = client.product();
+            // Only Agent Gateway fills `feature_flags.terms` in on every read;
+            // Agent Stream stores that flag like any other.
+            if product == Product::AgentGateway {
+                reject_runtime_terms_flag(&body, "settings show")?;
+            }
+            warn_each(settings_write_warnings(product, &body));
             client
                 .request(Method::POST, "/v1/settings", Some(body))
                 .await?;
@@ -3497,7 +3510,7 @@ async fn run_settings(
         }
         SettingsCommand::Reset { force } => {
             if !force {
-                reject_settings_reset()?;
+                reject_settings_reset(client.product())?;
             }
             client
                 .request(Method::DELETE, "/v1/settings", None)
@@ -3507,10 +3520,10 @@ async fn run_settings(
     }
 }
 
-/// Reads the appliance settings back after a write. The write routes answer
-/// with the stored document, which lacks the `feature_flags.terms` every read
-/// adds from the gateway's `network.terms` configuration, so printing that
-/// answer would disagree with the next `settings show`.
+/// Reads the appliance settings back after a write, so what is printed is what
+/// the next `settings show` prints. Agent Gateway's write routes answer with
+/// the stored document, which lacks the `feature_flags.terms` every read adds
+/// from the gateway's `network.terms` configuration.
 async fn read_back_settings(
     client: &GatewayClient,
     done: &str,
@@ -3521,27 +3534,48 @@ async fn read_back_settings(
         .with_context(|| format!("the appliance settings were {done}, but reading them back failed"))
 }
 
-/// Refuses an unforced `settings reset`. The route writes the built-in defaults
-/// over the whole document rather than restoring the fields nobody set, so it
-/// silently switches off two security controls, and the Prometheus password it
-/// erases cannot be put back from a `settings show` backup: the hash is blanked
-/// on every read, and re-enabling authentication without a plaintext password
-/// is rejected.
-fn reject_settings_reset() -> Result<()> {
+/// Refuses an unforced `settings reset` on `product`. The route writes the
+/// built-in defaults over the whole document rather than restoring the fields
+/// nobody set, so it silently switches off two security controls and clears
+/// `appliance_id` on both products, and the Prometheus password it erases
+/// cannot be put back from a `settings show` backup: the hash is blanked on
+/// every read, and re-enabling authentication without a plaintext password is
+/// rejected. The message is built once for both products. Only the Agent
+/// Stream one names `appliance_id`, and it says that the audit settings gate
+/// only the recording of policy decisions there; the Agent Gateway one keeps
+/// its earlier wording, dash included.
+fn reject_settings_reset(product: Product) -> Result<()> {
+    let (audit, appliance_id, backup) = match product {
+        Product::AgentGateway => ("audit logging stops", "", " \u{2014}"),
+        Product::AgentStream => ("policy decisions are no longer recorded in the audit log", "'appliance_id'; ", ":"),
+    };
     bail!(
-        "`settings reset` overwrites the whole appliance settings document with the built-in defaults. It clears: 'prometheus_auth_enabled', so /v1/metrics/prometheus stops checking credentials; 'prometheus_auth_username' and the stored password hash; 'audit_enabled' and 'audit_categories', so audit logging stops; every entry in 'feature_flags'; and every window, interval and threshold. A `fabric agent-gateway settings show` backup does not undo it — the password hash is blanked on read, and re-enabling Prometheus authentication without a plaintext 'prometheus_auth_password' is refused with 400. Keep that password elsewhere, or re-run with --force"
+        "`settings reset` overwrites the whole appliance settings document with the built-in defaults. It clears: 'prometheus_auth_enabled', so /v1/metrics/prometheus stops checking credentials; 'prometheus_auth_username' and the stored password hash; 'audit_enabled' and 'audit_categories', so {audit}; {appliance_id}every entry in 'feature_flags'; and every window, interval and threshold. A `{} settings show` backup does not undo it{backup} the password hash is blanked on read, and re-enabling Prometheus authentication without a plaintext 'prometheus_auth_password' is refused with 400. Keep that password elsewhere, or re-run with --force",
+        product.command()
     )
 }
 
-/// Names the parts of an appliance settings document the gateway will not store
+/// Names the parts of an appliance settings document `product` will not store
 /// as sent, so a document round-tripped through `settings show` does not look
-/// like it applied more than it did.
-fn settings_write_warnings(body: &Value) -> Vec<String> {
+/// like it applied more than it did. On Agent Stream that includes
+/// `audit_events`, the Agent Gateway field it has no use for, and
+/// `audit_categories`, which replaces the stored categories whole.
+fn settings_write_warnings(
+    product: Product,
+    body: &Value,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     if carries_value(body, "/payments_min_display") {
-        warnings.push(
-            "'payments_min_display' is not part of an appliance settings update and is ignored; set it per user with `fabric agent-gateway user-settings set`".to_owned(),
-        );
+        let (per_user, refusal) = match product {
+            Product::AgentGateway => ("user-settings set", ""),
+            Product::AgentStream => {
+                ("api post /v1/user-settings --file <file>", ", which refuses an access token with explicit scopes")
+            }
+        };
+        warnings.push(format!(
+            "'payments_min_display' is not part of an appliance settings update and is ignored; set it per user with `{} {per_user}`{refusal}",
+            product.command()
+        ));
     }
     if carries_value(body, "/prometheus_auth_password_hash") {
         warnings.push(
@@ -3551,6 +3585,18 @@ fn settings_write_warnings(body: &Value) -> Vec<String> {
     if carries_value(body, "/feature_flags") {
         warnings
             .push("'feature_flags' replaces the stored map; any flag missing from this document is removed".to_owned());
+    }
+    if product == Product::AgentStream {
+        if carries_value(body, "/audit_categories") {
+            warnings.push(
+                "'audit_categories' replaces the stored categories; any category missing from this document is switched off".to_owned(),
+            );
+        }
+        if carries_value(body, "/audit_events") {
+            warnings.push(
+                "'audit_events' is an Agent Gateway setting and is ignored; Agent Stream chooses what to audit with 'audit_categories'".to_owned(),
+            );
+        }
     }
     warnings
 }
@@ -4188,13 +4234,106 @@ mod gateway_config_tests {
             .expect_err("send-welcome without --title and --message should be rejected");
     }
 
+    #[tokio::test]
+    async fn the_gateway_settings_refusals_and_warnings_keep_their_exact_wording() {
+        let client = GatewayClient::new("http://127.0.0.1:1", "agpat_valid").expect("client");
+        let terms = json_file(r#"{"feature_flags":{"terms":true}}"#);
+
+        let reset = run_settings(&client, SettingsCommand::Reset { force: false })
+            .await
+            .expect_err("an unforced reset");
+        let terms = run_settings(
+            &client,
+            SettingsCommand::Set(JsonFileArgs {
+                file: terms.path().to_path_buf(),
+            }),
+        )
+        .await
+        .expect_err("a terms flag");
+        let warnings = settings_write_warnings(
+            Product::AgentGateway,
+            &json!({
+                "payments_min_display": 10,
+                "prometheus_auth_password_hash": "",
+                "feature_flags": {"ap2_experimental": false}
+            }),
+        );
+
+        assert_eq!(
+            reset.to_string(),
+            "`settings reset` overwrites the whole appliance settings document with the built-in defaults. It \
+             clears: 'prometheus_auth_enabled', so /v1/metrics/prometheus stops checking credentials; \
+             'prometheus_auth_username' and the stored password hash; 'audit_enabled' and 'audit_categories', so \
+             audit logging stops; every entry in 'feature_flags'; and every window, interval and threshold. A \
+             `fabric agent-gateway settings show` backup does not undo it \u{2014} the password hash is blanked on \
+             read, and re-enabling Prometheus authentication without a plaintext 'prometheus_auth_password' is \
+             refused with 400. Keep that password elsewhere, or re-run with --force"
+        );
+        assert_eq!(
+            terms.to_string(),
+            "'feature_flags.terms' cannot be written: the gateway reports it from its `network.terms` configuration \
+             on every read and ignores a stored value, so this write could never take effect. Delete \"terms\" from \
+             \"feature_flags\" (a `fabric agent-gateway settings show` document always carries it) and re-run. \
+             Terms of Use are switched on or off in the gateway's `network.terms` configuration, not here"
+        );
+        assert_eq!(
+            warnings,
+            [
+                "'payments_min_display' is not part of an appliance settings update and is ignored; set it per user \
+                 with `fabric agent-gateway user-settings set`",
+                "'prometheus_auth_password_hash' is blanked on every read and is ignored on write; send \
+                 'prometheus_auth_password' to change the password",
+                "'feature_flags' replaces the stored map; any flag missing from this document is removed",
+            ]
+        );
+    }
+
     #[test]
-    fn settings_warnings_name_every_field_the_gateway_drops_or_replaces() {
-        let warnings = settings_write_warnings(&json!({
+    fn the_agent_stream_settings_warnings_check_its_own_audit_field() {
+        let document = json!({
             "payments_min_display": 10,
             "prometheus_auth_password_hash": "",
-            "feature_flags": {"ap2_experimental": false}
-        }));
+            "feature_flags": {"beta": true},
+            "audit_categories": {"policies": true},
+            "audit_events": ["policy_decision"]
+        });
+
+        assert_eq!(
+            settings_write_warnings(Product::AgentStream, &document),
+            [
+                "'payments_min_display' is not part of an appliance settings update and is ignored; set it per user \
+                 with `fabric agent-stream api post /v1/user-settings --file <file>`, which refuses an access token \
+                 with explicit scopes",
+                "'prometheus_auth_password_hash' is blanked on every read and is ignored on write; send \
+                 'prometheus_auth_password' to change the password",
+                "'feature_flags' replaces the stored map; any flag missing from this document is removed",
+                "'audit_categories' replaces the stored categories; any category missing from this document is \
+                 switched off",
+                "'audit_events' is an Agent Gateway setting and is ignored; Agent Stream chooses what to audit with \
+                 'audit_categories'",
+            ]
+        );
+        assert_eq!(
+            settings_write_warnings(Product::AgentGateway, &document).len(),
+            3,
+            "Agent Gateway's checks stay as they were"
+        );
+        assert!(
+            settings_write_warnings(Product::AgentStream, &json!({"audit_categories": null, "audit_events": null}))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn settings_warnings_name_every_field_the_gateway_drops_or_replaces() {
+        let warnings = settings_write_warnings(
+            Product::AgentGateway,
+            &json!({
+                "payments_min_display": 10,
+                "prometheus_auth_password_hash": "",
+                "feature_flags": {"ap2_experimental": false}
+            }),
+        );
         assert_eq!(warnings.len(), 3);
         assert!(
             warnings
@@ -4212,17 +4351,20 @@ mod gateway_config_tests {
                 .any(|warning| warning.contains("replaces the stored map"))
         );
 
-        assert!(settings_write_warnings(&json!({"refresh_interval_seconds": 30})).is_empty());
+        assert!(settings_write_warnings(Product::AgentGateway, &json!({"refresh_interval_seconds": 30})).is_empty());
 
         // An explicit null deserialises to None on every settings field, so the
         // gateway leaves the stored value alone and there is nothing to warn
         // about.
         assert!(
-            settings_write_warnings(&json!({
-                "feature_flags": null,
-                "payments_min_display": null,
-                "prometheus_auth_password_hash": null
-            }))
+            settings_write_warnings(
+                Product::AgentGateway,
+                &json!({
+                    "feature_flags": null,
+                    "payments_min_display": null,
+                    "prometheus_auth_password_hash": null
+                })
+            )
             .is_empty()
         );
     }
@@ -14674,7 +14816,7 @@ async fn run_policies(
 use crate::client::{REDACTED, RawAuth, clean_for_terminal, gateway_error};
 
 #[derive(Debug, Subcommand)]
-enum AuditCommand {
+pub(crate) enum AuditCommand {
     /// List audit events, newest first.
     ///
     /// The log records gateway traffic, such as delegation, policy decisions,
@@ -14707,43 +14849,43 @@ const AUDIT_LIST_EXAMPLES: &str = r#"Examples:
     fabric agent-gateway audit list --all --output json > audit.json"#;
 
 #[derive(Debug, Args)]
-struct AuditListArgs {
+pub(crate) struct AuditListArgs {
     /// Events per page. The gateway clamps this to 1-500.
     #[arg(long, default_value_t = 100)]
-    limit: usize,
+    pub(crate) limit: usize,
     /// Page to read, counting from 1.
     #[arg(long, default_value_t = 1, conflicts_with = "all")]
-    page: usize,
+    pub(crate) page: usize,
     /// Case-insensitive substring, matched against each whole event as JSON,
     /// so field names and the base64 body of an embedded JWT match too.
     #[arg(long)]
-    filter: Option<String>,
+    pub(crate) filter: Option<String>,
     /// Comma-separated event categories, for example
     /// policy_decision,trust_check,consent_granted,token_injected,payment.
     #[arg(long)]
-    category: Option<String>,
+    pub(crate) category: Option<String>,
     /// Only policy decisions from this request flow; other events are dropped.
     #[arg(long, value_enum)]
-    flow: Option<AuditFlow>,
+    pub(crate) flow: Option<AuditFlow>,
     /// Only policy decisions at this scope; other events are dropped.
     #[arg(long, value_enum)]
-    scope: Option<AuditScope>,
+    pub(crate) scope: Option<AuditScope>,
     /// Only policy decisions with this outcome; other events are dropped.
     /// `deny` leaves out `error` decisions, which also denied the request.
     #[arg(long, value_enum)]
-    decision: Option<AuditDecision>,
+    pub(crate) decision: Option<AuditDecision>,
     /// Read every page instead of one. With --output json the per-page
     /// counters are dropped and total is kept.
     #[arg(long)]
-    all: bool,
+    pub(crate) all: bool,
     /// Print the caller's email and name and the full vp_jwt of each event
     /// instead of a placeholder.
     #[arg(long)]
-    reveal: bool,
+    pub(crate) reveal: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum AuditFlow {
+pub(crate) enum AuditFlow {
     /// Inbound requests at a surface's Access Point.
     #[value(name = "access_point")]
     AccessPoint,
@@ -14764,8 +14906,11 @@ impl AuditFlow {
     }
 }
 
+/// The `scope` of a policy decision in the audit log. Only the Agent Gateway
+/// scopes can be typed after `fabric agent-gateway audit list --scope`; the
+/// Agent Stream ones come from `fabric agent-stream audit list`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum AuditScope {
+pub(crate) enum AuditScope {
     /// The gateway-wide policy, checked before the surface policy.
     Gateway,
     /// The surface policy.
@@ -14778,6 +14923,12 @@ enum AuditScope {
     /// Tools a `tools/list` filter removed from the response.
     #[value(name = "mcp_tool_list")]
     McpToolList,
+    #[cfg(feature = "agent-stream")]
+    #[value(skip)]
+    Pipe,
+    #[cfg(feature = "agent-stream")]
+    #[value(skip)]
+    Ide,
 }
 
 impl AuditScope {
@@ -14788,18 +14939,28 @@ impl AuditScope {
             Self::McpTool => "mcp_tool",
             Self::Response => "response",
             Self::McpToolList => "mcp_tool_list",
+            #[cfg(feature = "agent-stream")]
+            Self::Pipe => "pipe",
+            #[cfg(feature = "agent-stream")]
+            Self::Ide => "ide",
         }
     }
 }
 
+/// The outcome of a policy decision in the audit log. `missing_engine` is
+/// recorded by Agent Stream only, so it comes from `fabric agent-stream audit
+/// list` and cannot be typed after `fabric agent-gateway audit list`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum AuditDecision {
+pub(crate) enum AuditDecision {
     /// The policy allowed the request.
     Allow,
     /// The policy denied the request.
     Deny,
     /// The policy could not decide, so the request was denied.
     Error,
+    #[cfg(feature = "agent-stream")]
+    #[value(skip)]
+    MissingEngine,
 }
 
 impl AuditDecision {
@@ -14808,6 +14969,8 @@ impl AuditDecision {
             Self::Allow => "allow",
             Self::Deny => "deny",
             Self::Error => "error",
+            #[cfg(feature = "agent-stream")]
+            Self::MissingEngine => "missing_engine",
         }
     }
 }
@@ -14925,7 +15088,7 @@ impl PaymentStore {
 }
 
 #[derive(Debug, Subcommand)]
-enum MetricsCommand {
+pub(crate) enum MetricsCommand {
     /// Manage the metrics configuration.
     Config {
         #[command(subcommand)]
@@ -14985,7 +15148,7 @@ const METRICS_TRUNCATE_EXAMPLES: &str = r#"Examples:
     fabric agent-gateway metrics truncate --yes"#;
 
 #[derive(Debug, Subcommand)]
-enum MetricsConfigCommand {
+pub(crate) enum MetricsConfigCommand {
     /// Show the metrics configuration.
     Show,
     /// Replace the whole metrics configuration from a JSON document.
@@ -15015,32 +15178,32 @@ const METRICS_CONFIG_SET_EXAMPLES: &str = r#"Examples:
 /// The replacement metrics document, plus the override for the pre-flight
 /// check that refuses one dropping a stored setting.
 #[derive(Debug, Args)]
-struct MetricsFileArgs {
+pub(crate) struct MetricsFileArgs {
     /// JSON request body. Use '-' to read from standard input.
     #[arg(short, long)]
-    file: PathBuf,
+    pub(crate) file: PathBuf,
     /// Skip the check against the live configuration, to remove a stored
     /// setting on purpose.
     #[arg(long)]
-    force: bool,
+    pub(crate) force: bool,
 }
 
 #[derive(Debug, Args)]
-struct MetricsScrapeArgs {
+pub(crate) struct MetricsScrapeArgs {
     /// Prometheus Basic-auth user configured in the gateway's admin settings.
     #[arg(long, requires = "password", env = "FABRIC_METRICS_USERNAME")]
-    username: Option<String>,
+    pub(crate) username: Option<String>,
     /// Password for --username. Prefer FABRIC_METRICS_PASSWORD over passing it
     /// on the command line, where it lands in shell history.
     #[arg(long, requires = "username", env = "FABRIC_METRICS_PASSWORD", hide_env_values = true)]
-    password: Option<String>,
+    pub(crate) password: Option<String>,
     /// Where to write the exposition. '-' is standard output.
     #[arg(long, default_value = "-")]
-    output_file: PathBuf,
+    pub(crate) output_file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
-enum LogsCommand {
+pub(crate) enum LogsCommand {
     /// Download every log file as one ZIP archive.
     ///
     /// The gateway builds the whole archive in memory before sending it, so
@@ -15107,6 +15270,7 @@ async fn run_audit(
                 || args.scope.is_some()
                 || args.decision.is_some();
             print_audit_table(
+                client.product(),
                 &response,
                 if filtered {
                     Scope::Filtered
@@ -15211,30 +15375,47 @@ async fn fetch_audit_page(
 }
 
 /// Printed to standard error beneath "No audit events yet.", for the operator who
-/// expected events: why the log can be empty, and what it never records.
-const EMPTY_AUDIT_NOTES: [&str; 2] = [
-    "An empty result is ambiguous: the gateway answers 200 with no events when the audit log is empty, when its \
-     audit subsystem failed to start, and when it cannot read the audit file or the file is not valid UTF-8. It \
-     also drops any line of the file it cannot parse without saying so.",
-    "The audit log records gateway traffic (delegation consent and tokens, policy decisions, trust checks, VP \
-     injection, payments, trace terminations); admin API calls such as creating an identity are not audited, \
-     except revoking delegation tokens.",
-];
+/// expected events: why `product`'s log can be empty, and what it never
+/// records. Agent Stream answers 503 instead of an empty page when its audit
+/// log never started, so its first note leaves that case out.
+fn empty_audit_notes(product: Product) -> [&'static str; 2] {
+    match product {
+        Product::AgentGateway => [
+            "An empty result is ambiguous: the gateway answers 200 with no events when the audit log is empty, when \
+             its audit subsystem failed to start, and when it cannot read the audit file or the file is not valid \
+             UTF-8. It also drops any line of the file it cannot parse without saying so.",
+            "The audit log records gateway traffic (delegation consent and tokens, policy decisions, trust checks, VP \
+             injection, payments, trace terminations); admin API calls such as creating an identity are not \
+             audited, except revoking delegation tokens.",
+        ],
+        Product::AgentStream => [
+            "An empty result is ambiguous: Agent Stream answers 200 with no events when the audit log is empty, and \
+             when it cannot read the audit file or the file is not valid UTF-8. It also drops any line of the file \
+             it cannot parse without saying so.",
+            "The audit log records delegation consent and tokens, policy decisions, and changes to the audit \
+             settings; policy decisions only while 'audit_enabled' and 'audit_categories.policies' are both on. \
+             Other admin API calls, such as creating an identity, are not audited, except revoking delegation \
+             tokens.",
+        ],
+    }
+}
 
 fn print_audit_table(
+    product: Product,
     response: &Value,
     scope: Scope,
 ) -> Result<()> {
-    write_audit_table(response, &mut io::stdout().lock(), &mut io::stderr().lock(), scope)
+    write_audit_table(product, response, &mut io::stdout().lock(), &mut io::stderr().lock(), scope)
         .context("print the audit table")
 }
 
 /// Writes the events to `rows` as the shared audit table, or, for an empty
 /// result, "No audit events yet." (or "No matching audit events." when a filter
-/// was given) to `rows` and [`EMPTY_AUDIT_NOTES`] to `notes`,
+/// was given) to `rows` and the [`empty_audit_notes`] of `product` to `notes`,
 /// so piped output stays clean. `rows` is standard output and `notes` standard
 /// error.
 fn write_audit_table(
+    product: Product,
     response: &Value,
     rows: &mut impl io::Write,
     notes: &mut impl io::Write,
@@ -15252,7 +15433,7 @@ fn write_audit_table(
         writeln!(rows, "{line}")?;
     }
     if events.is_empty() {
-        for note in EMPTY_AUDIT_NOTES {
+        for note in empty_audit_notes(product) {
             writeln!(notes, "note: {note}")?;
         }
     }
@@ -15793,7 +15974,7 @@ async fn set_metrics_config(
             .request(Method::GET, "/v1/metrics/config", None)
             .await
             .context("read the live metrics configuration to check what this document would drop")?;
-        reject_dropped_settings(&current, &body)?;
+        reject_dropped_settings(client.product(), &current, &body)?;
     }
     let value = client
         .request(Method::PUT, "/v1/metrics/config", Some(body))
@@ -15829,9 +16010,10 @@ fn metrics_update_message(
 /// treats several settings as optional — `opentelemetry.auth` above all — so
 /// omitting one removes it rather than defaulting it, and the live exporter is
 /// re-applied immediately. Dropping `auth` silently switches collector export
-/// to unauthenticated, so refuse any document that would drop a setting the
-/// gateway currently stores.
+/// to unauthenticated, so refuse any document that would drop a setting
+/// `product` currently stores.
 fn reject_dropped_settings(
+    product: Product,
     current: &Value,
     submitted: &Value,
 ) -> Result<()> {
@@ -15841,10 +16023,11 @@ fn reject_dropped_settings(
         return Ok(());
     }
     bail!(
-        "this document drops {} setting(s) the gateway currently stores: {}. A metrics update replaces the whole \
+        "this document drops {} setting(s) {} currently stores: {}. A metrics update replaces the whole \
          document, so each one would be removed and the live exporter reconfigured without it. Add them, or re-run \
          with --force",
         dropped.len(),
+        product.message_subject(),
         dropped.join(", ")
     )
 }
@@ -15897,16 +16080,24 @@ async fn scrape_metrics(
     // Prometheus Basic check — never from the bearer token, which is why the
     // shared "gateway rejected the bearer token" wording must not be used.
     if status == reqwest::StatusCode::UNAUTHORIZED {
+        let product = client.product();
         match &args.username {
-            Some(username) => bail!("gateway rejected the Prometheus credentials for --username '{username}'"),
+            Some(username) => {
+                bail!("{} rejected the Prometheus credentials for --username '{username}'", product.message_name())
+            }
             None => bail!(
-                "this gateway requires Prometheus credentials on /v1/metrics/prometheus; pass --username and \
-                 --password, which are sent instead of the bearer token"
+                "{} requires Prometheus credentials on /v1/metrics/prometheus; pass --username and --password, \
+                 which are sent instead of the bearer token",
+                // Agent Gateway's wording predates Agent Stream and is kept.
+                match product {
+                    Product::AgentGateway => "this gateway",
+                    Product::AgentStream => product.message_subject(),
+                }
             ),
         }
     }
     if !status.is_success() {
-        return Err(gateway_error(status, &body, &client.secrets(auth)));
+        return Err(client.raw_response_error(status, &body, auth));
     }
     write_response_body(&args.output_file, &scrape_output(&args.output_file, &body))
 }
@@ -15960,7 +16151,7 @@ async fn run_logs(
                 .download_bytes("/v1/logs/download")
                 .await?;
             if !status.is_success() {
-                return Err(gateway_error(status, &body, &client.secrets(RawAuth::Bearer)));
+                return Err(client.response_error(status, &body));
             }
             write_response_body(&output_file, &body)
         }
@@ -16215,7 +16406,7 @@ mod observability_tests {
     /// standard error.
     fn audit_table(response: &Value) -> (String, String) {
         let (mut rows, mut notes) = (Vec::new(), Vec::new());
-        write_audit_table(response, &mut rows, &mut notes, Scope::All).expect("write to memory");
+        write_audit_table(Product::AgentGateway, response, &mut rows, &mut notes, Scope::All).expect("write to memory");
         (String::from_utf8(rows).expect("UTF-8 rows"), String::from_utf8(notes).expect("UTF-8 notes"))
     }
 
@@ -16872,6 +17063,104 @@ mod observability_tests {
     }
 
     #[tokio::test]
+    async fn the_gateway_prometheus_refusals_keep_their_exact_wording() {
+        const UNAUTHORIZED: &[(&str, &str)] = &[("HTTP/1.1 401 Unauthorized", "")];
+        let _guard = PROCESS_ENV_LOCK.lock().await;
+        clear_metrics_credentials();
+
+        let anonymous = error_for(&["fabric", "agent-gateway", "metrics", "scrape"], UNAUTHORIZED).await;
+        let named = error_for(
+            &["fabric", "agent-gateway", "metrics", "scrape", "--username", "prom", "--password", "hunter2"],
+            UNAUTHORIZED,
+        )
+        .await;
+
+        assert_eq!(
+            anonymous,
+            "this gateway requires Prometheus credentials on /v1/metrics/prometheus; pass --username and \
+             --password, which are sent instead of the bearer token"
+        );
+        assert_eq!(named, "gateway rejected the Prometheus credentials for --username 'prom'");
+    }
+
+    #[test]
+    fn the_gateway_dropped_metrics_settings_refusal_keeps_its_exact_wording() {
+        let error = reject_dropped_settings(
+            Product::AgentGateway,
+            &json!({"opentelemetry": {"auth": {"header_name": "x-api-key"}}, "retention": {}}),
+            &json!({"opentelemetry": {}}),
+        )
+        .expect_err("two settings dropped");
+
+        assert_eq!(
+            error.to_string(),
+            "this document drops 2 setting(s) the gateway currently stores: opentelemetry.auth, retention. A \
+             metrics update replaces the whole document, so each one would be removed and the live exporter \
+             reconfigured without it. Add them, or re-run with --force"
+        );
+    }
+
+    #[test]
+    fn the_gateway_empty_audit_notes_keep_their_exact_wording() {
+        let (rows, notes) = audit_table(&json!({"events": []}));
+
+        assert_eq!(rows, "No audit events yet.\n");
+        assert_eq!(
+            notes,
+            "note: An empty result is ambiguous: the gateway answers 200 with no events when the audit log is \
+             empty, when its audit subsystem failed to start, and when it cannot read the audit file or the file is \
+             not valid UTF-8. It also drops any line of the file it cannot parse without saying so.\n\
+             note: The audit log records gateway traffic (delegation consent and tokens, policy decisions, trust \
+             checks, VP injection, payments, trace terminations); admin API calls such as creating an identity are \
+             not audited, except revoking delegation tokens.\n"
+        );
+    }
+
+    #[test]
+    fn the_agent_stream_empty_audit_notes_leave_out_what_agent_stream_does_not_do() {
+        let (mut rows, mut notes) = (Vec::new(), Vec::new());
+        write_audit_table(Product::AgentStream, &json!({"events": []}), &mut rows, &mut notes, Scope::All)
+            .expect("write to memory");
+
+        assert_eq!(String::from_utf8(rows).expect("UTF-8 rows"), "No audit events yet.\n");
+        assert_eq!(
+            String::from_utf8(notes).expect("UTF-8 notes"),
+            "note: An empty result is ambiguous: Agent Stream answers 200 with no events when the audit log is \
+             empty, and when it cannot read the audit file or the file is not valid UTF-8. It also drops any line \
+             of the file it cannot parse without saying so.\n\
+             note: The audit log records delegation consent and tokens, policy decisions, and changes to the \
+             audit settings; policy decisions only while 'audit_enabled' and 'audit_categories.policies' are both \
+             on. Other admin API calls, such as creating an identity, are not audited, except revoking delegation \
+             tokens.\n"
+        );
+    }
+
+    #[test]
+    fn the_gateway_audit_filters_keep_their_values() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let list = command
+            .find_subcommand("agent-gateway")
+            .and_then(|gateway| gateway.find_subcommand("audit"))
+            .and_then(|audit| audit.find_subcommand("list"))
+            .expect("audit list");
+        let values = |id: &str| -> Vec<String> {
+            list.get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .unwrap_or_else(|| panic!("--{id}"))
+                .get_possible_values()
+                .iter()
+                .map(|value| value.get_name().to_owned())
+                .collect()
+        };
+
+        assert_eq!(values("flow"), ["access_point", "transit_point", "fabric"]);
+        assert_eq!(values("scope"), ["gateway", "surface", "mcp_tool", "response", "mcp_tool_list"]);
+        assert_eq!(values("decision"), ["allow", "deny", "error"]);
+    }
+
+    #[tokio::test]
     async fn logs_download_errors_redact_the_client_token() {
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory
@@ -17132,6 +17421,7 @@ mod observability_tests {
         // Omitting an optional nested key removes it, which is how collector
         // authentication gets silently switched off.
         let error = reject_dropped_settings(
+            Product::AgentGateway,
             &current,
             &json!({
                 "opentelemetry": {"enabled": true, "endpoint": "http://collector:4317"},
@@ -17144,8 +17434,12 @@ mod observability_tests {
         assert!(text.contains("opentelemetry.auth"), "got: {text}");
 
         // Whole sections default away the same way.
-        let error = reject_dropped_settings(&current, &json!({"opentelemetry": current["opentelemetry"]}))
-            .expect_err("dropping whole sections must be refused");
+        let error = reject_dropped_settings(
+            Product::AgentGateway,
+            &current,
+            &json!({"opentelemetry": current["opentelemetry"]}),
+        )
+        .expect_err("dropping whole sections must be refused");
         let text = error.to_string();
         assert!(text.contains("retention") && text.contains("advanced"), "got: {text}");
 
@@ -17159,7 +17453,7 @@ mod observability_tests {
                 "retention": {"days": 7},
                 "advanced": {"batch_size": 512}
             });
-            let error = reject_dropped_settings(&current, &submitted)
+            let error = reject_dropped_settings(Product::AgentGateway, &current, &submitted)
                 .expect_err("replacing a stored section with a non-object must be refused");
             let text = error.to_string();
             assert!(text.contains("opentelemetry.auth"), "got: {text}");
@@ -17167,13 +17461,15 @@ mod observability_tests {
 
         // The reverse is a change, not a removal: nothing stored goes away.
         reject_dropped_settings(
+            Product::AgentGateway,
             &json!({"opentelemetry": {"auth": null}}),
             &json!({"opentelemetry": {"auth": {"header_name": "x-api-key"}}}),
         )
         .expect("filling in a setting the gateway stores as null is accepted");
 
-        reject_dropped_settings(&current, &current).expect("an unchanged document is accepted");
+        reject_dropped_settings(Product::AgentGateway, &current, &current).expect("an unchanged document is accepted");
         reject_dropped_settings(
+            Product::AgentGateway,
             &current,
             &json!({"opentelemetry": current["opentelemetry"], "retention": {"days": 30}, "advanced": {"batch_size": 512, "extra": 1}}),
         )

@@ -45,10 +45,11 @@ every place on this list that applies to a command that changes a surface: all b
   check on each line, and keeps a line that trips it out of its history.
 - The interactive shell parses each line with the same `Cli`, so a new command needs no
   shell wiring.
-- `secrets`, `users`, `identities`, `api-keys`, and `policies` also run on Agent Stream,
-  through their own enums in [`src/agent_stream/`](../../src/agent_stream/), which a
-  `From` maps onto the Agent Gateway enums. The compiler does not point at them, so a new
-  Agent Gateway command in one of these groups leaves Agent Stream silently without it.
+- `secrets`, `users`, `identities`, `api-keys`, `policies`, `settings`, `audit`,
+  `metrics`, and `logs` also run on Agent Stream, through their own enums in
+  [`src/agent_stream/`](../../src/agent_stream/), which a `From` maps onto the Agent
+  Gateway enums. The compiler does not point at them, so a new Agent Gateway command in
+  one of these groups leaves Agent Stream silently without it.
   When Agent Stream has the route, add the variant to the Agent Stream enum and its
   `From` too, with help that names Agent Stream. Any message the shared code prints at
   run time names the product through `client.product()` (`message_name`,

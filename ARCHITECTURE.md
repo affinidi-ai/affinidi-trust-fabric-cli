@@ -272,9 +272,9 @@ the uncapped and multi-line variants.
 
 After the client is built, `dispatch_with` calls `run_and_print`, which does some
 per-command preparation, then calls the group's handler. `fabric agent-stream secrets`,
-`users`, `identities`, `api-keys`, and `policies` reach the same function through
-`run_shared`, with a `SharedCommand` mapped from their own clap enums, so both products
-print the same tables and confirmation lines:
+`users`, `identities`, `api-keys`, `policies`, `settings`, `audit`, `metrics`, and `logs`
+reach the same function through `run_shared`, with a `SharedCommand` mapped from their
+own clap enums, so both products print the same tables and confirmation lines:
 
 - `resolve_surface_command` swaps a surface name for its ID in every surface command
   that names one, printing `note: using surface <id> (<name>)` to standard error.
@@ -283,6 +283,9 @@ print the same tables and confirmation lines:
 - The handler runs: `run_crud` for resources that fit the shared CRUD shape, or a
   group-specific function such as `run_surfaces`, `run_secrets`, `run_policies`, or
   `run_api`.
+
+Agent Stream has no `metrics status`, because it has no OpenTelemetry export status
+route.
 
 Handlers return in one of three ways:
 
@@ -464,7 +467,7 @@ Every file in [`src/`](src/) and what it owns.
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
 | [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, `remembering_probes`, which keeps a host's answer for the length of an interactive shell, and the names messages give each product (`message_name`, `message_subject`, `connection_noun`, `surface_noun`). |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, and `policies.rs`, which map onto the shared Agent Gateway commands through `run_shared`), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `settings.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared Agent Gateway commands through `run_shared`), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |
