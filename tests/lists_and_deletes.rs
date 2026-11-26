@@ -49,7 +49,8 @@ struct Output {
     /// stays in this list, so a test that expects no requests catches it.
     requests: Vec<String>,
     /// Whether a binary built with the `agent-stream` feature sent
-    /// [`PRODUCT_PROBE`] as its first request; always false without the feature.
+    /// [`PRODUCT_PROBE`] as its first request; always false without the
+    /// feature, and for a command refused before the host is asked.
     probed: bool,
     success: bool,
 }
@@ -1270,7 +1271,7 @@ fn revoking_or_rotating_an_access_token_without_yes_refuses_and_sends_nothing_wh
             out.stdout
         );
         assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
-        assert_eq!(out.probed, cfg!(feature = "agent-stream"), "{verb}");
+        assert!(!out.probed, "{verb}");
     }
 }
 
@@ -1311,7 +1312,7 @@ fn revoking_or_rotating_an_api_key_without_yes_refuses_and_sends_nothing_when_st
         );
         assert!(!out.stdout.contains("sk_new"), "{verb}: {}", out.stdout);
         assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
-        assert_eq!(out.probed, cfg!(feature = "agent-stream"), "{verb}");
+        assert!(!out.probed, "{verb}");
     }
 }
 
@@ -1333,7 +1334,7 @@ fn an_api_key_command_without_yes_or_agent_id_refuses_before_any_lookup() {
             out.stderr
         );
         assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
-        assert_eq!(out.probed, cfg!(feature = "agent-stream"), "{verb}");
+        assert!(!out.probed, "{verb}");
     }
 }
 

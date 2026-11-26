@@ -2148,6 +2148,11 @@ async fn dispatch_with(
                          {name} --host {host}`"
                     )
                 })?;
+            match &command {
+                Command::AccessTokens { command } => command.refuse_without_terminal()?,
+                Command::ApiKeys { command } => command.refuse_without_terminal()?,
+                _ => {}
+            }
             product::check_product(
                 Product::AgentGateway,
                 &host,
@@ -13129,6 +13134,34 @@ async fn describe_target(
     match name {
         Some(name) => format!("'{name}' ({id}) on {host}"),
         None => format!("{id} on {host}"),
+    }
+}
+
+impl AccessTokenCommand {
+    /// Fails, as [`refuse_without_terminal`] does, for a revoke or rotate that
+    /// would ask for a confirmation nobody can give. Called before the host is
+    /// asked which product it is, so a refused command sends nothing at all.
+    pub(crate) fn refuse_without_terminal(&self) -> Result<()> {
+        match self {
+            Self::Revoke(args) => refuse_without_terminal("revoke", &args.id, args.yes),
+            Self::Rotate(args) => refuse_without_terminal("rotate", &args.id, args.yes),
+            Self::List | Self::Get { .. } | Self::Create(_) | Self::Scopes => Ok(()),
+        }
+    }
+}
+
+impl ApiKeyCommand {
+    /// Fails, as [`refuse_without_terminal`] does, for a revoke, rotate, or
+    /// delete that would ask for a confirmation nobody can give. Called before
+    /// the host is asked which product it is, so a refused command sends
+    /// nothing at all.
+    fn refuse_without_terminal(&self) -> Result<()> {
+        match self {
+            Self::Revoke { key_id, yes, .. } => refuse_without_terminal("revoke", key_id, *yes),
+            Self::Rotate { key_id, yes, .. } => refuse_without_terminal("rotate", key_id, *yes),
+            Self::Delete { key_id, yes, .. } => refuse_without_terminal("delete", key_id, *yes),
+            Self::List { .. } | Self::Get { .. } | Self::Create(_) => Ok(()),
+        }
     }
 }
 

@@ -87,9 +87,9 @@ pub async fn login(
             .context("--host is required for login")?,
         globals.flags.allow_http,
     )?;
-    let source = token_source(globals.token.is_some(), &args, io::stdin().is_terminal())?;
+    let source = token_source(globals.token.as_deref(), &args, io::stdin().is_terminal())?;
     product::check_product(Product::AgentStream, &host, globals.token.as_deref(), globals.given()).await?;
-    let token = acquire_token(source, globals.token.as_deref())?;
+    let token = acquire_token(source)?;
     // The host has answered by now, so only the token's prefix is left to check.
     product::check_product(Product::AgentStream, &host, Some(&token), Given::default()).await?;
     let client = GatewayClient::for_agent_stream(&host, &token)?;
@@ -107,15 +107,29 @@ pub async fn login(
     Ok(())
 }
 
-/// Where a login reads its token from.
-#[derive(Debug, PartialEq, Eq)]
+/// Where a login reads its token from. Its `Debug` output never shows the
+/// given token.
+#[derive(PartialEq, Eq)]
 enum TokenSource {
     /// The token given with --token or FABRIC_TOKEN.
-    Given,
+    Given(String),
     /// Standard input.
     Stdin,
     /// The terminal, without echo.
     Prompt,
+}
+
+impl std::fmt::Debug for TokenSource {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match self {
+            Self::Given(_) => f.write_str("Given(<redacted>)"),
+            Self::Stdin => f.write_str("Stdin"),
+            Self::Prompt => f.write_str("Prompt"),
+        }
+    }
 }
 
 /// Where a login with `args` reads its token from: the one given with --token
@@ -128,18 +142,18 @@ enum TokenSource {
 /// lets it through when it is typed before `login` or comes from the shell's
 /// own flags.
 fn token_source(
-    given: bool,
+    given: Option<&str>,
     args: &LoginArgs,
     stdin_is_terminal: bool,
 ) -> Result<TokenSource> {
-    if given {
+    if let Some(token) = given {
         if args.token_stdin {
             bail!("the argument '--token-stdin' cannot be used with '--token <TOKEN>'");
         }
         if args.paste {
             bail!("the argument '--paste' cannot be used with '--token <TOKEN>'");
         }
-        return Ok(TokenSource::Given);
+        return Ok(TokenSource::Given(token.to_owned()));
     }
     Ok(if args.token_stdin {
         TokenSource::Stdin
@@ -150,16 +164,12 @@ fn token_source(
     })
 }
 
-/// The token for a login, read from `source`, with `given` the token given
-/// with --token or FABRIC_TOKEN.
-fn acquire_token(
-    source: TokenSource,
-    given: Option<&str>,
-) -> Result<String> {
-    match (source, given) {
-        (TokenSource::Given, Some(token)) => non_empty_token(token.to_owned(), &super::SHELL_TEXT),
-        (TokenSource::Prompt, _) => prompt_token(&super::SHELL_TEXT),
-        _ => read_stdin_token(&super::SHELL_TEXT),
+/// The token for a login, read from `source`.
+fn acquire_token(source: TokenSource) -> Result<String> {
+    match source {
+        TokenSource::Given(token) => non_empty_token(token, &super::SHELL_TEXT),
+        TokenSource::Stdin => read_stdin_token(&super::SHELL_TEXT),
+        TokenSource::Prompt => prompt_token(&super::SHELL_TEXT),
     }
 }
 
@@ -383,6 +393,9 @@ mod tests {
         assert!(note.starts_with("warning: could not reach http://127.0.0.1:1 to end the session"), "{note}");
     }
 
+    /// A token given with --token or FABRIC_TOKEN.
+    const GIVEN_TOKEN: &str = "aspat_secret";
+
     /// The login arguments with --token-stdin and --paste set as given.
     fn login_args(
         token_stdin: bool,
@@ -394,17 +407,17 @@ mod tests {
     #[test]
     fn a_given_token_comes_first_then_token_stdin_then_paste_then_piped_input_then_the_terminal() {
         for (given, token_stdin, paste, stdin_is_terminal, expected) in [
-            (true, false, false, true, TokenSource::Given),
-            (true, false, false, false, TokenSource::Given),
-            (false, true, false, true, TokenSource::Stdin),
-            (false, false, true, false, TokenSource::Prompt),
-            (false, false, false, false, TokenSource::Stdin),
-            (false, false, false, true, TokenSource::Prompt),
+            (Some(GIVEN_TOKEN), false, false, true, TokenSource::Given(GIVEN_TOKEN.to_owned())),
+            (Some(GIVEN_TOKEN), false, false, false, TokenSource::Given(GIVEN_TOKEN.to_owned())),
+            (None, true, false, true, TokenSource::Stdin),
+            (None, false, true, false, TokenSource::Prompt),
+            (None, false, false, false, TokenSource::Stdin),
+            (None, false, false, true, TokenSource::Prompt),
         ] {
             assert_eq!(
                 token_source(given, &login_args(token_stdin, paste), stdin_is_terminal).unwrap(),
                 expected,
-                "given {given}, --token-stdin {token_stdin}, --paste {paste}, terminal {stdin_is_terminal}"
+                "given {given:?}, --token-stdin {token_stdin}, --paste {paste}, terminal {stdin_is_terminal}"
             );
         }
     }
@@ -413,7 +426,7 @@ mod tests {
     fn a_given_token_with_token_stdin_or_paste_is_refused() {
         for (args, flag) in [(login_args(true, false), "--token-stdin"), (login_args(false, true), "--paste")] {
             for stdin_is_terminal in [true, false] {
-                let error = token_source(true, &args, stdin_is_terminal).expect_err("two token sources");
+                let error = token_source(Some(GIVEN_TOKEN), &args, stdin_is_terminal).expect_err("two token sources");
 
                 assert_eq!(error.to_string(), format!("the argument '{flag}' cannot be used with '--token <TOKEN>'"));
             }
@@ -422,8 +435,8 @@ mod tests {
 
     #[test]
     fn a_given_token_is_trimmed_and_an_empty_one_is_refused() {
-        assert_eq!(acquire_token(TokenSource::Given, Some("  aspat_secret \n")).unwrap(), "aspat_secret");
-        let error = acquire_token(TokenSource::Given, Some("   ")).expect_err("an empty token");
+        assert_eq!(acquire_token(TokenSource::Given("  aspat_secret \n".to_owned())).unwrap(), "aspat_secret");
+        let error = acquire_token(TokenSource::Given("   ".to_owned())).expect_err("an empty token");
         assert_eq!(error.to_string(), "token must not be empty");
     }
 

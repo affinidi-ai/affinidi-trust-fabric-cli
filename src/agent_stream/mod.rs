@@ -21,8 +21,9 @@ use clap::{Args, Subcommand};
 use crate::{
     client::GatewayClient,
     commands::{
-        ApiArgs, CommandTarget, DEFAULT_CONNECTION, HostFlags, Output, ShellGlobals, ShellText, command_target,
-        given_host_and_token, new_hash_name_warnings, print_value, run_api, shell_prefix,
+        AccessTokenCommand, ApiArgs, CommandTarget, DEFAULT_CONNECTION, HostFlags, Output, ShellGlobals, ShellText,
+        command_target, given_host_and_token, new_hash_name_warnings, print_value, run_access_tokens, run_api,
+        shell_prefix,
     },
     config::Config,
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
@@ -361,8 +362,10 @@ async fn run_command(
         AgentStreamCommand::Logout => login::logout(saved, credentials, path, globals.connection.as_deref()).await,
         AgentStreamCommand::Whoami => whoami::whoami(saved, credentials, &globals).await,
         AgentStreamCommand::Tokens { command } => {
+            let command = AccessTokenCommand::from(command);
+            command.refuse_without_terminal()?;
             let client = connect(saved, credentials, &globals).await?;
-            tokens::run(&client, command, globals.output).await
+            run_access_tokens(&client, command, globals.output).await
         }
         AgentStreamCommand::Api(args) => {
             let client = connect(saved, credentials, &globals).await?;

@@ -1,16 +1,9 @@
 //! `fabric agent-stream tokens`: the access tokens of an Agent Stream, run
 //! through the access token commands Agent Gateway uses.
 
-use anyhow::Result;
 use clap::Subcommand;
 
-use crate::{
-    client::GatewayClient,
-    commands::{
-        AccessTokenCommand, AccessTokenCreateArgs, AccessTokenRevokeArgs, AccessTokenRotateArgs, Output,
-        run_access_tokens,
-    },
-};
+use crate::commands::{AccessTokenCommand, AccessTokenCreateArgs, AccessTokenRevokeArgs, AccessTokenRotateArgs};
 
 /// The help of a token ID argument, in place of the Agent Gateway one.
 const ID_HELP: &str = "ID of the access token (see `fabric agent-stream tokens list`)";
@@ -100,15 +93,6 @@ const ROTATE_EXAMPLES: &str = r#"Examples:
 
   Rotate from a script and capture the new secret:
     ASPAT=$(fabric agent-stream tokens rotate <token-id> --yes)"#;
-
-/// Runs one `tokens` command on the Agent Stream behind `client`.
-pub async fn run(
-    client: &GatewayClient,
-    command: TokenCommand,
-    output: Output,
-) -> Result<()> {
-    run_access_tokens(client, command.into(), output).await
-}
 
 impl From<TokenCommand> for AccessTokenCommand {
     fn from(command: TokenCommand) -> Self {

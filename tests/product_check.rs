@@ -131,6 +131,32 @@ mod with_the_agent_stream_feature {
     }
 
     #[test]
+    fn revoking_or_rotating_a_token_with_a_typed_host_and_no_terminal_sends_nothing() {
+        for product in ["agent-stream", "agent-gateway"] {
+            for verb in ["revoke", "rotate"] {
+                let (host, requests) = host_listing_nothing(AGENT_STREAM_PERMISSIONS);
+
+                let output = fabric_in_fresh_home(
+                    &[product, "--host", &host, "tokens", verb, "t-1"],
+                    &[],
+                    &[("FABRIC_TOKEN", SESSION_TOKEN)],
+                    "",
+                );
+
+                let text = stderr(&output);
+                assert_eq!(output.status.code(), Some(1), "{product} {verb}: {text}");
+                assert!(
+                    text.contains(&format!(
+                        "refusing to {verb} 't-1' without confirmation in a non-interactive session"
+                    )),
+                    "{product} {verb}: {text}"
+                );
+                assert!(request_lines(&requests).is_empty(), "{product} {verb}");
+            }
+        }
+    }
+
+    #[test]
     fn the_interactive_shell_asks_a_given_host_which_product_it_is_once() {
         let (host, requests) = host_listing_nothing(GATEWAY_PERMISSIONS);
 
