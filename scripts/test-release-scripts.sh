@@ -707,6 +707,7 @@ set_checks_runs() {
   jq --slurp '{total_count: length, workflow_runs: .}' <<< "$(printf '%s\n' "$@")" > "${checks_runs}"
 }
 run_checks_passed() {
+  # shellcheck disable=SC2031 # this is the script's own PATH; run_sign_macos only changes it in its subshell.
   env "PATH=${testdata}/checks-bin:${PATH}" GH_TOKEN=test-token GITHUB_REPOSITORY=example/repo \
     "FAKE_GH_SHA=${checks_sha}" "FAKE_GH_RUNS=${checks_runs}" "$@" \
     > "${work_dir}/checks-passed.log" 2>&1
