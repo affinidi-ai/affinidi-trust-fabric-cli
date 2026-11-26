@@ -79,7 +79,8 @@ flowchart TB
     L --> W["dispatch_with"]
     W --> H["Resolve connection, host, token"]
     H --> G["GatewayClient"]
-    G --> X["Group handler: run_surfaces, run_crud, ..."]
+    G --> RP["run_and_print"]
+    RP --> X["Group handler: run_surfaces, run_crud, ..."]
     X --> P
 ```
 
@@ -269,8 +270,11 @@ the uncapped and multi-line variants.
 
 ### Dispatch to handlers
 
-After the client is built, `dispatch_with` does some per-command preparation, then calls
-the group's handler:
+After the client is built, `dispatch_with` calls `run_and_print`, which does some
+per-command preparation, then calls the group's handler. `fabric agent-stream secrets`,
+`users`, `identities`, `api-keys`, and `policies` reach the same function through
+`run_shared`, with a `SharedCommand` mapped from their own clap enums, so both products
+print the same tables and confirmation lines:
 
 - `resolve_surface_command` swaps a surface name for its ID in every surface command
   that names one, printing `note: using surface <id> (<name>)` to standard error.
@@ -286,7 +290,7 @@ Handlers return in one of three ways:
 | --- | --- | --- |
 | `Result<Value>` | The shared printer prints it | `run_crud`, `run_policies`, `run_users` |
 | `Result<Option<Value>>` | `None` means the handler already printed its outcome | `run_surfaces`, `run_secrets`, `run_certificates` |
-| `return` from `dispatch_with` | The handler prints everything itself | `run_audit`, `run_payments`, `run_metrics`, `run_logs`, `run_api_keys`, `run_access_tokens` |
+| `return` from `run_and_print` | The handler prints everything itself | `run_audit`, `run_payments`, `run_metrics`, `run_logs`, `run_api_keys`, `run_access_tokens` |
 
 `run` wraps every Agent Gateway error with `add_terms_hint`, because the gateway's Terms
 of Use gate can refuse any route. Agent Stream errors skip it, because `product_error`
@@ -303,16 +307,20 @@ fixed prefix.
 | `warning:` | Something the user should act on, but the command continues |
 | `error:` | The command failed. Printed by `main` (or by the shell for one line) as `error: {error:#}`, so the whole `anyhow` context chain shows. |
 
-In `dispatch_with`, a value is printed by one of three paths:
+In `run_and_print`, a value is printed by one of three paths:
 
 - A delete or update with a confirmation prints one line from `confirmation_line`, such
-  as `Deleted issuer 'i-1'`, through `print_outcome`.
+  as `Deleted issuer 'i-1'`, through `print_outcome`. `users delete` takes its line from
+  `user_delete_line`: `Disabled user '<id>'` when Agent Stream answers `{"outcome":
+  "disabled"}`, because it kept the record of a user who signs in through an identity
+  provider, with a `note:` on standard error saying so, and `Deleted user '<id>'`
+  otherwise.
 - A list with a layout prints through `print_list`, which renders a `tables::Layout`
   with `tables::render_scoped`.
 - Anything else goes through `print_created_or_value`: `print_issued` for a create, else
   `print_value`.
 
-With `--output json`, these print the gateway's document. The shared printer,
+With `--output json`, these print the appliance's document. The shared printer,
 `print_value`, uses `pretty_json_for_terminal`, which escapes characters a terminal
 could act on while keeping the JSON valid. A create or rotate whose answer carries a
 secret shown once prints that secret alone on standard output, so `$(...)` captures just
@@ -455,8 +463,8 @@ Every file in [`src/`](src/) and what it owns.
 | [`client.rs`](src/client.rs) | `GatewayClient`, the shared HTTP client, path checks, `gateway_error`, redaction, and the terminal sanitisers. |
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
-| [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, and `remembering_probes`, which keeps a host's answer for the length of an interactive shell. |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, and `tokens.rs`, which maps onto the shared access token commands), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, `remembering_probes`, which keeps a host's answer for the length of an interactive shell, and the names messages give each product (`message_name`, `message_subject`, `connection_noun`, `surface_noun`). |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, and `policies.rs`, which map onto the shared Agent Gateway commands through `run_shared`), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |

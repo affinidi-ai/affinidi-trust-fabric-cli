@@ -6,12 +6,17 @@
 //! their own file (`agent-stream.toml`) and under their own keyring service,
 //! so each product can have a connection named `default`.
 
+mod api_keys;
 mod config;
+mod identities;
 mod login;
+mod policies;
+mod secrets;
 mod surfaces;
 #[cfg(test)]
 mod test_support;
 mod tokens;
+mod users;
 mod whoami;
 
 use std::path::Path;
@@ -160,6 +165,47 @@ enum AgentStreamCommand {
     Tokens {
         #[command(subcommand)]
         command: tokens::TokenCommand,
+    },
+    /// Manage secrets.
+    ///
+    /// Other configuration refers to a secret as $SECRET:<secret-id>. Secret
+    /// values are masked in what the commands print unless --reveal is given.
+    Secrets {
+        #[command(subcommand)]
+        command: secrets::SecretCommand,
+        /// Print secret values instead of masking them. Applies to get,
+        /// create, and update; list answers never carry values and delete
+        /// prints none.
+        #[arg(long, global = true)]
+        reveal: bool,
+    },
+    /// Manage Agent Stream users.
+    ///
+    /// Agent Stream has no route to create a user, so there is no create
+    /// command.
+    Users {
+        #[command(subcommand)]
+        command: users::UserCommand,
+    },
+    /// Manage did:webvh identities.
+    ///
+    /// A connection point's identity is read-only here: Agent Stream answers
+    /// 409 to update, rotate-keys, transfer, deactivate, and trust-policy set
+    /// on it, because its connection point manages it.
+    Identities {
+        #[command(subcommand)]
+        command: identities::IdentityCommand,
+    },
+    /// Manage the API keys a Surface authenticates callers with.
+    #[command(name = "api-keys")]
+    ApiKeys {
+        #[command(subcommand)]
+        command: api_keys::ApiKeyCommand,
+    },
+    /// Manage the Rego policy definitions Agent Stream enforces.
+    Policies {
+        #[command(subcommand)]
+        command: policies::PolicyCommand,
     },
     /// Call any Agent Stream management API endpoint.
     ///
@@ -378,6 +424,26 @@ async fn run_command(
             command.refuse_without_terminal()?;
             let client = connect(saved, credentials, &globals).await?;
             run_access_tokens(&client, command, globals.output).await
+        }
+        AgentStreamCommand::Secrets { command, reveal } => {
+            let client = connect(saved, credentials, &globals).await?;
+            secrets::run(&client, command, reveal, globals.output).await
+        }
+        AgentStreamCommand::Users { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            users::run(&client, command, globals.output).await
+        }
+        AgentStreamCommand::Identities { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            identities::run(&client, command, globals.output).await
+        }
+        AgentStreamCommand::ApiKeys { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            api_keys::run(&client, command, globals.output).await
+        }
+        AgentStreamCommand::Policies { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            policies::run(&client, command, globals.output).await
         }
         AgentStreamCommand::Api(args) => {
             let client = connect(saved, credentials, &globals).await?;
@@ -1268,6 +1334,104 @@ mod tests {
         for subcommand in ["revoke", "rotate"] {
             assert_eq!(help_of(subcommand, "id"), "ID of the access token (see `fabric agent-stream tokens list`)");
         }
+    }
+
+    /// Every help text of `command` and its subcommands: about, long about,
+    /// examples, each argument's help, and the help of each value an argument
+    /// accepts.
+    fn help_texts(command: &clap::Command) -> Vec<String> {
+        let mut texts: Vec<String> = [command.get_about(), command.get_long_about(), command.get_after_long_help()]
+            .into_iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect();
+        texts.extend(
+            command
+                .get_arguments()
+                .flat_map(|argument| [argument.get_help(), argument.get_long_help()])
+                .flatten()
+                .map(ToString::to_string),
+        );
+        texts.extend(
+            command
+                .get_arguments()
+                .flat_map(clap::Arg::get_possible_values)
+                .filter_map(|value| {
+                    value
+                        .get_help()
+                        .map(ToString::to_string)
+                }),
+        );
+        for subcommand in command.get_subcommands() {
+            texts.extend(help_texts(subcommand));
+        }
+        texts
+    }
+
+    #[test]
+    fn the_shared_groups_help_never_names_agent_gateway() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let stream = command
+            .find_subcommand("agent-stream")
+            .expect("the feature build has agent-stream");
+
+        for group in ["secrets", "users", "identities", "api-keys", "policies"] {
+            let texts = help_texts(
+                stream
+                    .find_subcommand(group)
+                    .unwrap_or_else(|| panic!("{group}")),
+            );
+            for text in texts {
+                // A field name in backticks, such as `gateways` in the
+                // `policies impact` answer, is what Agent Stream sends.
+                let prose: String = text
+                    .split('`')
+                    .step_by(2)
+                    .collect();
+                let lower = prose.to_ascii_lowercase();
+                assert!(!lower.contains("gateway"), "{group}: {text}");
+                assert!(!lower.contains("agent surface"), "{group}: {text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shared_groups_reach_their_routes_with_the_saved_token() {
+        let (host, requests) = scripted_agent_stream(vec![
+            ("GET /api/v1/secrets", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/users", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/identities", "HTTP/1.1 200 OK", r#"{"identities":[],"count":0}"#),
+            ("GET /api/v1/api-keys", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/policy-definitions", "HTTP/1.1 200 OK", "[]"),
+        ])
+        .await;
+
+        for group in ["secrets", "users", "identities", "api-keys", "policies"] {
+            let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+            run_stream(&[group, "list"], saved, &credentials)
+                .await
+                .unwrap_or_else(|error| panic!("{group}: {error:#}"));
+        }
+
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/secrets HTTP/1.1",
+                "GET /api/v1/users HTTP/1.1",
+                "GET /api/v1/identities HTTP/1.1",
+                "GET /api/v1/api-keys HTTP/1.1",
+                "GET /api/v1/policy-definitions HTTP/1.1",
+            ]
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| sends_bearer(request, ACCESS_TOKEN))
+        );
     }
 
     #[tokio::test]

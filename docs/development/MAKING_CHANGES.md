@@ -45,6 +45,15 @@ every place on this list that applies to a command that changes a surface: all b
   check on each line, and keeps a line that trips it out of its history.
 - The interactive shell parses each line with the same `Cli`, so a new command needs no
   shell wiring.
+- `secrets`, `users`, `identities`, `api-keys`, and `policies` also run on Agent Stream,
+  through their own enums in [`src/agent_stream/`](../../src/agent_stream/), which a
+  `From` maps onto the Agent Gateway enums. The compiler does not point at them, so a new
+  Agent Gateway command in one of these groups leaves Agent Stream silently without it.
+  When Agent Stream has the route, add the variant to the Agent Stream enum and its
+  `From` too, with help that names Agent Stream. Any message the shared code prints at
+  run time names the product through `client.product()` (`message_name`,
+  `message_subject`, `command`, `surface_noun`), never a literal `gateway` or `fabric
+  agent-gateway`.
 
 ## Add a new command group
 
@@ -56,19 +65,19 @@ group with one command beyond CRUD.
 | 1 | `Command` | Add the variant, with `#[command(name = "…")]` when the name has a hyphen, and `command: <Group>Command` as a subcommand field. Its doc comment is the group's one-line summary in `fabric agent-gateway --help`. |
 | 2 | A new `<Group>Command` enum | Define the group's commands. Reuse `CrudCommand` where it fits; see [the next recipe](#add-a-resource-that-fits-the-shared-crud-commands). |
 | 3 | A new `run_<group>` function | Handle each command. Take `&GatewayClient`, plus `Output` if it prints itself. |
-| 4 | The inner `match command` in `dispatch_with` | Add the arm that calls `run_<group>`. The compiler finds this. |
+| 4 | The `match command` in `run_and_print` | Add the arm that calls `run_<group>`. The compiler finds this. |
 | 5 | `list_layout`, `create_kind`, `delete_confirmation`, `update_confirmation` | As in the previous recipe. Not found by the compiler. |
 | 6 | Tests and user documentation | As in the previous recipe. |
 
 **Watch for:**
 
 - A group that needs no gateway, no token, and no saved connection belongs before the
-  connection is resolved: either in the outer `match` of `dispatch_with`, as `config` is,
+  connection is resolved: either in the `match` of `dispatch_with`, as `config` is,
   or in `run_offline`, as `surfaces tool-gate-preview --gates-file` is. A variant handled
-  in the outer `match` also goes in the `unreachable!()` arm at the end of the inner
-  `match command`, which the compiler points at.
+  in `dispatch_with` also goes in the `unreachable!()` arm at the end of the `match
+  command` in `run_and_print`, which the compiler points at.
 - A group whose output is not one value, such as a file written to disk or several
-  tables, returns from `dispatch_with` directly, as `Audit`, `Payments`, `Metrics`, and
+  tables, returns from `run_and_print` directly, as `Audit`, `Payments`, `Metrics`, and
   `Logs` do.
 - Every error passes through `add_terms_hint` in `run`. Do not add it again.
 
@@ -85,7 +94,7 @@ and `delete <id>`. `run_crud` maps them onto `GET`, `GET {id}`, `POST`, `PUT {id
 | Order | Place | Change |
 | --- | --- | --- |
 | 1 | `Command` | Add the variant with `command: CrudCommand`. |
-| 2 | The inner `match command` in `dispatch_with` | Add `Command::<Name> { command } => run_crud(&client, "/v1/<path>", command).await?`. |
+| 2 | The `match command` in `run_and_print` | Add `Command::<Name> { command } => run_crud(client, "/v1/<path>", command).await?`. |
 | 3 | [`src/tables.rs`](../../src/tables.rs) and `list_layout` | Add a layout for `list`. Without one, the list prints with the `GENERIC` layout. |
 | 4 | `create_kind`, `delete_confirmation`, `update_confirmation` | Name the kind the way the other lines do, such as `"trust registry"`. |
 | 5 | Unit tests in `commands.rs` | Add the resource to `each_list_command_prints_the_header_of_its_own_resource`, `every_create_kind_has_its_exact_name`, `every_delete_on_the_shared_commands_confirms_with_its_kind_and_id`, and `every_shared_update_names_its_kind_and_the_id_the_user_passed`. |
