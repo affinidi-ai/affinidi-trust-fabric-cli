@@ -3488,6 +3488,7 @@ async fn run_settings(
     client: &GatewayClient,
     command: SettingsCommand,
 ) -> Result<Value> {
+    command.refuse_unforced_reset(client.product())?;
     match command {
         SettingsCommand::Show => {
             client
@@ -3508,10 +3509,7 @@ async fn run_settings(
                 .await?;
             read_back_settings(client, "saved").await
         }
-        SettingsCommand::Reset { force } => {
-            if !force {
-                reject_settings_reset(client.product())?;
-            }
+        SettingsCommand::Reset { .. } => {
             client
                 .request(Method::DELETE, "/v1/settings", None)
                 .await?;
@@ -3532,6 +3530,22 @@ async fn read_back_settings(
         .request(Method::GET, "/v1/settings", None)
         .await
         .with_context(|| format!("the appliance settings were {done}, but reading them back failed"))
+}
+
+impl SettingsCommand {
+    /// Fails, as [`reject_settings_reset`] does, for a `reset` on `product`
+    /// without --force. `run_settings` checks it on both products, and an
+    /// Agent Stream command also checks it before the host is asked which
+    /// product it is, so a refused reset sends nothing at all there.
+    pub(crate) fn refuse_unforced_reset(
+        &self,
+        product: Product,
+    ) -> Result<()> {
+        match self {
+            Self::Reset { force: false } => reject_settings_reset(product),
+            Self::Show | Self::Set(_) | Self::Reset { force: true } => Ok(()),
+        }
+    }
 }
 
 /// Refuses an unforced `settings reset` on `product`. The route writes the
@@ -9049,10 +9063,10 @@ async fn run_secrets(
 }
 
 /// What `secrets get --reveal` adds on standard error when Agent Stream
-/// answers without the value, which it does while its `secrets.reveal_values`
-/// setting is off.
+/// answers without the value, which it does while `secrets.reveal_values` is
+/// off in its agent-stream.json configuration file.
 const SECRET_VALUE_WITHHELD_NOTE: &str =
-    "note: Agent Stream sent no value, because its secrets.reveal_values setting is off";
+    "note: Agent Stream sent no value, because secrets.reveal_values is off in its agent-stream.json";
 
 /// Grants are minted only by a user completing the provider's OAuth flow in a
 /// browser, so this resource has no create and no update: the gateway offers
@@ -12117,7 +12131,8 @@ fn api_key_prompt(
 /// `--agent-id` skips the lookup, which a caller whose token carries
 /// `api_keys.edit` or `api_keys.delete` without `api_keys.view` needs: the
 /// key's own route is open to them, the collection is not. Messages name the
-/// surface with [`Product::surface_noun`].
+/// surface with [`Product::surface_noun`] and show the key id the user typed
+/// cleaned with [`sanitize_whole`], so it cannot drive the terminal.
 async fn resolve_api_key_surface(
     client: &GatewayClient,
     key_id: &str,
@@ -12128,21 +12143,22 @@ async fn resolve_api_key_surface(
     }
     let product = client.product();
     let surface = product.surface_noun();
+    let shown = sanitize_whole(key_id);
     let keys = client
         .request(Method::GET, "/v1/api-keys", None)
         .await
         .with_context(|| {
             format!(
-                "look up which {surface} API key '{key_id}' belongs to; pass --agent-id <surface-id> to skip the \
+                "look up which {surface} API key '{shown}' belongs to; pass --agent-id <surface-id> to skip the \
                  lookup"
             )
         })?;
     let surfaces = surfaces_carrying_key(product, &keys, key_id)?;
     match surfaces.as_slice() {
         [agent_id] => Ok((*agent_id).to_owned()),
-        [] => bail!("API key '{key_id}' not found on any {surface} this token can see"),
+        [] => bail!("API key '{shown}' not found on any {surface} this token can see"),
         _ => bail!(
-            "API key '{key_id}' is on more than one {surface} ({}); pass --agent-id <surface-id> to choose one",
+            "API key '{shown}' is on more than one {surface} ({}); pass --agent-id <surface-id> to choose one",
             surfaces
                 .iter()
                 .map(|agent_id| sanitize_for_terminal(agent_id))
@@ -13740,7 +13756,7 @@ impl ApiKeyCommand {
     /// delete that would ask for a confirmation nobody can give. Called before
     /// the host is asked which product it is, so a refused command sends
     /// nothing at all.
-    fn refuse_without_terminal(&self) -> Result<()> {
+    pub(crate) fn refuse_without_terminal(&self) -> Result<()> {
         match self {
             Self::Revoke { key_id, yes, .. } => refuse_without_terminal("revoke", key_id, *yes),
             Self::Rotate { key_id, yes, .. } => refuse_without_terminal("rotate", key_id, *yes),

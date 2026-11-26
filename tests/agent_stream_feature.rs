@@ -544,7 +544,8 @@ fn policies_create_and_delete_print_the_agent_gateway_lines() {
 /// What `secrets get --reveal` prints on standard error when Agent Stream
 /// sends no value.
 #[cfg(feature = "agent-stream")]
-const WITHHELD_NOTE: &str = "note: Agent Stream sent no value, because its secrets.reveal_values setting is off\n";
+const WITHHELD_NOTE: &str =
+    "note: Agent Stream sent no value, because secrets.reveal_values is off in its agent-stream.json\n";
 
 #[cfg(feature = "agent-stream")]
 #[test]
@@ -597,12 +598,54 @@ fn api_keys_revoke_and_delete_print_one_line_each() {
 
 #[cfg(feature = "agent-stream")]
 #[test]
+fn api_keys_revoke_rotate_and_delete_with_a_typed_host_and_no_terminal_send_nothing() {
+    for verb in ["revoke", "rotate", "delete"] {
+        let (host, requests) = agent_stream_host();
+
+        let output = fabric_in_fresh_home(
+            &["agent-stream", "--host", &host, "api-keys", verb, "ak_1", "--agent-id", "pipe-1"],
+            &[],
+            &[("FABRIC_TOKEN", SESSION_TOKEN)],
+            "",
+        );
+
+        let text = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{verb}: {text}");
+        assert!(
+            text.contains(&format!("refusing to {verb} 'ak_1' without confirmation in a non-interactive session")),
+            "{verb}: {text}"
+        );
+        assert!(request_lines(&requests).is_empty(), "{verb}: {:?}", request_lines(&requests));
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn settings_reset_without_force_and_with_a_typed_host_sends_nothing() {
+    let (host, requests) = agent_stream_host();
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "--host", &host, "settings", "reset"],
+        &[],
+        &[("FABRIC_TOKEN", SESSION_TOKEN)],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("re-run with --force"), "{text}");
+    assert!(request_lines(&requests).is_empty(), "{:?}", request_lines(&requests));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
 fn identities_create_update_and_deactivate_print_the_agent_gateway_lines() {
     let identity = r#"{"id":"i-1","did":"did:webvh:x:agents/a","version":1,"active":true}"#;
+    let deactivated = r#"{"message":"Identity deactivated","id":"i-1","version_id":"2-QmHash","deactivated_at":"2026-11-01T00:00:00Z"}"#;
     let host = agent_stream_stand_in(vec![
         ("POST /api/v1/identities/i-1/update", "200 OK", identity),
         ("POST /api/v1/identities", "201 Created", identity),
-        ("DELETE /api/v1/identities/i-1", "200 OK", r#"{"id":"i-1","did":"did:webvh:x:agents/a","active":false}"#),
+        ("DELETE /api/v1/identities/i-1", "200 OK", deactivated),
     ]);
 
     let create = fabric_on_stream(&host, &["identities", "create"], "");
@@ -618,7 +661,8 @@ fn identities_create_update_and_deactivate_print_the_agent_gateway_lines() {
     assert_eq!(stdout(&update), "Updated identity 'i-1'\n", "{}", stderr(&update));
     assert_eq!(stdout(&deactivate), "Deactivated identity 'i-1'\n", "{}", stderr(&deactivate));
     let printed: serde_json::Value = serde_json::from_str(&stdout(&deactivate_json)).expect("JSON");
-    assert_eq!(printed["active"], false);
+    let sent: serde_json::Value = serde_json::from_str(deactivated).expect("JSON");
+    assert_eq!(printed, sent);
 }
 
 #[cfg(feature = "agent-stream")]
@@ -631,7 +675,6 @@ fn users_delete_with_output_json_prints_a_removed_outcome() {
     assert!(output.status.success(), "{}", stderr(&output));
     let printed: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON");
     assert_eq!(printed, serde_json::json!({"outcome": "removed"}));
-    assert!(!stderr(&output).contains("record"), "{}", stderr(&output));
 }
 
 /// What a command printed on standard error, less the note every

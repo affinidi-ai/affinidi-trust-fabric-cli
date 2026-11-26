@@ -70,13 +70,15 @@ const RESET_EXAMPLES: &str = r#"Examples:
     fabric agent-stream settings show --output json > settings-backup.json
     fabric agent-stream settings reset --force"#;
 
-/// Runs one `settings` command on the Agent Stream behind `client`.
+/// Runs one `settings` command, already turned into the shared form so the
+/// caller could refuse an unforced reset first, on the Agent Stream behind
+/// `client`.
 pub async fn run(
     client: &GatewayClient,
-    command: SettingsCommand,
+    command: commands::SettingsCommand,
     output: Output,
 ) -> Result<()> {
-    run_shared(client, SharedCommand::Settings(command.into()), output).await
+    run_shared(client, SharedCommand::Settings(command), output).await
 }
 
 impl From<SettingsCommand> for commands::SettingsCommand {
@@ -125,7 +127,7 @@ mod tests {
             SettingsCommand::Set(JsonFileArgs { file: set.path().to_path_buf() }),
             SettingsCommand::Reset { force: true },
         ] {
-            run(&client, command, Output::Json)
+            run(&client, command.into(), Output::Json)
                 .await
                 .expect("the command succeeds");
         }
@@ -151,7 +153,7 @@ mod tests {
         .await;
         let set = document(r#"{"feature_flags":{"terms":true}}"#);
 
-        run(&client(host), SettingsCommand::Set(JsonFileArgs { file: set.path().to_path_buf() }), Output::Json)
+        run(&client(host), SettingsCommand::Set(JsonFileArgs { file: set.path().to_path_buf() }).into(), Output::Json)
             .await
             .expect("the flag is written");
 
@@ -162,7 +164,7 @@ mod tests {
     async fn an_unforced_reset_names_what_agent_stream_clears_and_sends_nothing() {
         let (host, requests) = scripted_agent_stream(Vec::new()).await;
 
-        let error = run(&client(host), SettingsCommand::Reset { force: false }, Output::Json)
+        let error = run(&client(host), SettingsCommand::Reset { force: false }.into(), Output::Json)
             .await
             .expect_err("an unforced reset");
 

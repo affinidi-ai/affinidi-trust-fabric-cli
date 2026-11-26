@@ -22,9 +22,9 @@ pub enum SecretCommand {
     /// Get a secret by its id, secret_id or name.
     ///
     /// The value is masked unless --reveal is given. Agent Stream sends the
-    /// value only while its `secrets.reveal_values` setting is on, which it
-    /// is by default. While it is off, --reveal prints the record without a
-    /// value and says why on standard error.
+    /// value only while `secrets.reveal_values` is on in its agent-stream.json
+    /// configuration file, which it is by default. While it is off, --reveal
+    /// prints the record without a value and says why on standard error.
     Get {
         /// The secret's id, secret_id or name. A secret_id or name matching more
         /// than one secret is refused; pass the id instead.

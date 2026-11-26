@@ -31,9 +31,9 @@ use clap::{Args, Subcommand};
 use crate::{
     client::GatewayClient,
     commands::{
-        AccessTokenCommand, ApiArgs, CommandTarget, DEFAULT_CONNECTION, HostFlags, Output, ShellGlobals, ShellText,
-        command_target, given_host_and_token, new_hash_name_warnings, print_value, run_access_tokens, run_api,
-        shell_prefix,
+        AccessTokenCommand, ApiArgs, ApiKeyCommand as SharedApiKeyCommand, CommandTarget, DEFAULT_CONNECTION,
+        HostFlags, Output, SettingsCommand as SharedSettingsCommand, ShellGlobals, ShellText, command_target,
+        given_host_and_token, new_hash_name_warnings, print_value, run_access_tokens, run_api, shell_prefix,
     },
     config::Config,
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
@@ -463,6 +463,8 @@ async fn run_command(
             identities::run(&client, command, globals.output).await
         }
         AgentStreamCommand::ApiKeys { command } => {
+            let command = SharedApiKeyCommand::from(command);
+            command.refuse_without_terminal()?;
             let client = connect(saved, credentials, &globals).await?;
             api_keys::run(&client, command, globals.output).await
         }
@@ -471,6 +473,8 @@ async fn run_command(
             policies::run(&client, command, globals.output).await
         }
         AgentStreamCommand::Settings { command } => {
+            let command = SharedSettingsCommand::from(command);
+            command.refuse_unforced_reset(Product::AgentStream)?;
             let client = connect(saved, credentials, &globals).await?;
             settings::run(&client, command, globals.output).await
         }
@@ -1237,7 +1241,7 @@ mod tests {
         let gateway_line = cli
             .interactive_prefix()
             .into_iter()
-            .chain(["policies".to_owned(), "list".to_owned()]);
+            .chain(["issuers".to_owned(), "list".to_owned()]);
         assert!(Cli::try_parse_from(gateway_line).is_err(), "an Agent Gateway command is not an Agent Stream one");
     }
 
@@ -1427,7 +1431,8 @@ mod tests {
             );
             for text in texts {
                 // A field name in backticks, such as `gateways` in the
-                // `policies impact` answer, is what Agent Stream sends.
+                // `policies impact` answer, is what Agent Stream sends, but a
+                // command in backticks still never names the other product.
                 let prose: String = text
                     .split('`')
                     .step_by(2)
@@ -1435,6 +1440,12 @@ mod tests {
                 let lower = prose.to_ascii_lowercase();
                 assert!(!lower.contains("gateway"), "{group}: {text}");
                 assert!(!lower.contains("agent surface"), "{group}: {text}");
+                assert!(
+                    !text
+                        .to_ascii_lowercase()
+                        .contains("agent-gateway"),
+                    "{group}: {text}"
+                );
             }
         }
     }

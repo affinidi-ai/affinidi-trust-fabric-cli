@@ -128,7 +128,7 @@ pub enum TrustPolicyCommand {
     Set {
         id: String,
         /// JSON document `{"config": {...}}`. A bare policy, without the
-        /// `config` wrapper, is rejected before anything is sent.
+        /// `config` wrapper, is refused and never sent.
         #[arg(short, long)]
         file: PathBuf,
     },
@@ -387,7 +387,9 @@ mod tests {
     #[test]
     fn get_has_no_reveal_flag_since_agent_stream_never_sends_the_private_key() {
         Cli::try_parse_from(["fabric", "agent-stream", "identities", "get", "i-1"]).expect("get parses");
-        Cli::try_parse_from(["fabric", "agent-stream", "identities", "get", "i-1", "--reveal"])
+        let error = Cli::try_parse_from(["fabric", "agent-stream", "identities", "get", "i-1", "--reveal"])
             .expect_err("--reveal would show nothing more");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument, "{error}");
     }
 }
