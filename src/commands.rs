@@ -12143,7 +12143,11 @@ async fn resolve_api_key_surface(
         [] => bail!("API key '{key_id}' not found on any {surface} this token can see"),
         _ => bail!(
             "API key '{key_id}' is on more than one {surface} ({}); pass --agent-id <surface-id> to choose one",
-            surfaces.join(", ")
+            surfaces
+                .iter()
+                .map(|agent_id| sanitize_for_terminal(agent_id))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -12882,6 +12886,24 @@ mod identity_access_tests {
             "look up which Agent Surface API key 'atgk_1' belongs to; pass --agent-id <surface-id> to skip the lookup"
         );
         assert_eq!(not_a_list.to_string(), "gateway answered the API key collection with something other than a list");
+    }
+
+    /// Surface ids in the collision error come from the server, so a control
+    /// character in one must not reach the terminal.
+    #[tokio::test]
+    async fn the_api_key_collision_error_cleans_the_surface_ids_the_server_sent() {
+        const COLLISION: &str =
+            r#"[{"key_id":"atgk_1","agent_id":"surface-1\u001b[2J"},{"key_id":"atgk_1","agent_id":"surface-2"}]"#;
+        let (host, _requests) = gateway_serving(vec![COLLISION]).await;
+
+        let error =
+            run_api_keys(&GatewayClient::new(host, "token").expect("client"), by_key_id("atgk_1"), Output::Json)
+                .await
+                .expect_err("two surfaces carry the key")
+                .to_string();
+
+        assert!(!error.contains('\u{1b}'), "{error:?}");
+        assert!(error.contains("(surface-1[2J, surface-2)"), "{error:?}");
     }
 
     #[test]

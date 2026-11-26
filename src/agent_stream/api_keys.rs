@@ -53,7 +53,9 @@ pub enum ApiKeyCommand {
         key_id: String,
         #[command(flatten)]
         surface: SurfaceArgs,
-        /// Name Agent Stream logs as having revoked the key.
+        /// Free-text name Agent Stream stores as who revoked the key. Agent
+        /// Stream keeps it as given and does not check it against the
+        /// signed-in user.
         #[arg(long, default_value = "api")]
         actor: String,
         /// Skip the confirmation prompt. Required when running non-interactively.
@@ -75,8 +77,9 @@ pub enum ApiKeyCommand {
         key_id: String,
         #[command(flatten)]
         surface: SurfaceArgs,
-        /// Name Agent Stream logs for the rotation and stores as the new key's
-        /// `issuer.actor`.
+        /// Free-text name Agent Stream stores as who rotated the key, and as
+        /// the new key's `issuer.actor`. Agent Stream keeps it as given and
+        /// does not check it against the signed-in user.
         #[arg(long, default_value = "api")]
         actor: String,
         /// Skip the confirmation prompt. Required when running non-interactively.
