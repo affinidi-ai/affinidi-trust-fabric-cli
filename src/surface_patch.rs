@@ -1,5 +1,6 @@
 //! Turns the `--set`, `--unset`, `--add` and `--remove` flags of `surfaces
-//! update` into a JSON Merge Patch document
+//! update`, and the `--set` flags of Agent Stream's `surfaces create`, into a
+//! JSON Merge Patch document
 //! (https://www.rfc-editor.org/rfc/rfc7396). Agent Gateway's
 //! `PATCH /v1/surfaces/{id}` applies the patch on the gateway. Agent Stream
 //! has no PATCH, so `fabric agent-stream surfaces` merges the patch into the

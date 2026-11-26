@@ -413,7 +413,9 @@ with, so it checks top-level names only. Flag paths with brackets or list positi
 which only Agent Gateway paths use, and flags on `id`, `created_at`, `updated_at`,
 `tenant_id`, or `owner_user_id` are refused before anything is read or sent, and so is any
 `update` flag on `status` other than `--set status=<value>`. Both commands refuse a
-surface without a text `pipe_type.type`.
+`status` other than `enabled` or `disabled`, and a `pipe_type.type` other than `llm`,
+`webhook`, or `ide_catalog` (on `update`, the stored surface's own type is accepted too,
+for a type a newer Agent Stream added).
 
 `update` reads the surface, builds the whole new surface on this machine, reads the
 surface again, and sends it with `PUT` only when `updated_at` has not moved. A surface

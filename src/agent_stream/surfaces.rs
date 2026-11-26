@@ -33,6 +33,13 @@ const MAX_ID_LEN: usize = 128;
 /// history.
 const STATUS_DELETED: &str = "deleted";
 
+/// How to give a `pipe_type` on `create`.
+const CREATE_PIPE_TYPE_HINT: &str =
+    "with flags, add --set pipe_type.type=webhook --set pipe_type.endpoint=<url>, or give it in --file";
+
+/// How to keep a `pipe_type` on `update`.
+const UPDATE_PIPE_TYPE_HINT: &str = "keep the `pipe_type` from `surfaces get`, or --set pipe_type.type to one of these";
+
 /// The end of the table-mode dry run of `update`, after a blank line.
 const DRY_RUN_UPDATE_NOTE: &str = "\nDry run: nothing was saved. Agent Stream's own checks, such as a route another \
                                    surface uses or the drift block, only run on a real save.";
@@ -41,6 +48,11 @@ const DRY_RUN_UPDATE_NOTE: &str = "\nDry run: nothing was saved. Agent Stream's 
 /// in Agent Stream's `src/pipes/config.rs`, which renames and flattens none of
 /// them. Agent Stream drops a field it does not know without an error, so this
 /// list must follow that struct whenever Agent Stream adds or removes a field.
+///
+/// The credential fields (`source_auth`, `upstream_headers`, and the
+/// `api_key_secret` of the judge, jury, guardrail, and cache settings) hold
+/// secret ids, never the secrets, and Agent Stream returns the surface as
+/// stored, so the commands print and send them back as they are.
 const SURFACE_FIELDS: [&str; 61] = [
     "id",
     "name",
@@ -160,7 +172,8 @@ pub enum SurfaceCommand {
     /// an earlier surface used, deleted ones included.
     ///
     /// Before anything is sent, the CLI checks that the surface has a
-    /// `pipe_type.type`, is not marked deleted, and has only top-level field
+    /// `pipe_type.type` of `llm`, `webhook`, or `ide_catalog`, a `status`, if
+    /// given, of `enabled` or `disabled`, and only top-level field
     /// names Agent Stream knows, because Agent Stream drops a field it does
     /// not know without an error. Names below the top level are not checked,
     /// since there is no stored surface to compare them with.
@@ -175,7 +188,9 @@ pub enum SurfaceCommand {
     /// with a JSON document.
     ///
     /// The CLI reads the surface, applies the change on this machine, and
-    /// checks the field names and that `pipe_type.type` is still there. It
+    /// checks the field names, that `pipe_type.type` is `llm`, `webhook`,
+    /// `ide_catalog`, or the type the surface already has, and that `status`
+    /// is `enabled` or `disabled`. It
     /// then reads the surface again, stops if it was saved meanwhile, and
     /// otherwise sends the whole surface. A surface with no `updated_at` is
     /// refused, since the CLI can't tell whether it was saved meanwhile.
@@ -447,6 +462,7 @@ fn create_body(
         Some(file) => read_json(&file)?,
         None => {
             check_flag_paths(&surface_patch::flag_paths(&args.set, &[], &[], &[]), &FIXED_ON_CREATE)?;
+            check_null_sets(&args.set, "create")?;
             let name = args
                 .name
                 .context("--name is required without --file")?;
@@ -481,27 +497,53 @@ fn create_body(
     {
         fields.insert("created_at".to_owned(), Value::String(rfc3339_utc(now)));
     }
-    check_pipe_type(&body)?;
+    check_pipe_type(&body, None, CREATE_PIPE_TYPE_HINT)?;
     if status_of(&body) == Some(STATUS_DELETED) {
         bail!("a new surface can't have `status` set to `deleted`");
     }
+    check_status_value(&body)?;
     Ok((id, body))
 }
 
-/// Refuses a surface without a text `pipe_type.type`, which Agent Stream
-/// can't read.
-fn check_pipe_type(surface: &Value) -> Result<()> {
-    if surface
+/// The `pipe_type.type` values Agent Stream reads, from the `PipeType`
+/// deserializer in Agent Stream's `src/pipes/config.rs`. On `update`, the
+/// stored surface's own type counts too, for a type a newer Agent Stream
+/// added.
+const PIPE_TYPES: [&str; 3] = ["llm", "webhook", "ide_catalog"];
+
+/// The `pipe_type.type` of `surface`, if it is text.
+fn pipe_type_of(surface: &Value) -> Option<&str> {
+    surface
         .pointer("/pipe_type/type")
         .and_then(Value::as_str)
-        .is_none()
-    {
+}
+
+/// Refuses a surface whose `pipe_type.type` is not one Agent Stream reads
+/// or the `stored` one, with `hint` saying how to give one.
+fn check_pipe_type(
+    surface: &Value,
+    stored: Option<&str>,
+    hint: &str,
+) -> Result<()> {
+    let known = |given: &str| PIPE_TYPES.contains(&given) || stored == Some(given);
+    if !pipe_type_of(surface).is_some_and(known) {
         bail!(
-            "a surface needs a `pipe_type.type` (`llm`, `webhook`, or `ide_catalog`), or Agent Stream can't read \
-             it; with flags, add --set pipe_type.type=webhook --set pipe_type.endpoint=<url>"
+            "a surface needs a `pipe_type.type` of `llm`, `webhook`, or `ide_catalog`, or Agent Stream can't read it; {hint}"
         );
     }
     Ok(())
+}
+
+/// Refuses a `status` other than `enabled` or `disabled`, the values a
+/// change may set (callers refuse `deleted` first with its own message). A
+/// surface with no `status` is left to Agent Stream, which reads it as
+/// enabled.
+fn check_status_value(surface: &Value) -> Result<()> {
+    match surface.get("status") {
+        None => Ok(()),
+        Some(Value::String(status)) if status == "enabled" || status == "disabled" => Ok(()),
+        Some(other) => bail!("`status` must be `enabled` or `disabled`, not {other}"),
+    }
 }
 
 /// Changes the surface and returns the text to print, if any: the changes in
@@ -516,6 +558,7 @@ async fn update(
     let paths = surface_patch::flag_paths(&args.set, &args.unset, &args.add, &args.remove);
     check_flag_paths(&paths, &FIXED_ON_UPDATE)?;
     check_status_flags(&paths)?;
+    check_null_sets(&args.set, "update")?;
     let before = read_live_surface(client, &path, &args.id).await?;
     let after = match args.file {
         Some(file) => {
@@ -533,10 +576,11 @@ async fn update(
             if status_of(&after) == Some(STATUS_DELETED) {
                 bail!("--set can't delete a surface; run `fabric agent-stream surfaces delete {}`", args.id);
             }
+            check_status_value(&after)?;
             after
         }
     };
-    check_pipe_type(&after)?;
+    check_pipe_type(&after, pipe_type_of(&before), UPDATE_PIPE_TYPE_HINT)?;
     let changes = surface_validate::changes(&before, &after);
     if args.dry_run {
         return preview_update(&changes, &after, output).map(Some);
@@ -651,9 +695,7 @@ fn check_flag_paths(
                 tables::flatten(path)
             );
         }
-        let top = path
-            .split_once('.')
-            .map_or(*path, |(top, _)| top);
+        let top = top_field(path);
         if let Some((field, reason)) = fixed
             .iter()
             .find(|(field, _)| *field == top)
@@ -664,15 +706,45 @@ fn check_flag_paths(
     Ok(())
 }
 
+/// Refuses `--set <path>=null` where the shared advice, `--unset <path>`,
+/// does not apply: on `create`, which has no --unset, and on `update` for
+/// `status` and `pipe_type`, whose --unset is refused too.
+fn check_null_sets(
+    sets: &[String],
+    command: &str,
+) -> Result<()> {
+    for given in sets {
+        let Some((path, value)) = given.split_once('=') else {
+            continue;
+        };
+        if value.trim() != "null" {
+            continue;
+        }
+        if command == "create" {
+            bail!("--set {path}=null: `create` sends only the fields given, so leave `{path}` out instead");
+        }
+        match top_field(path) {
+            "status" => bail!("`status` can't be null: use --set status=enabled or --set status=disabled"),
+            "pipe_type" => bail!("`{path}` can't be null: a surface needs a `pipe_type.type`"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The top-level field of a flag path: the part before the first `.`.
+fn top_field(path: &str) -> &str {
+    path.split_once('.')
+        .map_or(path, |(top, _)| top)
+}
+
 /// Refuses, before anything is read, a flag on `status` other than `--set
 /// status=<value>`: Agent Stream reads a surface with no `status` as enabled,
 /// so an --unset would turn a disabled surface back on, and a nested path
 /// would replace the status with an object Agent Stream can't read.
 fn check_status_flags(paths: &[(&str, &str)]) -> Result<()> {
     for (flag, path) in paths {
-        let top = path
-            .split_once('.')
-            .map_or(*path, |(top, _)| top);
+        let top = top_field(path);
         if top == "status" && (*flag != "--set" || *path != "status") {
             bail!(
                 "{flag} can't change `{}`: change `status` with --set status=<enabled|disabled>, or run `surfaces \
@@ -1013,6 +1085,10 @@ mod tests {
     const GET_MOVED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", MOVED);
     const GET_DELETED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", DELETED);
     const GET_UNSTAMPED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", UNSTAMPED);
+    /// A stored surface with a pipe type a newer Agent Stream added.
+    const NEWER_TYPE: &str = r#"{"id":"s-1","name":"Sales","pipe_type":{"type":"mcp"},"status":"enabled","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-20T10:00:00Z"}"#;
+    const GET_NEWER_TYPE: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", NEWER_TYPE);
+    const PUT_NEWER_TYPE: Route = ("PUT /api/v1/pipes/s-1", "HTTP/1.1 200 OK", NEWER_TYPE);
     const GET_NEWER: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", NEWER);
     const PUT_SAVED: Route = ("PUT /api/v1/pipes/s-1", "HTTP/1.1 200 OK", STORED);
     /// The answer to a save, with an `updated_at` Agent Stream's store then
@@ -1591,6 +1667,8 @@ mod tests {
             ["--unset", "pipe_type"],
             ["--unset", "pipe_type.type"],
             ["--set", "pipe_type.type=123"],
+            ["--set", "pipe_type.type="],
+            ["--set", "pipe_type.type=api"],
             ["--file", path_of(&file)],
         ] {
             let error = run_surfaces(&host, &[&["surfaces", "update", "s-1"][..], &words].concat())
@@ -1603,7 +1681,104 @@ mod tests {
                 "{words:?}: {error}"
             );
         }
+        assert_eq!(start_lines(&requests), [GET_LINE; 6], "each reads once and sends no PUT");
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_status_other_than_enabled_or_disabled() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED, PUT_SAVED]).await;
+
+        for value in ["status=paused", "status=123", r#"status={"x":1}"#, "status="] {
+            let error = run_surfaces(&host, &["surfaces", "update", "s-1", "--set", value])
+                .await
+                .expect_err("Agent Stream reads only enabled or disabled");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("`status` must be `enabled` or `disabled`"),
+                "{value}: {error}"
+            );
+        }
         assert_eq!(start_lines(&requests), [GET_LINE; 4], "each reads once and sends no PUT");
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_status_other_than_enabled_or_disabled_before_sending() {
+        let (host, requests) = scripted_agent_stream(vec![POST_CREATED]).await;
+
+        let error = run_surfaces(
+            &host,
+            &[
+                "surfaces",
+                "create",
+                "--name",
+                "Sales",
+                "--set",
+                "pipe_type.type=webhook",
+                "--set",
+                WEBHOOK_ENDPOINT,
+                "--set",
+                "status=paused",
+            ],
+        )
+        .await
+        .expect_err("Agent Stream reads only enabled or disabled");
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("`status` must be"),
+            "{error}"
+        );
+        assert!(start_lines(&requests).is_empty(), "nothing is sent");
+    }
+
+    #[tokio::test]
+    async fn update_keeps_a_pipe_type_a_newer_agent_stream_added() {
+        let (host, requests) = scripted_agent_stream(vec![GET_NEWER_TYPE, PUT_NEWER_TYPE]).await;
+
+        run_surfaces(&host, &["surfaces", "update", "s-1", "--set", "name=Sales EU"])
+            .await
+            .expect("the stored type is kept");
+
+        assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE]);
+        assert_eq!(sent_json(&requests, 2)["pipe_type"]["type"], "mcp");
+    }
+
+    #[tokio::test]
+    async fn null_sets_get_advice_that_works_for_the_command() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED]).await;
+
+        for (words, start) in [
+            (vec!["surfaces", "update", "s-1", "--set", "status=null"], "`status` can't be null"),
+            (vec!["surfaces", "update", "s-1", "--set", "pipe_type.type=null"], "`pipe_type.type` can't be null"),
+            (
+                vec!["surfaces", "create", "--name", "Sales", "--set", "status=null", "--dry-run"],
+                "--set status=null: `create` sends only the fields given",
+            ),
+        ] {
+            let error = run_surfaces(&host, &words)
+                .await
+                .expect_err("a null here has no --unset to point at");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(start),
+                "{words:?}: {error}"
+            );
+        }
+        assert!(start_lines(&requests).is_empty(), "each is refused before anything is read");
+    }
+
+    #[tokio::test]
+    async fn get_command_reads_the_surface_by_id() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED]).await;
+
+        run_surfaces(&host, &["surfaces", "get", "s-1"])
+            .await
+            .expect("surfaces get");
+
+        assert_eq!(start_lines(&requests), [GET_LINE]);
     }
 
     #[tokio::test]
