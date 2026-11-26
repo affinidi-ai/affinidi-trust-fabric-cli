@@ -724,7 +724,7 @@ check_checks_stop() {
   shift
   if run_checks_passed "$@" "${root}/scripts/checks-passed.sh" "${checks_sha}"; then
     fail "checks-passed.sh passed ${what}"
-  elif [ "$#" -eq 0 ] && ! grep -q "^::error::" "${work_dir}/checks-passed.log"; then
+  elif ! grep -q "^::error::" "${work_dir}/checks-passed.log"; then
     fail "checks-passed.sh stopped ${what} without an error that says why"
   fi
 }
@@ -732,6 +732,10 @@ check_checks_stop() {
 set_checks_runs "$(checks_run 7 completed success)"
 check_checks_pass "when the checks passed"
 check_checks_stop "when GitHub couldn't be asked" FAKE_GH_FAIL=1
+if ! grep -qF "::error::Couldn't ask GitHub for the checks runs of ${checks_sha}, so nothing is released" \
+  "${work_dir}/checks-passed.log"; then
+  fail "checks-passed.sh didn't say it couldn't ask GitHub"
+fi
 check_checks_stop "when it asks GitHub about another commit" \
   FAKE_GH_SHA=fedcba9876543210fedcba9876543210fedcba98
 set_checks_runs "$(checks_run 7 completed failure)"
