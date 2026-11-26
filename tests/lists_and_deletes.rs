@@ -34,11 +34,23 @@ fn reply(
     }
 }
 
+/// The anonymous request a binary built with the `agent-stream` feature sends
+/// first to ask the host which product it is, because the token these tests
+/// give in FABRIC_TOKEN has no product's prefix. The gateway answers it with a
+/// 404, so the command carries on as the build without the feature does.
+const PRODUCT_PROBE: &str = "GET /api/v1/permissions/public";
+
 struct Output {
     stdout: String,
     stderr: String,
-    /// The request line of every request the gateway received.
+    /// The request line of every request the gateway received, apart from one
+    /// [`PRODUCT_PROBE`] sent first by a binary built with the `agent-stream`
+    /// feature. A probe from a build without the feature, or a second one,
+    /// stays in this list, so a test that expects no requests catches it.
     requests: Vec<String>,
+    /// Whether a binary built with the `agent-stream` feature sent
+    /// [`PRODUCT_PROBE`] as its first request; always false without the feature.
+    probed: bool,
     success: bool,
 }
 
@@ -146,13 +158,22 @@ fn fabric(
         .env_remove("FABRIC_CONNECTION")
         .output()
         .expect("run fabric");
+    let mut requests = seen
+        .lock()
+        .expect("recorder")
+        .clone();
+    let probed = cfg!(feature = "agent-stream")
+        && requests
+            .first()
+            .is_some_and(|request| request == PRODUCT_PROBE);
+    if probed {
+        requests.remove(0);
+    }
     Output {
         stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
-        requests: seen
-            .lock()
-            .expect("recorder")
-            .clone(),
+        requests,
+        probed,
         success: result.status.success(),
     }
 }
@@ -1249,6 +1270,7 @@ fn revoking_or_rotating_an_access_token_without_yes_refuses_and_sends_nothing_wh
             out.stdout
         );
         assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
+        assert_eq!(out.probed, cfg!(feature = "agent-stream"), "{verb}");
     }
 }
 
@@ -1265,6 +1287,7 @@ fn a_raw_api_call_with_a_control_character_in_a_dot_segment_is_refused_before_it
             out.stderr
         );
         assert!(out.requests.is_empty(), "{path:?}: {:?}", out.requests);
+        assert_eq!(out.probed, cfg!(feature = "agent-stream"), "{path:?}");
     }
 }
 
@@ -1288,6 +1311,7 @@ fn revoking_or_rotating_an_api_key_without_yes_refuses_and_sends_nothing_when_st
         );
         assert!(!out.stdout.contains("sk_new"), "{verb}: {}", out.stdout);
         assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
+        assert_eq!(out.probed, cfg!(feature = "agent-stream"), "{verb}");
     }
 }
 
@@ -1309,6 +1333,7 @@ fn an_api_key_command_without_yes_or_agent_id_refuses_before_any_lookup() {
             out.stderr
         );
         assert!(out.requests.is_empty(), "{verb}: {:?}", out.requests);
+        assert_eq!(out.probed, cfg!(feature = "agent-stream"), "{verb}");
     }
 }
 

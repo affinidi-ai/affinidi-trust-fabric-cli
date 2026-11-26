@@ -17,7 +17,7 @@ use crate::{
     config::{Config, Connection, normalize_host, normalize_user_host, saved_host_http_warning},
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
     features,
-    product::{self, Product},
+    product::{self, Given, Product},
     surface_patch, surface_validate,
     tables::{self, Layout, Scope, table_cell},
     tool_gate_preview::{self, Conditions, Gating, Preview, ToolPreview, Verdict},
@@ -2148,7 +2148,16 @@ async fn dispatch_with(
                          {name} --host {host}`"
                     )
                 })?;
-            product::check_product(Product::AgentGateway, &host, Some(&token), cli.host.is_some()).await?;
+            product::check_product(
+                Product::AgentGateway,
+                &host,
+                Some(&token),
+                Given {
+                    host: cli.host.is_some(),
+                    token: cli.token.is_some(),
+                },
+            )
+            .await?;
             let client = GatewayClient::new(host, token)?;
             if let Command::AccessTokens { command } = command {
                 return run_access_tokens(&client, command, cli.output).await;
@@ -2529,10 +2538,19 @@ async fn login_and_save(
             .context("--host is required for login")?,
         allow_http,
     )?;
-    product::check_product(Product::AgentGateway, &host, args.token.as_deref(), true).await?;
+    product::check_product(
+        Product::AgentGateway,
+        &host,
+        args.token.as_deref(),
+        Given {
+            host: true,
+            token: args.token.is_some(),
+        },
+    )
+    .await?;
     let token = acquire_login_token(&host, &args).await?;
     // The host has answered by now, so only the token's prefix is left to check.
-    product::check_product(Product::AgentGateway, &host, Some(&token), false).await?;
+    product::check_product(Product::AgentGateway, &host, Some(&token), Given::default()).await?;
     let client = GatewayClient::new(&host, &token)?;
     if args.pat.is_some() {
         client
@@ -2774,7 +2792,16 @@ async fn whoami_info(
         token,
         token_stored,
     } = command_target(config, credentials, connection, host_override, flags, token_override)?;
-    product::check_product(Product::AgentGateway, &host, token.as_deref(), host_override.is_some()).await?;
+    product::check_product(
+        Product::AgentGateway,
+        &host,
+        token.as_deref(),
+        Given {
+            host: host_override.is_some(),
+            token: token_override.is_some(),
+        },
+    )
+    .await?;
 
     let mut info = json!({
         "connection": name,
@@ -18282,6 +18309,79 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
+        }
+
+        #[tokio::test]
+        async fn a_given_session_token_never_reaches_a_saved_connection_that_answers_as_agent_stream() {
+            for words in [vec!["surfaces", "list"], vec!["whoami"]] {
+                let (host, requests) =
+                    recording_server(vec![ok_json(AGENT_STREAM_PERMISSIONS), ok_json(AUTHENTICATED)]).await;
+                let config = config_with_connection("prod", &host);
+                let credentials = credentials_bound_to("prod", GIVEN_TOKEN, &host);
+                let line: Vec<&str> = ["--token", SESSION_TOKEN]
+                    .into_iter()
+                    .chain(words.iter().copied())
+                    .collect();
+
+                let error = dispatch_with(gateway_args(&line), config, &credentials)
+                    .await
+                    .expect_err("a given session token must not reach a saved Agent Stream host");
+
+                let text = error.to_string();
+                assert!(
+                    text.contains(&format!("{host} is an Agent Stream, not an Agent Gateway")),
+                    "{words:?}: {text}"
+                );
+                assert!(!text.contains(SESSION_TOKEN), "{words:?}: {text}");
+                assert_eq!(first_lines(&requests), [PROBE_REQUEST], "{words:?}");
+                let probe = requests.lock().unwrap()[0].to_ascii_lowercase();
+                assert!(!probe.contains("authorization"), "{words:?}: {probe}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_given_session_token_on_a_saved_gateway_is_sent_after_the_host_answers() {
+            let (host, requests) = recording_server(vec![ok_json(GATEWAY_PERMISSIONS), OK_EMPTY_LIST]).await;
+            let config = config_with_connection("prod", &host);
+            let credentials = credentials_bound_to("prod", GIVEN_TOKEN, &host);
+
+            dispatch_with(
+                gateway_args(&["--token", SESSION_TOKEN, "api", "get", "/v1/gateways"]),
+                config,
+                &credentials,
+            )
+            .await
+            .expect("the saved host answers as Agent Gateway");
+
+            assert_eq!(first_lines(&requests), [PROBE_REQUEST, "GET /api/v1/gateways HTTP/1.1"]);
+            let requests = requests.lock().unwrap();
+            assert!(
+                !requests[0]
+                    .to_ascii_lowercase()
+                    .contains("authorization"),
+                "{}",
+                requests[0]
+            );
+            assert!(
+                requests[1]
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {SESSION_TOKEN}")),
+                "{}",
+                requests[1]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_given_gateway_access_token_on_a_saved_gateway_is_sent_without_asking_the_host() {
+            let (host, requests) = recording_server(vec![OK_EMPTY_LIST]).await;
+            let config = config_with_connection("prod", &host);
+            let credentials = credentials_bound_to("prod", SESSION_TOKEN, &host);
+
+            dispatch_with(gateway_args(&["--token", GIVEN_TOKEN, "api", "get", "/v1/gateways"]), config, &credentials)
+                .await
+                .expect("the access token's prefix says Agent Gateway");
+
+            assert_eq!(first_lines(&requests), ["GET /api/v1/gateways HTTP/1.1"]);
         }
 
         #[tokio::test]

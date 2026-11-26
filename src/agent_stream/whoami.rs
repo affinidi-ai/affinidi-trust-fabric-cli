@@ -86,7 +86,7 @@ async fn whoami_info(
         globals.flags,
         globals.token.as_deref(),
     )?;
-    product::check_product(Product::AgentStream, &host, token.as_deref(), globals.host.is_some()).await?;
+    product::check_product(Product::AgentStream, &host, token.as_deref(), globals.given()).await?;
 
     let mut info = json!({
         "connection": connection,

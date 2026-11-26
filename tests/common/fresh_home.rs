@@ -3,6 +3,7 @@
 
 use std::{
     io::Write,
+    path::Path,
     process::{Command, Output, Stdio},
 };
 
@@ -21,11 +22,19 @@ pub fn fabric_in_fresh_home(
     stdin: &str,
 ) -> Output {
     let home = TempDir::new().expect("temp dir");
-    for directory in [
-        home.path()
-            .join("Library/Application Support/fabric"),
-        home.path().join("xdg/fabric"),
-    ] {
+    fabric_in_home(home.path(), args, files, environment, stdin)
+}
+
+/// Like [`fabric_in_fresh_home`], in `home`, which the caller made and can
+/// look into once the command has ended.
+pub fn fabric_in_home(
+    home: &Path,
+    args: &[&str],
+    files: &[(&str, &str)],
+    environment: &[(&str, &str)],
+    stdin: &str,
+) -> Output {
+    for directory in [home.join("Library/Application Support/fabric"), home.join("xdg/fabric")] {
         std::fs::create_dir_all(&directory).expect("config directory");
         for (name, contents) in files {
             std::fs::write(directory.join(name), contents).expect("config file");
@@ -37,8 +46,8 @@ pub fn fabric_in_fresh_home(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", home.path().join("xdg"))
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("xdg"))
         .env_remove("FABRIC_TOKEN")
         .env_remove("FABRIC_HOST")
         .env_remove("FABRIC_CONNECTION");

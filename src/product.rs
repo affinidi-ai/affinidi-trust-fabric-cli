@@ -160,6 +160,19 @@ fn wrong_product_message(
     format!("{reason}; run the command as `{} ...` instead", found.command())
 }
 
+/// Which parts of a command's target were given on this run, with a flag or an
+/// environment variable, rather than read from a saved connection. A part that
+/// was given has not been checked against the host before, so
+/// [`check_product`] decides from these whether to ask the host which product
+/// it is.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Given {
+    /// The host was typed with `--host` or set in FABRIC_HOST.
+    pub host: bool,
+    /// The token was typed with `--token` or set in FABRIC_TOKEN.
+    pub token: bool,
+}
+
 /// Stops a command of `expected` that is aimed at the other product, before
 /// anything is sent with the token or written, in a binary built with the
 /// `agent-stream` Cargo feature (see [`stop_if_other_product`] for the rules).
@@ -171,28 +184,30 @@ pub async fn check_product(
     expected: Product,
     host: &str,
     token: Option<&str>,
-    host_given: bool,
+    given: Given,
 ) -> Result<()> {
     if !cfg!(feature = "agent-stream") {
         return Ok(());
     }
-    stop_if_other_product(expected, host, token, host_given).await
+    stop_if_other_product(expected, host, token, given).await
 }
 
 /// The stop behind [`check_product`], whatever the binary was built with.
 ///
 /// A `token` with the other product's prefix is refused on the spot, without a
-/// request. Any other token, including one with the command's own prefix, is
-/// checked against the host when `host_given` says the host was typed with
-/// `--host` or set in FABRIC_HOST: `host` is asked which product it is,
-/// without the token, and the other product is refused, so an Agent Gateway
-/// access token is not sent to a typed host that answers as Agent Stream, nor
-/// an Agent Stream access token to one that answers as Agent Gateway. A saved
-/// connection is not asked,
-/// because it already belongs to its product's store. Inside
-/// [`remembering_probes`] a host that has named its product is not asked
-/// again. When the host cannot be read, an Agent Gateway command carries on
-/// and an Agent Stream command stops.
+/// request. Otherwise `host` is asked which product it is, without the token,
+/// and the other product is refused, when [`must_ask_host`] says so: when the
+/// host was given on this run, whatever the token's prefix, or when the token
+/// was given on this run and has no product's prefix, such as a browser
+/// session token. So an Agent Gateway access token is not sent to a typed host
+/// that answers as Agent Stream, nor an Agent Stream access token to one that
+/// answers as Agent Gateway, and a given session token is not sent to a saved
+/// connection of the other product. A saved connection used with its saved
+/// token, or with a given token that has the command's own prefix, is not
+/// asked, because the host belongs to its product's store and the token to
+/// its product. Inside [`remembering_probes`] a host that has named its
+/// product is not asked again. When the host cannot be read, an Agent Gateway
+/// command carries on and an Agent Stream command stops.
 ///
 /// A refusal is worded by [`wrong_product_message`], which names the command
 /// group of the other product. Neither the token nor any part of it is ever
@@ -201,7 +216,7 @@ async fn stop_if_other_product(
     expected: Product,
     host: &str,
     token: Option<&str>,
-    host_given: bool,
+    given: Given,
 ) -> Result<()> {
     if let Some(product) = token
         .and_then(token_product)
@@ -209,7 +224,7 @@ async fn stop_if_other_product(
     {
         bail!(wrong_product_message(expected, product, Mismatch::TokenPrefix));
     }
-    if !host_given {
+    if !must_ask_host(token, given) {
         return Ok(());
     }
     match host_product(host).await {
@@ -222,6 +237,22 @@ async fn stop_if_other_product(
             expected.name()
         ),
     }
+}
+
+/// Whether the host has to be asked which product it is before `token` is
+/// sent: always when the host was given on this run, and, for a saved host,
+/// when the token was given on this run and its prefix names no product. A
+/// token with a product's prefix says which product it belongs to, so with a
+/// saved host it needs no answer from the host.
+fn must_ask_host(
+    token: Option<&str>,
+    given: Given,
+) -> bool {
+    given.host
+        || (given.token
+            && token
+                .and_then(token_product)
+                .is_none())
 }
 
 /// Which product runs at `host`: the answer remembered for it inside
@@ -310,6 +341,12 @@ mod tests {
     const OLD_STREAM_TOKEN: &str = "atgpat_secret-value";
     const STREAM_HOST: &str = "https://stream.example";
     const GATEWAY_HOST: &str = "https://gateway.example";
+    /// A host typed with `--host` or FABRIC_HOST, and a saved token.
+    const HOST_GIVEN: Given = Given { host: true, token: false };
+    /// A saved connection with its saved token.
+    const SAVED: Given = Given { host: false, token: false };
+    /// A saved connection with a token typed with `--token` or FABRIC_TOKEN.
+    const TOKEN_GIVEN: Given = Given { host: false, token: true };
 
     /// Answers every request with `status_line` and `body` until the test
     /// ends, and records each request. Returns its base URL and the recording.
@@ -482,11 +519,11 @@ mod tests {
         let (stream, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
 
         for token in [GATEWAY_TOKEN, STREAM_TOKEN, OLD_STREAM_TOKEN, SESSION_TOKEN] {
-            check_product(Product::AgentGateway, &stream, Some(token), true)
+            check_product(Product::AgentGateway, &stream, Some(token), HOST_GIVEN)
                 .await
                 .expect("the stop is off in a build without the feature");
         }
-        check_product(Product::AgentGateway, &stream, None, true)
+        check_product(Product::AgentGateway, &stream, None, HOST_GIVEN)
             .await
             .expect("the stop is off in a build without the feature");
 
@@ -498,11 +535,11 @@ mod tests {
     async fn a_build_with_the_feature_stops_a_command_aimed_at_the_other_product() {
         let (stream, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
 
-        let by_prefix = check_product(Product::AgentGateway, &stream, Some(STREAM_TOKEN), true)
+        let by_prefix = check_product(Product::AgentGateway, &stream, Some(STREAM_TOKEN), HOST_GIVEN)
             .await
             .expect_err("an Agent Stream token must be refused");
         assert!(request_lines(&requests).is_empty());
-        let by_host = check_product(Product::AgentGateway, &stream, Some(SESSION_TOKEN), true)
+        let by_host = check_product(Product::AgentGateway, &stream, Some(SESSION_TOKEN), HOST_GIVEN)
             .await
             .expect_err("an Agent Stream host must be refused");
 
@@ -526,7 +563,7 @@ mod tests {
         let (host, requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
 
         for token in [STREAM_TOKEN, OLD_STREAM_TOKEN] {
-            let error = stop_if_other_product(Product::AgentGateway, &host, Some(token), true)
+            let error = stop_if_other_product(Product::AgentGateway, &host, Some(token), HOST_GIVEN)
                 .await
                 .expect_err("an Agent Stream token must be refused");
 
@@ -542,7 +579,7 @@ mod tests {
     async fn a_gateway_token_on_an_agent_stream_command_stops_without_a_request() {
         let (host, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
 
-        let error = stop_if_other_product(Product::AgentStream, &host, Some(GATEWAY_TOKEN), true)
+        let error = stop_if_other_product(Product::AgentStream, &host, Some(GATEWAY_TOKEN), HOST_GIVEN)
             .await
             .expect_err("an Agent Gateway token must be refused");
 
@@ -557,7 +594,7 @@ mod tests {
     async fn an_agent_stream_token_typed_with_a_leading_space_stops_without_a_request() {
         let (host, requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
 
-        let error = stop_if_other_product(Product::AgentGateway, &host, Some(&format!(" {STREAM_TOKEN}")), true)
+        let error = stop_if_other_product(Product::AgentGateway, &host, Some(&format!(" {STREAM_TOKEN}")), HOST_GIVEN)
             .await
             .expect_err("the space must not hide the Agent Stream prefix");
 
@@ -568,15 +605,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_token_with_the_expected_prefix_on_a_saved_connection_is_not_probed() {
+    async fn a_given_token_with_the_expected_prefix_on_a_saved_connection_is_not_probed() {
         let (host, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
 
-        stop_if_other_product(Product::AgentGateway, &host, Some(GATEWAY_TOKEN), false)
+        stop_if_other_product(Product::AgentGateway, &host, Some(GATEWAY_TOKEN), TOKEN_GIVEN)
             .await
             .expect("the prefix says Agent Gateway and the host is saved");
-        stop_if_other_product(Product::AgentStream, &host, Some(STREAM_TOKEN), false)
-            .await
-            .expect("the prefix says Agent Stream and the host is saved");
+        for token in [STREAM_TOKEN, OLD_STREAM_TOKEN] {
+            stop_if_other_product(Product::AgentStream, &host, Some(token), TOKEN_GIVEN)
+                .await
+                .expect("the prefix says Agent Stream and the host is saved");
+        }
 
         assert!(request_lines(&requests).is_empty());
     }
@@ -585,7 +624,7 @@ mod tests {
     async fn a_gateway_token_with_a_given_host_of_agent_stream_stops_after_a_probe_without_the_token() {
         let (stream, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
 
-        let error = stop_if_other_product(Product::AgentGateway, &stream, Some(GATEWAY_TOKEN), true)
+        let error = stop_if_other_product(Product::AgentGateway, &stream, Some(GATEWAY_TOKEN), HOST_GIVEN)
             .await
             .expect_err("an Agent Gateway token must not reach an Agent Stream host");
 
@@ -603,7 +642,7 @@ mod tests {
     async fn a_gateway_token_with_a_given_host_of_agent_gateway_carries_on_after_a_probe() {
         let (gateway, requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
 
-        stop_if_other_product(Product::AgentGateway, &gateway, Some(GATEWAY_TOKEN), true)
+        stop_if_other_product(Product::AgentGateway, &gateway, Some(GATEWAY_TOKEN), HOST_GIVEN)
             .await
             .expect("an Agent Gateway host");
 
@@ -612,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gateway_token_with_a_given_host_that_cannot_be_read_carries_on() {
-        stop_if_other_product(Product::AgentGateway, &refusing_host(), Some(GATEWAY_TOKEN), true)
+        stop_if_other_product(Product::AgentGateway, &refusing_host(), Some(GATEWAY_TOKEN), HOST_GIVEN)
             .await
             .expect("an Agent Gateway command carries on when the host cannot be read");
     }
@@ -622,7 +661,7 @@ mod tests {
         let (gateway, requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
 
         for token in [STREAM_TOKEN, OLD_STREAM_TOKEN] {
-            let error = stop_if_other_product(Product::AgentStream, &gateway, Some(token), true)
+            let error = stop_if_other_product(Product::AgentStream, &gateway, Some(token), HOST_GIVEN)
                 .await
                 .expect_err("an Agent Stream token must not reach an Agent Gateway host");
 
@@ -643,7 +682,7 @@ mod tests {
     async fn an_agent_stream_token_with_a_given_host_that_cannot_be_read_stops() {
         let host = refusing_host();
 
-        let error = stop_if_other_product(Product::AgentStream, &host, Some(STREAM_TOKEN), true)
+        let error = stop_if_other_product(Product::AgentStream, &host, Some(STREAM_TOKEN), HOST_GIVEN)
             .await
             .expect_err("an Agent Stream command needs a known host");
 
@@ -656,20 +695,84 @@ mod tests {
     async fn an_agent_stream_token_with_a_given_host_of_agent_stream_carries_on() {
         let (stream, _) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
 
-        stop_if_other_product(Product::AgentStream, &stream, Some(STREAM_TOKEN), true)
+        stop_if_other_product(Product::AgentStream, &stream, Some(STREAM_TOKEN), HOST_GIVEN)
             .await
             .expect("an Agent Stream host");
     }
 
     #[tokio::test]
-    async fn a_saved_connection_is_not_probed() {
-        let (host, requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
+    async fn a_saved_connection_with_its_saved_token_is_not_probed() {
+        let (stream, stream_requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
+        let (gateway, gateway_requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
 
-        stop_if_other_product(Product::AgentGateway, &host, Some(SESSION_TOKEN), false)
+        stop_if_other_product(Product::AgentGateway, &stream, Some(SESSION_TOKEN), SAVED)
             .await
-            .expect("a saved connection already belongs to its product's store");
+            .expect("a saved token was checked against its host at login");
+        stop_if_other_product(Product::AgentStream, &gateway, Some(SESSION_TOKEN), SAVED)
+            .await
+            .expect("a saved token was checked against its host at login");
 
-        assert!(request_lines(&requests).is_empty());
+        assert!(request_lines(&stream_requests).is_empty());
+        assert!(request_lines(&gateway_requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_given_session_token_on_a_saved_connection_of_the_other_product_stops_after_a_probe_without_the_token() {
+        let (stream, stream_requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
+        let (gateway, gateway_requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
+
+        let on_stream = stop_if_other_product(Product::AgentGateway, &stream, Some(SESSION_TOKEN), TOKEN_GIVEN)
+            .await
+            .expect_err("a given session token must not reach a saved Agent Stream host");
+        let on_gateway = stop_if_other_product(Product::AgentStream, &gateway, Some(SESSION_TOKEN), TOKEN_GIVEN)
+            .await
+            .expect_err("a given session token must not reach a saved Agent Gateway host");
+
+        let on_stream = on_stream.to_string();
+        assert!(on_stream.contains(&format!("{stream} is an Agent Stream, not an Agent Gateway")), "{on_stream}");
+        let on_gateway = on_gateway.to_string();
+        assert!(on_gateway.contains(&format!("{gateway} is an Agent Gateway, not an Agent Stream")), "{on_gateway}");
+        for requests in [stream_requests, gateway_requests] {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET /api/v1/permissions/public HTTP/1.1"), "{}", requests[0]);
+            assert!(!requests[0].contains(SESSION_TOKEN), "{}", requests[0]);
+            assert!(
+                !requests[0]
+                    .to_ascii_lowercase()
+                    .contains("authorization"),
+                "{}",
+                requests[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_given_session_token_on_a_saved_connection_of_the_right_product_carries_on_after_a_probe() {
+        let (stream, stream_requests) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
+        let (gateway, gateway_requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
+
+        stop_if_other_product(Product::AgentStream, &stream, Some(SESSION_TOKEN), TOKEN_GIVEN)
+            .await
+            .expect("an Agent Stream host");
+        stop_if_other_product(Product::AgentGateway, &gateway, Some(SESSION_TOKEN), TOKEN_GIVEN)
+            .await
+            .expect("an Agent Gateway host");
+
+        assert_eq!(request_lines(&stream_requests), ["GET /api/v1/permissions/public HTTP/1.1"]);
+        assert_eq!(request_lines(&gateway_requests), ["GET /api/v1/permissions/public HTTP/1.1"]);
+    }
+
+    #[test]
+    fn the_host_is_asked_when_it_was_given_or_a_given_token_names_no_product() {
+        assert!(must_ask_host(Some(GATEWAY_TOKEN), HOST_GIVEN));
+        assert!(must_ask_host(None, HOST_GIVEN));
+        assert!(must_ask_host(Some(SESSION_TOKEN), TOKEN_GIVEN));
+        assert!(must_ask_host(Some(&format!(" {SESSION_TOKEN}")), TOKEN_GIVEN));
+        assert!(!must_ask_host(Some(GATEWAY_TOKEN), TOKEN_GIVEN));
+        assert!(!must_ask_host(Some(STREAM_TOKEN), TOKEN_GIVEN));
+        assert!(!must_ask_host(Some(SESSION_TOKEN), SAVED));
+        assert!(!must_ask_host(None, SAVED));
     }
 
     #[tokio::test]
@@ -746,14 +849,14 @@ mod tests {
         let (stream, _) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
         let (gateway, _) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
 
-        let error = stop_if_other_product(Product::AgentGateway, &stream, Some(SESSION_TOKEN), true)
+        let error = stop_if_other_product(Product::AgentGateway, &stream, Some(SESSION_TOKEN), HOST_GIVEN)
             .await
             .expect_err("an Agent Stream host must be refused");
         let text = error.to_string();
         assert!(text.contains(&format!("{stream} is an Agent Stream, not an Agent Gateway")), "{text}");
         assert!(text.contains("`fabric agent-stream ...`"), "{text}");
 
-        let error = stop_if_other_product(Product::AgentStream, &gateway, Some(SESSION_TOKEN), true)
+        let error = stop_if_other_product(Product::AgentStream, &gateway, Some(SESSION_TOKEN), HOST_GIVEN)
             .await
             .expect_err("an Agent Gateway host must be refused");
         let text = error.to_string();
@@ -766,13 +869,13 @@ mod tests {
         let (stream, _) = answering_server("HTTP/1.1 200 OK", STREAM_PERMISSIONS).await;
         let (gateway, _) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
 
-        stop_if_other_product(Product::AgentGateway, &gateway, Some(SESSION_TOKEN), true)
+        stop_if_other_product(Product::AgentGateway, &gateway, Some(SESSION_TOKEN), HOST_GIVEN)
             .await
             .expect("an Agent Gateway host");
-        stop_if_other_product(Product::AgentStream, &stream, Some(SESSION_TOKEN), true)
+        stop_if_other_product(Product::AgentStream, &stream, Some(SESSION_TOKEN), HOST_GIVEN)
             .await
             .expect("an Agent Stream host");
-        stop_if_other_product(Product::AgentGateway, &gateway, None, true)
+        stop_if_other_product(Product::AgentGateway, &gateway, None, HOST_GIVEN)
             .await
             .expect("no token yet, an Agent Gateway host");
     }
@@ -781,10 +884,10 @@ mod tests {
     async fn an_unknown_host_stops_an_agent_stream_command_and_lets_a_gateway_command_through() {
         let host = refusing_host();
 
-        stop_if_other_product(Product::AgentGateway, &host, Some(SESSION_TOKEN), true)
+        stop_if_other_product(Product::AgentGateway, &host, Some(SESSION_TOKEN), HOST_GIVEN)
             .await
             .expect("an Agent Gateway command runs as it did before the probe");
-        let error = stop_if_other_product(Product::AgentStream, &host, Some(SESSION_TOKEN), true)
+        let error = stop_if_other_product(Product::AgentStream, &host, Some(SESSION_TOKEN), HOST_GIVEN)
             .await
             .expect_err("an Agent Stream command needs a known host");
 
@@ -801,7 +904,7 @@ mod tests {
 
         remembering_probes(async {
             for host in [&gateway, &written_differently, &gateway] {
-                stop_if_other_product(Product::AgentGateway, host, Some(SESSION_TOKEN), true)
+                stop_if_other_product(Product::AgentGateway, host, Some(SESSION_TOKEN), HOST_GIVEN)
                     .await
                     .expect("an Agent Gateway host");
             }
@@ -817,7 +920,7 @@ mod tests {
 
         remembering_probes(async {
             for _ in 0..2 {
-                let error = stop_if_other_product(Product::AgentGateway, &stream, Some(SESSION_TOKEN), true)
+                let error = stop_if_other_product(Product::AgentGateway, &stream, Some(SESSION_TOKEN), HOST_GIVEN)
                     .await
                     .expect_err("an Agent Stream host must be refused every time");
                 assert!(
@@ -842,10 +945,10 @@ mod tests {
         .await;
 
         remembering_probes(async {
-            stop_if_other_product(Product::AgentGateway, &host, Some(SESSION_TOKEN), true)
+            stop_if_other_product(Product::AgentGateway, &host, Some(SESSION_TOKEN), HOST_GIVEN)
                 .await
                 .expect("an Agent Gateway command carries on when the host cannot be read");
-            let error = stop_if_other_product(Product::AgentGateway, &host, Some(SESSION_TOKEN), true)
+            let error = stop_if_other_product(Product::AgentGateway, &host, Some(SESSION_TOKEN), HOST_GIVEN)
                 .await
                 .expect_err("the unreadable answer must not be remembered as a pass");
             assert!(
@@ -865,7 +968,7 @@ mod tests {
         let (gateway, requests) = answering_server("HTTP/1.1 200 OK", GATEWAY_PERMISSIONS).await;
 
         for _ in 0..2 {
-            stop_if_other_product(Product::AgentGateway, &gateway, Some(SESSION_TOKEN), true)
+            stop_if_other_product(Product::AgentGateway, &gateway, Some(SESSION_TOKEN), HOST_GIVEN)
                 .await
                 .expect("an Agent Gateway host");
         }

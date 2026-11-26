@@ -81,6 +81,8 @@ without the feature never sends it. The request goes out before:
 
 - a command or `whoami` given `--host` or `FABRIC_HOST`, unless its token starts with
   the other product's prefix, which is refused without a request;
+- a command or `whoami` on a saved connection given `--token` or `FABRIC_TOKEN` with a
+  token that has neither product's prefix, such as a browser session token;
 - every `login`, `--pat` included, unless it was given a token that starts with the
   other product's prefix.
 
@@ -149,8 +151,8 @@ Each file in [`tests/`](../../tests/) runs the built binary through
 | --- | --- |
 | [`lists_and_deletes.rs`](../../tests/lists_and_deletes.rs) | The tables lists print, the one-line confirmations of deletes and other changes, and what goes to standard output versus standard error |
 | [`env_token_and_host_note.rs`](../../tests/env_token_and_host_note.rs) | The `note:` printed when both the token and the host come from the environment, including in the interactive shell |
-| [`product_check.rs`](../../tests/product_check.rs) | Every request a host gets from a gateway command, `login`, and the interactive shell given a host and a token. The build with the `agent-stream` feature asks the host which product it is once, without the token, and sends nothing more to one that answers as Agent Stream. The default build never asks and sends only the command's own requests. Each test is compiled for one of the two builds only |
-| [`agent_stream_feature.rs`](../../tests/agent_stream_feature.rs) | The default build rejects `fabric agent-stream`. The build with the `agent-stream` feature lists Agent Stream connections apart from the Agent Gateway ones, warns about a `#` in a connection name, and prints the note for a token and host both from the environment. Each test is compiled for one of the two builds only |
+| [`product_check.rs`](../../tests/product_check.rs) | Every request a host gets from a gateway command, `login`, and the interactive shell given a host and a token, and from a command of either product given a session token beside a saved connection. The build with the `agent-stream` feature asks the host which product it is once, without the token, and sends nothing more to one that answers as the other product. The default build never asks and sends only the command's own requests. Each test is compiled for one of the two builds only |
+| [`agent_stream_feature.rs`](../../tests/agent_stream_feature.rs) | The default build rejects `fabric agent-stream`. The build with the `agent-stream` feature lists Agent Stream connections apart from the Agent Gateway ones, warns about a `#` in a connection name, prints the note for a token and host both from the environment, and sends `tokens list` with a token from the environment: after an anonymous probe when the host is from the environment too or the token is a session token, and without one for an access token beside a saved connection. Each test is compiled for one of the two builds only |
 
 Every run is isolated from your own configuration:
 
@@ -160,10 +162,13 @@ Every run is isolated from your own configuration:
   configuration directory differs between macOS and Linux. `lists_and_deletes.rs` does
   that in its own `fabric` helper. The other files go through `fabric_in_fresh_home` in
   [`tests/common/fresh_home.rs`](../../tests/common/fresh_home.rs), which writes the
-  files a test hands it into both directories. `agent_stream_feature.rs` hands it a
-  `config.toml`, an `agent-stream.toml`, both, or no file, depending on the test, and
-  `product_check.rs` hands it no file, because its commands are given their host and
-  token.
+  files a test hands it into both directories. `agent_stream_feature.rs` and
+  `product_check.rs` hand it a `config.toml`, an `agent-stream.toml`, both, or no file,
+  depending on the test. A test that looks into the home afterwards makes it itself and
+  runs `fabric_in_home` from the same file. The hosts those two files point at come from
+  `host_answering` in [`tests/common/recording_host.rs`](../../tests/common/recording_host.rs),
+  which answers the product probe and every other request apart and records each whole
+  request.
 - `FABRIC_HOST`, `FABRIC_CONNECTION`, and `FABRIC_TOKEN` are removed from the inherited
   environment, and each test sets only the ones it needs. `lists_and_deletes.rs` always
   sets `FABRIC_TOKEN` to a test value.
@@ -177,7 +182,10 @@ In `lists_and_deletes.rs`, the `fabric` helper takes a list of `Reply` values, b
 `reply(method, path, status, body)`, and starts a server on a thread that answers each
 request whose method and path match, with `/api` added to the path and the query
 ignored. Anything else gets `404 Not Found`. The helper returns an `Output` with
-`stdout`, `stderr`, the recorded `requests`, and `success`.
+`stdout`, `stderr`, the recorded `requests`, and `success`. Its `FABRIC_TOKEN` has no
+product's prefix, so the build with the `agent-stream` feature asks the saved host which
+product it is first; the server answers that with a `404`, the command carries on, and
+`requests` leaves that probe out.
 
 `env_token_and_host_note.rs` needs no server: its saved and environment hosts are
 unreachable loopback ports, and it asserts only on standard error.

@@ -135,14 +135,21 @@ a binary built with the feature.
 There, `check_product` makes sure the command is not aimed at the other product. A
 token whose prefix says the other product issued it (`agpat_` is Agent Gateway;
 `aspat_` and the older `atgpat_` are Agent Stream) is refused without a request.
-Whitespace around the token is ignored when its prefix is read. A host typed with
-`--host` or set in `FABRIC_HOST` makes the CLI ask the host which product it is, through
-`GET /api/v1/permissions/public` with no token: the key `pipes.view` exists only on
-Agent Stream, and a host that answers as the other product is refused. The host is asked
-even when the token has the command's own prefix, so an `agpat_` token is not sent to a typed
-host that answers as Agent Stream, nor an `aspat_` token to one that answers as Agent Gateway. A saved connection is never probed,
-since it already belongs to one product's store. When the probe cannot tell, a gateway
-command carries on and an Agent Stream command stops. Both refusals get their text from
+Whitespace around the token is ignored when its prefix is read. Otherwise the CLI asks
+the host which product it is, through `GET /api/v1/permissions/public` with no token, and
+refuses a host that answers as the other product: the key `pipes.view` exists only on
+Agent Stream. Each caller passes a `product::Given` saying whether the host and the token
+were given on this run, and `must_ask_host` in `product.rs` decides from it, so the
+callers cannot drift apart. The host is asked when it was typed with `--host` or set in
+`FABRIC_HOST`, even when the token has the command's own prefix, so an `agpat_` token is
+not sent to a typed host that answers as Agent Stream, nor an `aspat_` token to one that
+answers as Agent Gateway. A saved connection's host is asked too when the token was given
+with `--token` or `FABRIC_TOKEN` and has no product's prefix, such as a browser session
+token, so a session of one product exported in `FABRIC_TOKEN` is not sent to a saved
+connection of the other. A saved connection is not asked when the command uses its saved
+token, which was checked against the host at login, or a given token with the command's
+own prefix. When the probe cannot tell, a gateway command carries on and an Agent Stream
+command stops. Both refusals get their text from
 `wrong_product_message`, which never sees the token and names the command group to use
 for the other product, such as `fabric agent-stream ...`.
 
@@ -339,7 +346,7 @@ The shell runs `inline_secret_warnings` on every line and keeps a line that trig
 out of its history. `login --paste` prompts without echo. Warnings that would repeat on
 every line, such as the plain-http warning for a saved host, are shown once per process through
 `first_warning_for` and the `WARNED_ONCE` list in `commands.rs`. In a binary built with
-the `agent-stream` feature, the question of which product a typed host is gets asked
+the `agent-stream` feature, the question of which product a host is gets asked
 once per shell as well, through `product::remembering_probes`.
 
 ### Browser login

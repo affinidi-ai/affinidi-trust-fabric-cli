@@ -26,7 +26,7 @@ use crate::{
     },
     config::Config,
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
-    product::{self, Product},
+    product::{self, Given, Product},
 };
 
 /// What the interactive shell shows when it was opened with
@@ -233,6 +233,17 @@ struct Globals {
     output: Output,
 }
 
+impl Globals {
+    /// Which of the host and token were given on this run, for
+    /// [`product::check_product`].
+    fn given(&self) -> Given {
+        Given {
+            host: self.host.is_some(),
+            token: self.token.is_some(),
+        }
+    }
+}
+
 impl AgentStreamArgs {
     /// Whether this is `fabric agent-stream shell`.
     pub fn is_shell(&self) -> bool {
@@ -386,7 +397,7 @@ async fn connect(
              {name} --host {host}`"
         )
     })?;
-    product::check_product(Product::AgentStream, &host, Some(&token), globals.host.is_some()).await?;
+    product::check_product(Product::AgentStream, &host, Some(&token), globals.given()).await?;
     GatewayClient::for_agent_stream(host, token)
 }
 
@@ -902,6 +913,64 @@ mod tests {
             assert!(request.starts_with("GET /api/v1/permissions/public HTTP/1.1"), "{request}");
             assert!(!sends_bearer(request, ACCESS_TOKEN), "{request}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_given_session_token_never_reaches_a_saved_connection_that_answers_as_agent_gateway() {
+        let (gateway, requests) = scripted_agent_stream(vec![GATEWAY_PERMISSIONS, PROFILE, TOKEN_LIST]).await;
+
+        for words in [vec!["tokens", "list"], vec!["api", "get", "/v1/access-tokens"], vec!["whoami"]] {
+            let (saved, credentials) = saved_login(&gateway, ACCESS_TOKEN);
+            let line: Vec<&str> = ["--token", SESSION_TOKEN]
+                .into_iter()
+                .chain(words.iter().copied())
+                .collect();
+            let error = run_stream(&line, saved, &credentials)
+                .await
+                .expect_err("a given session token must not reach a saved Agent Gateway host");
+
+            let text = format!("{error:#}");
+            assert!(text.contains(&format!("{gateway} is an Agent Gateway, not an Agent Stream")), "{words:?}: {text}");
+            assert!(!text.contains(SESSION_TOKEN), "{words:?}: {text}");
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert!(request.starts_with("GET /api/v1/permissions/public HTTP/1.1"), "{request}");
+            assert!(!sends_bearer(request, SESSION_TOKEN), "{request}");
+            assert!(!sends_bearer(request, ACCESS_TOKEN), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_given_session_token_on_a_saved_agent_stream_is_sent_after_the_host_answers() {
+        let (host, requests) = scripted_agent_stream(vec![STREAM_PERMISSIONS, TOKEN_LIST]).await;
+        let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+
+        run_stream(&["--token", SESSION_TOKEN, "tokens", "list"], saved, &credentials)
+            .await
+            .expect("the saved host answers as Agent Stream");
+
+        assert_eq!(
+            start_lines(&requests),
+            ["GET /api/v1/permissions/public HTTP/1.1", "GET /api/v1/access-tokens HTTP/1.1"]
+        );
+        let requests = requests.lock().unwrap();
+        assert!(!sends_bearer(&requests[0], SESSION_TOKEN), "{}", requests[0]);
+        assert!(sends_bearer(&requests[1], SESSION_TOKEN), "{}", requests[1]);
+    }
+
+    #[tokio::test]
+    async fn a_given_access_token_on_a_saved_agent_stream_is_sent_without_asking_the_host() {
+        let (host, requests) = scripted_agent_stream(vec![TOKEN_LIST]).await;
+        let (saved, credentials) = saved_login(&host, SESSION_TOKEN);
+
+        run_stream(&["--token", ACCESS_TOKEN, "tokens", "list"], saved, &credentials)
+            .await
+            .expect("the access token's prefix says Agent Stream");
+
+        assert_eq!(start_lines(&requests), ["GET /api/v1/access-tokens HTTP/1.1"]);
     }
 
     #[tokio::test]

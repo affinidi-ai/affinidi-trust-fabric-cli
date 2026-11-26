@@ -20,7 +20,7 @@ use crate::{
     },
     config::{Config, Connection, normalize_user_host, saved_host_http_warning},
     credentials::CredentialStore,
-    product::{self, Product},
+    product::{self, Given, Product},
 };
 
 #[derive(Debug, Args)]
@@ -88,10 +88,10 @@ pub async fn login(
         globals.flags.allow_http,
     )?;
     let source = token_source(globals.token.is_some(), &args, io::stdin().is_terminal())?;
-    product::check_product(Product::AgentStream, &host, globals.token.as_deref(), true).await?;
+    product::check_product(Product::AgentStream, &host, globals.token.as_deref(), globals.given()).await?;
     let token = acquire_token(source, globals.token.as_deref())?;
     // The host has answered by now, so only the token's prefix is left to check.
-    product::check_product(Product::AgentStream, &host, Some(&token), false).await?;
+    product::check_product(Product::AgentStream, &host, Some(&token), Given::default()).await?;
     let client = GatewayClient::for_agent_stream(&host, &token)?;
     let checked = check_token(&client, &token)
         .await
