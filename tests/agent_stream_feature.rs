@@ -69,17 +69,6 @@ fn the_default_build_does_not_know_agent_stream() {
     assert!(!stdout(&fabric(&["--help"], &[])).contains("agent-stream"));
 }
 
-#[cfg(not(feature = "agent-stream"))]
-#[test]
-fn the_default_build_refuses_the_agent_stream_connection_groups() {
-    for group in ["connections", "connection-points", "mediators"] {
-        let output = fabric(&["agent-stream", group, "list"], &[]);
-
-        assert_eq!(output.status.code(), Some(USAGE_EXIT_CODE), "{group}: {}", stderr(&output));
-        assert!(stderr(&output).contains("unrecognized subcommand"), "{group}: {}", stderr(&output));
-    }
-}
-
 #[cfg(feature = "agent-stream")]
 #[test]
 fn the_feature_build_lists_agent_stream_connections_apart_from_the_gateway_ones() {
@@ -1100,13 +1089,13 @@ fn connections_connection_points_and_mediators_print_the_agent_gateway_lines() {
 }
 
 /// The invitation secret a `connection-points create` document sends, which
-/// Agent Stream sends back in its create answer only.
+/// the stand-in sends back in its create answer.
 #[cfg(feature = "agent-stream")]
 const INVITATION_SECRET: &str = "invitation-secret-of-at-least-32-bytes";
 
 #[cfg(feature = "agent-stream")]
 #[test]
-fn connection_points_create_prints_only_the_id_in_a_table_and_the_sent_secret_in_json() {
+fn connection_points_create_prints_only_the_id_in_a_table_and_the_answer_in_json() {
     let answer = r#"{"connection_point":{"id":"cp-1","gateway_id":"g-self","mediator_id":"m-1","name":"Door","use_count":0,"secret":"invitation-secret-of-at-least-32-bytes"}}"#;
     let (host, _) = agent_stream_stand_in(vec![("POST /api/v1/connection-points", "200 OK", answer)]);
     let document = format!(

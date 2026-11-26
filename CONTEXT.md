@@ -26,7 +26,7 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 | **Personal access token** (_PAT_) | A long-lived token starting with `agpat_`, for scripts and CI. Its authority is the user's role, narrowed by the token's scopes. Managed with `fabric agent-gateway tokens`. |
 | **Agent Stream access token** | A long-lived token starting with `aspat_` (or the older `atgpat_`), for scripts and CI against an Agent Stream. Its authority is the user's role, narrowed by the token's scopes. Managed with `fabric agent-stream tokens`; `fabric agent-stream logout` removes only the local copy, so the token stays valid until it is revoked. Only in builds with the `agent-stream` feature. |
 | **OS credential store** | The macOS Keychain, Windows Credential Manager, or Linux Secret Service, where the CLI keeps tokens. Tokens are never written to the configuration file. |
-| **Gateway connection** | A gateway-to-gateway link managed with `fabric agent-gateway connections`. Unrelated to a connection profile. |
+| **Gateway connection** (_Trust Fabric connection_ on Agent Stream) | A gateway-to-gateway link managed with `fabric agent-gateway connections`. On Agent Stream it is called a Trust Fabric connection: the record of this Agent Stream (type `self`) or of a peer it connects to (type `remote`), managed with `fabric agent-stream connections` in builds with the `agent-stream` feature. Unrelated to a connection profile. |
 
 ## Agent Surfaces
 

@@ -13,15 +13,15 @@ pub enum ConnectionPointCommand {
     /// List connection points.
     ///
     /// Lists the connection points users created; the ones Agent Stream
-    /// creates for a connection are left out. Needs the
-    /// `connection_points.view` permission. No answer but create's carries
-    /// the invitation secret.
+    /// creates for a connection are left out. No answer but create's carries
+    /// the invitation secret. `get` and --output json print every field Agent
+    /// Stream sends. Needs the connection_points.view permission.
     List,
     /// Get a connection point by ID.
     ///
     /// The ID is the ID column of `fabric agent-stream connection-points
     /// list`. It is sent as given: a name is not looked up. Needs the
-    /// `connection_points.view` permission.
+    /// connection_points.view permission.
     Get {
         /// Connection point ID, as `list` prints it.
         id: String,
@@ -36,12 +36,14 @@ pub enum ConnectionPointCommand {
     /// `expiry_seconds`, `did_method` (`web`, the default, `peer`, or
     /// `webvh`), and `integrations`, a list of objects with `integration_id`
     /// and `variables`. `integration_id` and `integration_variables` are an
-    /// older form of one integration. Needs the `connection_points.edit`
+    /// older form of one integration. Needs the connection_points.edit
     /// permission.
     ///
     /// Table output prints only the new connection point's ID. With --output
-    /// json the answer is printed as Agent Stream sent it, which includes the
-    /// `secret` you sent; no other answer carries it.
+    /// json the answer is printed as Agent Stream sent it. Keep the secret
+    /// from your own document: the answer's `secret` may show it encrypted
+    /// when Agent Stream encrypts stored fields, and no other answer carries
+    /// it.
     #[command(after_long_help = CREATE_EXAMPLES)]
     Create(JsonFileArgs),
     /// Update a connection point from a JSON document.
@@ -50,7 +52,7 @@ pub enum ConnectionPointCommand {
     /// integration list, and ignores other fields. It reads the integration
     /// list as `integration_integrations`, not as the `integrations` field
     /// `get` prints, so send only the fields you change rather than editing
-    /// `get` output. Needs the `connection_points.edit` permission.
+    /// `get` output. Needs the connection_points.edit permission.
     #[command(after_long_help = UPDATE_EXAMPLES)]
     Update {
         /// Connection point ID, as `list` prints it.
@@ -64,7 +66,7 @@ pub enum ConnectionPointCommand {
     ///
     /// It runs at once, with no confirmation prompt. Agent Stream stops the
     /// connection point's listener, then deletes it. Needs the
-    /// `connection_points.delete` permission.
+    /// connection_points.delete permission.
     Delete {
         /// Connection point ID, as `list` prints it.
         id: String,

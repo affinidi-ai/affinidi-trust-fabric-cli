@@ -223,9 +223,7 @@ enum AgentStreamCommand {
     /// the peers it connects to.
     ///
     /// These are the records under `/v1/gateways`, not the saved connections
-    /// of `fabric agent-stream config`. Reading them needs the `gateways.view`
-    /// permission, create and update `gateways.edit`, and delete
-    /// `gateways.delete`.
+    /// of `fabric agent-stream config`.
     Connections {
         #[command(subcommand)]
         command: connections::ConnectionCommand,
@@ -233,17 +231,16 @@ enum AgentStreamCommand {
     /// Manage connection points, the DIDComm invitations other appliances use
     /// to connect to this Agent Stream.
     ///
-    /// Each one holds a secret that a peer must know to accept it, which only
-    /// the create answer carries.
+    /// Each one holds a secret that a peer must know to accept it. Keep it
+    /// from the document you create the connection point with: only the
+    /// create answer carries it, and that one may show it encrypted when
+    /// Agent Stream encrypts stored fields.
     #[command(name = "connection-points")]
     ConnectionPoints {
         #[command(subcommand)]
         command: connection_points::ConnectionPointCommand,
     },
     /// Manage DIDComm mediator records.
-    ///
-    /// Reading them needs the `mediators.view` permission, create and update
-    /// `mediators.edit`, and delete `mediators.delete`.
     Mediators {
         #[command(subcommand)]
         command: mediators::MediatorCommand,
@@ -1584,6 +1581,54 @@ mod tests {
         }
     }
 
+    /// The prose of a help text, without the names Agent Stream reads, sends,
+    /// or checks: a name in backticks, such as `gateways` in the `policies
+    /// impact` answer, a JSON key in an example document, such as
+    /// "gateway_id", and a permission, such as gateways.view.
+    fn help_prose(text: &str) -> String {
+        let unticked: String = text
+            .split('`')
+            .step_by(2)
+            .collect();
+        let parts: Vec<&str> = unticked.split('"').collect();
+        let without_keys: String = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, part)| {
+                let quoted = index % 2 == 1;
+                let is_key = parts
+                    .get(index + 1)
+                    .is_some_and(|after| after.starts_with(':'));
+                !(quoted && is_key && is_field_name(part))
+            })
+            .map(|(_, part)| *part)
+            .collect();
+        without_keys
+            .split_whitespace()
+            .filter(|word| !is_permission(word.trim_end_matches([',', '.', ';', ')'])))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn is_field_name(word: &str) -> bool {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '_')
+    }
+
+    fn is_permission(word: &str) -> bool {
+        word.split_once('.')
+            .is_some_and(|(resource, action)| is_field_name(resource) && matches!(action, "view" | "edit" | "delete"))
+    }
+
+    #[test]
+    fn help_prose_drops_json_keys_and_permissions_but_keeps_quoted_words() {
+        assert_eq!(help_prose(r#"{"gateway_id": "g-1"}"#), "{: g-1}");
+        assert_eq!(help_prose("Needs the gateways.view permission."), "Needs the permission.");
+        assert_eq!(help_prose(r#"the "gateway" record"#), "the gateway record");
+    }
+
     #[test]
     fn the_shared_groups_help_never_names_agent_gateway() {
         use clap::CommandFactory;
@@ -1600,24 +1645,10 @@ mod tests {
                     .unwrap_or_else(|| panic!("{group}")),
             );
             for text in texts {
-                // A field name in backticks, such as `gateways` in the
-                // `policies impact` answer, or quoted as a JSON key in an
-                // example document, such as "gateway_id", is what Agent
-                // Stream reads or sends, but a command in backticks still
-                // never names the other product.
-                let prose: String = text
-                    .split('`')
-                    .step_by(2)
-                    .collect::<String>()
-                    .split('"')
-                    .filter(|part| {
-                        part.is_empty()
-                            || !part
-                                .chars()
-                                .all(|character| character.is_ascii_lowercase() || character == '_')
-                    })
-                    .collect();
-                let lower = prose.to_ascii_lowercase();
+                // `help_prose` drops the names Agent Stream reads, sends, or
+                // checks, but a command in backticks still never names the
+                // other product.
+                let lower = help_prose(&text).to_ascii_lowercase();
                 assert!(!lower.contains("gateway"), "{group}: {text}");
                 assert!(!lower.contains("agent surface"), "{group}: {text}");
                 assert!(

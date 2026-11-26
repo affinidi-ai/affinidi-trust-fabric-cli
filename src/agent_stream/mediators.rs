@@ -10,11 +10,17 @@ use crate::commands::{self, JsonFileArgs};
 #[derive(Debug, Subcommand)]
 pub enum MediatorCommand {
     /// List mediators.
+    ///
+    /// `get` and --output json print every field Agent Stream sends. Any
+    /// signed-in user can read mediators; an access token with its own scope
+    /// list needs mediators.view.
     List,
     /// Get a mediator by ID.
     ///
     /// The ID is the ID column of `fabric agent-stream mediators list`. It is
-    /// sent as given: a name is not looked up.
+    /// sent as given: a name is not looked up. Any signed-in user can read
+    /// mediators; an access token with its own scope list needs
+    /// mediators.view.
     Get {
         /// Mediator ID, as `list` prints it.
         id: String,
@@ -26,7 +32,7 @@ pub enum MediatorCommand {
     /// resolves the DID itself. It checks the mediator's DID document before
     /// saving and refuses one it cannot use. It also makes a new did:peer to
     /// talk to the mediator with, shown as `our_did`; its keys are never in
-    /// an answer.
+    /// an answer. Needs the mediators.edit permission.
     #[command(after_long_help = CREATE_EXAMPLES)]
     Create(JsonFileArgs),
     /// Update a mediator from a JSON document.
@@ -34,7 +40,7 @@ pub enum MediatorCommand {
     /// Agent Stream changes only `name`, `description`, `did`, and `status`
     /// (`active` or `disabled`), and ignores other fields. It checks the
     /// mediator's DID document again before saving and refuses the change
-    /// when it cannot use it.
+    /// when it cannot use it. Needs the mediators.edit permission.
     #[command(after_long_help = UPDATE_EXAMPLES)]
     Update {
         /// Mediator ID, as `list` prints it.
@@ -48,7 +54,7 @@ pub enum MediatorCommand {
     ///
     /// It runs at once, with no confirmation prompt. Agent Stream stops the
     /// listeners of the connection points that use the mediator, but keeps
-    /// those connection points.
+    /// those connection points. Needs the mediators.delete permission.
     Delete {
         /// Mediator ID, as `list` prints it.
         id: String,

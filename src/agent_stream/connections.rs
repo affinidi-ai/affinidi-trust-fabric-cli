@@ -13,12 +13,18 @@ pub enum ConnectionCommand {
     ///
     /// Each record's type is `self` for this Agent Stream or `remote` for a
     /// peer. Its status is `active`, `pending`, `awaiting-approval`,
-    /// `disabled`, or `failed`.
+    /// `disabled`, or `failed`. --output json prints every field Agent Stream
+    /// sends, including `runtime_status`, the connection health only the list
+    /// answer may carry; `get` prints the stored record. Any signed-in user
+    /// can read connections; an access token with its own scope list needs
+    /// gateways.view.
     List,
     /// Get a connection by ID.
     ///
     /// The ID is the ID column of `fabric agent-stream connections list`. It
-    /// is sent as given: a name is not looked up.
+    /// is sent as given: a name is not looked up. Any signed-in user can read
+    /// connections; an access token with its own scope list needs
+    /// gateways.view.
     Get {
         /// Connection ID, as `list` prints it.
         id: String,
@@ -27,7 +33,8 @@ pub enum ConnectionCommand {
     ///
     /// The document carries `name`, `description`, and `did`, the peer's
     /// DID. The record is created with the type `remote`. Table output prints
-    /// the new record's ID; --output json prints the whole record.
+    /// the new record's ID; --output json prints the whole record. Needs the
+    /// gateways.edit permission.
     #[command(after_long_help = CREATE_EXAMPLES)]
     Create(JsonFileArgs),
     /// Update a connection from a JSON document.
@@ -35,6 +42,7 @@ pub enum ConnectionCommand {
     /// Agent Stream changes only `name`, `description`, and `status`, and
     /// ignores other fields, so the DID cannot change. `status` is one of
     /// `active`, `pending`, `awaiting-approval`, `disabled`, or `failed`.
+    /// Needs the gateways.edit permission.
     #[command(after_long_help = UPDATE_EXAMPLES)]
     Update {
         /// Connection ID, as `list` prints it.
@@ -49,7 +57,8 @@ pub enum ConnectionCommand {
     /// It runs at once, with no confirmation prompt. Agent Stream refuses to
     /// delete the `self` record. Deleting a `remote` record stops the
     /// listeners of its connection points and deletes the connection points
-    /// Agent Stream created for it; the ones a user created are kept.
+    /// Agent Stream created for it; the ones a user created are kept. Needs
+    /// the gateways.delete permission.
     Delete {
         /// Connection ID, as `list` prints it.
         id: String,
