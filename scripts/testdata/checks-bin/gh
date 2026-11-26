@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stands in for `gh api <runs of the checks workflow> --jq <expr>` in
+# scripts/test-release-scripts.sh. It answers only the request for the checks
+# workflow's runs of the push of FAKE_GH_SHA to main in example/repo, with the
+# runs in the JSON file FAKE_GH_RUNS. FAKE_GH_FAIL=1 makes it fail as a
+# network error would.
+set -euo pipefail
+
+: "${FAKE_GH_SHA:?}" "${FAKE_GH_RUNS:?}"
+expected="repos/example/repo/actions/workflows/checks.yaml/runs?branch=main&event=push&head_sha=${FAKE_GH_SHA}&per_page=100"
+if [ "$#" -ne 4 ] || [ "$1 $2 $3" != "api ${expected} --jq" ]; then
+  echo "fake gh: unexpected arguments: $*" >&2
+  exit 2
+fi
+if [ -n "${FAKE_GH_FAIL:-}" ]; then
+  echo "fake gh: connection reset" >&2
+  exit 1
+fi
+jq --raw-output "$4" "${FAKE_GH_RUNS}"

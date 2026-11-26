@@ -13,7 +13,10 @@
 # or a newer one, and stops when main's version isn't X.Y.Z, and
 # scripts/sign-macos.sh stops on a bad argument or setting before it needs a
 # Mac, and scripts/push-release-notes.sh pushes a release's missing git note
-# again, retrying a refused push, and leaves every other failure alone. Run by .github/workflows/checks.yaml; the working tree is never changed.
+# again, retrying a refused push, and leaves every other failure alone, and
+# scripts/checks-passed.sh passes only when the newest checks run of the push
+# of a commit to main passed. Run by .github/workflows/checks.yaml; the working
+# tree is never changed.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -678,6 +681,93 @@ check_notes_run "when semantic-release made no note" 2 0
 setup_notes_repo 0
 if (cd "${notes_repo}" && "${root}/scripts/push-release-notes.sh" 'v9.9.9;true') > "${work_dir}/push-release-notes.log" 2>&1; then
   fail "push-release-notes.sh passed with the tag 'v9.9.9;true'"
+fi
+
+# checks-passed.sh asks GitHub for the checks runs of a commit.
+# scripts/testdata/checks-bin/gh answers only the request for the checks
+# workflow's runs of the push of checks_sha to main, with the runs in
+# checks_runs, so a request for any other workflow, commit, event or branch
+# fails.
+checks_sha="0123456789abcdef0123456789abcdef01234567"
+checks_runs="${work_dir}/checks-runs.json"
+
+# Prints one run as GitHub lists it: run number, status, conclusion, and
+# optionally the commit, branch, event and repository when they differ.
+checks_run() {
+  jq --null-input --compact-output \
+    --argjson number "$1" --arg status "$2" --arg conclusion "$3" \
+    --arg sha "${4:-${checks_sha}}" --arg branch "${5:-main}" --arg event "${6:-push}" \
+    --arg repo "${7:-example/repo}" \
+    '{run_number: $number, status: $status, conclusion: (if $conclusion == "" then null else $conclusion end),
+      head_sha: $sha, head_branch: $branch, event: $event, head_repository: {full_name: $repo},
+      html_url: "https://github.com/example/repo/actions/runs/\($number)"}'
+}
+# Writes the given runs to checks_runs.
+set_checks_runs() {
+  jq --slurp '{total_count: length, workflow_runs: .}' <<< "$(printf '%s\n' "$@")" > "${checks_runs}"
+}
+run_checks_passed() {
+  env "PATH=${testdata}/checks-bin:${PATH}" GH_TOKEN=test-token GITHUB_REPOSITORY=example/repo \
+    "FAKE_GH_SHA=${checks_sha}" "FAKE_GH_RUNS=${checks_runs}" "$@" \
+    > "${work_dir}/checks-passed.log" 2>&1
+}
+check_checks_pass() {
+  if ! run_checks_passed "${root}/scripts/checks-passed.sh" "${checks_sha}"; then
+    fail "checks-passed.sh stopped $1:"
+    cat "${work_dir}/checks-passed.log" >&2
+  fi
+}
+check_checks_stop() {
+  local what="$1"
+  shift
+  if run_checks_passed "$@" "${root}/scripts/checks-passed.sh" "${checks_sha}"; then
+    fail "checks-passed.sh passed ${what}"
+  elif [ "$#" -eq 0 ] && ! grep -q "^::error::" "${work_dir}/checks-passed.log"; then
+    fail "checks-passed.sh stopped ${what} without an error that says why"
+  fi
+}
+
+set_checks_runs "$(checks_run 7 completed success)"
+check_checks_pass "when the checks passed"
+check_checks_stop "when GitHub couldn't be asked" FAKE_GH_FAIL=1
+check_checks_stop "when it asks GitHub about another commit" \
+  FAKE_GH_SHA=fedcba9876543210fedcba9876543210fedcba98
+set_checks_runs "$(checks_run 7 completed failure)"
+check_checks_stop "when the checks failed"
+set_checks_runs "$(checks_run 7 completed cancelled)"
+check_checks_stop "when the checks were cancelled"
+set_checks_runs "$(checks_run 7 in_progress "")"
+check_checks_stop "when the checks are still running"
+set_checks_runs "$(checks_run 7 queued "")"
+check_checks_stop "when the checks are queued"
+set_checks_runs "$(checks_run 7 in_progress success)"
+check_checks_stop "when the checks are still running with a conclusion left from before"
+set_checks_runs
+check_checks_stop "when the checks never ran"
+
+# Only the newest run of the commit counts, in whatever order GitHub lists them.
+set_checks_runs "$(checks_run 7 completed success)" "$(checks_run 9 completed failure)"
+check_checks_stop "when a newer run of the commit failed"
+set_checks_runs "$(checks_run 9 completed success)" "$(checks_run 7 completed failure)"
+check_checks_pass "when the newest run of the commit passed"
+
+# A passing run of anything but the push of that commit to main doesn't count,
+# even if GitHub answered with it.
+set_checks_runs "$(checks_run 7 completed success fedcba9876543210fedcba9876543210fedcba98)"
+check_checks_stop "on a run of another commit"
+set_checks_runs "$(checks_run 7 completed success "${checks_sha}" feature)"
+check_checks_stop "on a run on another branch"
+set_checks_runs "$(checks_run 7 completed success "${checks_sha}" main workflow_dispatch)"
+check_checks_stop "on a run by hand"
+set_checks_runs "$(checks_run 7 completed success "${checks_sha}" main push someone/fork)"
+check_checks_stop "on a run in another repository"
+
+set_checks_runs "$(checks_run 7 completed success)"
+if run_checks_passed "${root}/scripts/checks-passed.sh" 0123456; then
+  fail "checks-passed.sh passed a short commit sha"
+fi
+if run_checks_passed "${root}/scripts/checks-passed.sh"; then
+  fail "checks-passed.sh passed with no commit sha"
 fi
 
 if [ "${failures}" -ne 0 ]; then

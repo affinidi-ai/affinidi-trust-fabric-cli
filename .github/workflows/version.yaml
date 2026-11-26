@@ -6,9 +6,10 @@ name: version
 # to main through the GitHub API, which signs it, with the new version in
 # Cargo.toml and Cargo.lock and the notes in CHANGELOG.md. It then pushes the
 # tag `v<version>` on that commit, which starts the release workflow. See
-# scripts/release.sh. Run it by hand to retry a failed release, except when
-# only the release's git note is missing; CONTRIBUTING.md under Releasing has
-# the command for that.
+# scripts/release.sh. Run it by hand on main to retry a failed release, except
+# when only the release's git note is missing; CONTRIBUTING.md under Releasing
+# has the command for that. A run by hand releases only when the checks passed
+# on a push of main's commit, see scripts/checks-passed.sh.
 on:
   workflow_run:
     workflows:
@@ -19,9 +20,12 @@ on:
       - main
   workflow_dispatch:
 
-# The job token can only read. Every write goes through the release bot's token.
+# The job token can only read: the code, and every workflow's runs, logs, and
+# artifacts, which a run by hand needs to see the checks passed. Every write
+# goes through the release bot's token.
 permissions:
   contents: read
+  actions: read
 
 # Runs one at a time and never cancels a run that may be halfway through
 # pushing a release.
@@ -34,7 +38,8 @@ jobs:
     # Only checks that passed on a push to main in this repository count. The
     # bot's own release commit starts the checks again and is skipped here;
     # only a commit pushed by a bot is skipped, so a pull request title that
-    # looks like one still runs. A run by hand must be on main.
+    # looks like one still runs. A run by hand must be on main, and its first
+    # steps stop it unless the checks passed on that commit.
     if: >-
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
       (github.event.workflow_run.conclusion == 'success' &&
@@ -47,6 +52,23 @@ jobs:
     # use, so a workflow on another branch can't get the bot's token.
     environment: main
     steps:
+      # main doesn't need the checks to pass before a merge, so a run by hand
+      # stops here, before it gets the release bot's token, unless the newest
+      # checks run of the push of this commit to main passed. The checkout only
+      # needs the script; once the release bot is set up, its checkout below
+      # replaces it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check the checks passed
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/checks-passed.sh "${GITHUB_SHA}"
+
       # Until the release bot's secrets are set, the run passes with a notice
       # instead of failing every merge.
       - name: Check for the release bot
