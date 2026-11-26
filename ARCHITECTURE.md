@@ -411,17 +411,20 @@ that object unless `--allow-new-field` is given; a name inside an object the sur
 lacks, or inside a list item, is not checked. `create` has nothing stored to compare
 with, so it checks top-level names only. Flag paths with brackets or list positions,
 which only Agent Gateway paths use, and flags on `id`, `created_at`, `updated_at`,
-`tenant_id`, or `owner_user_id` are refused before the first read.
+`tenant_id`, or `owner_user_id` are refused before anything is read or sent, and so is any
+`update` flag on `status` other than `--set status=<value>`. Both commands refuse a
+surface without a text `pipe_type.type`.
 
 `update` reads the surface, builds the whole new surface on this machine, reads the
-surface again, and sends it with `PUT` only when `updated_at` has not moved. A `--file`
+surface again, and sends it with `PUT` only when `updated_at` has not moved. A surface
+with no `updated_at` is refused, since a later save could not be told apart. A `--file`
 must carry the current `updated_at`, and its `status`, `created_at`, `tenant_id`, and
 `owner_user_id` are replaced with the stored ones. After the save, table output lists
 the changed fields, and `--output json` reads the surface once more and prints it,
 because Agent Stream answers a save with an `updated_at` its store then replaces, so
 only a fresh read can go back to `--file`. A dry run of `create` or `update` prints the
 same JSON shape (`dry_run`, `changes`, `after`), and `create --dry-run` runs before any
-connection is resolved, so it needs no saved login.
+connection is resolved, so it needs no saved connection.
 
 ## Invariants
 

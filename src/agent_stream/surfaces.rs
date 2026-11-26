@@ -114,8 +114,15 @@ const FIXED_ON_UPDATE: [(&str, &str); 5] = [
     ("owner_user_id", "a surface can't move to another tenant or owner"),
 ];
 
-/// The fields `create --set` can't set, each with the flag that sets it.
-const FIXED_ON_CREATE: [(&str, &str); 2] = [("id", "use --id"), ("name", "use --name")];
+/// The fields `create --set` can't set, each with the reason.
+const FIXED_ON_CREATE: [(&str, &str); 6] = [
+    ("id", "use --id"),
+    ("name", "use --name"),
+    ("created_at", "the CLI sets it to the current time; give another in --file"),
+    ("updated_at", "Agent Stream sets it on every save"),
+    ("tenant_id", "give it in --file, where Agent Stream checks it against your token"),
+    ("owner_user_id", "Agent Stream sets it to the user who creates the surface"),
+];
 
 /// The fields of an `update --file` document that are replaced with the
 /// stored ones, each with the reason given when they differed.
@@ -130,8 +137,8 @@ const KEPT_FROM_STORED: [(&str, &str); 4] = [
 pub enum SurfaceCommand {
     /// List surfaces.
     ///
-    /// Deleted surfaces are left out. UPDATED is when the surface was last
-    /// saved. Use --output json for the full surfaces.
+    /// Agent Stream leaves deleted surfaces out of the list. UPDATED is when
+    /// the surface was last saved. Use --output json for the full surfaces.
     List,
     /// Get a surface by ID, as the whole JSON document Agent Stream keeps.
     ///
@@ -144,12 +151,13 @@ pub enum SurfaceCommand {
     /// Create a surface from flags or a complete JSON document.
     ///
     /// With flags, --name is required and --set fills any other field, such
-    /// as `pipe_type.type`. With --file, the document is sent as it is, apart
-    /// from the two fields the CLI adds when the document has none: `id`
-    /// (--id, else `s-` and 12 random hex digits) and `created_at` (the
-    /// current UTC time). An id holds letters, digits, `-`, and `_`, up to
-    /// 128 characters, and can't be one an earlier surface used, deleted ones
-    /// included.
+    /// as `pipe_type.type`, except `id`, `created_at`, `updated_at`,
+    /// `tenant_id`, and `owner_user_id`, which the CLI or Agent Stream sets.
+    /// With --file, the document is sent as it is, apart from the two fields
+    /// the CLI adds when the document has none: `id` (--id, else `s-` and 12
+    /// random hex digits) and `created_at` (the current UTC time). An id holds
+    /// letters, digits, `-`, and `_`, up to 128 characters, and can't be one
+    /// an earlier surface used, deleted ones included.
     ///
     /// Before anything is sent, the CLI checks that the surface has a
     /// `pipe_type.type`, is not marked deleted, and has only top-level field
@@ -158,7 +166,7 @@ pub enum SurfaceCommand {
     /// since there is no stored surface to compare them with.
     ///
     /// --dry-run prints the document and sends nothing, so it needs no saved
-    /// login; with --output json it prints the same preview as `update
+    /// connection; with --output json it prints the same preview as `update
     /// --dry-run`. Table output prints the new surface's id; --output json
     /// prints the surface Agent Stream answered with.
     #[command(after_long_help = CREATE_EXAMPLES)]
@@ -167,11 +175,13 @@ pub enum SurfaceCommand {
     /// with a JSON document.
     ///
     /// The CLI reads the surface, applies the change on this machine, and
-    /// checks the field names. It then reads the surface again, stops if it
-    /// was saved meanwhile, and otherwise sends the whole surface. Agent
-    /// Stream has no version check, so a save that lands in the short gap
-    /// between that last read and the send is still overwritten. A change
-    /// that leaves the surface as it is sends nothing.
+    /// checks the field names and that `pipe_type.type` is still there. It
+    /// then reads the surface again, stops if it was saved meanwhile, and
+    /// otherwise sends the whole surface. A surface with no `updated_at` is
+    /// refused, since the CLI can't tell whether it was saved meanwhile.
+    /// Agent Stream has no version check, so a save that lands in the short
+    /// gap between that last read and the send is still overwritten. A
+    /// change that leaves the surface as it is sends nothing.
     ///
     /// Field names are checked against the surface as read: a top-level name
     /// must be one Agent Stream knows, and a name inside an object the
@@ -179,8 +189,8 @@ pub enum SurfaceCommand {
     /// --allow-new-field is given. A name inside an object the surface does
     /// not have yet, or inside a list item, is not checked. The flags can't
     /// change `id`, `created_at`, `updated_at`, `tenant_id`, or
-    /// `owner_user_id`, and --set can't set `status` to `deleted`; use
-    /// `surfaces delete`.
+    /// `owner_user_id`. `status` changes only with --set status=enabled or
+    /// --set status=disabled; to delete the surface, use `surfaces delete`.
     ///
     /// --file must hold the `updated_at` the surface has now, so start it
     /// from `surfaces get` or from the --output json of an update; a copy
@@ -255,7 +265,7 @@ pub struct CreateArgs {
     #[arg(short, long)]
     file: Option<PathBuf>,
     /// Print the document that would be sent, and send nothing. Needs no
-    /// saved login.
+    /// saved connection.
     #[arg(long)]
     dry_run: bool,
 }
@@ -302,7 +312,7 @@ pub struct UpdateArgs {
 
 /// Runs one `surfaces` command. `connect` gives the client of the Agent
 /// Stream to talk to, and is only called for a command that sends something,
-/// so `create --dry-run` needs no saved login.
+/// so `create --dry-run` needs no saved connection.
 pub async fn run(
     command: SurfaceCommand,
     output: Output,
@@ -327,10 +337,7 @@ pub async fn run(
             print_list(&surfaces, output, &tables::AGENT_STREAM_SURFACES, Scope::All)
         }
         SurfaceCommand::Get { id } => {
-            let surface = client
-                .request(Method::GET, &surface_path(&id)?, None)
-                .await?;
-            println!("{}", pretty_json_for_terminal(&surface)?);
+            println!("{}", get(&client, &id).await?);
             Ok(())
         }
         SurfaceCommand::Create(args) => create(&client, args, output).await,
@@ -371,6 +378,17 @@ fn check_id(id: &str) -> Result<()> {
         bail!("a surface id can be at most {MAX_ID_LEN} characters");
     }
     Ok(())
+}
+
+/// The text `get` prints: the surface `id` as Agent Stream keeps it.
+async fn get(
+    client: &GatewayClient,
+    id: &str,
+) -> Result<String> {
+    let surface = client
+        .request(Method::GET, &surface_path(id)?, None)
+        .await?;
+    pretty_json_for_terminal(&surface)
 }
 
 /// A new surface id: `s-` and 12 random hex digits.
@@ -428,7 +446,7 @@ fn create_body(
     let mut body = match args.file {
         Some(file) => read_json(&file)?,
         None => {
-            check_flag_paths(&flag_paths(&args.set, &[], &[], &[]), &FIXED_ON_CREATE)?;
+            check_flag_paths(&surface_patch::flag_paths(&args.set, &[], &[], &[]), &FIXED_ON_CREATE)?;
             let name = args
                 .name
                 .context("--name is required without --file")?;
@@ -463,7 +481,17 @@ fn create_body(
     {
         fields.insert("created_at".to_owned(), Value::String(rfc3339_utc(now)));
     }
-    if body
+    check_pipe_type(&body)?;
+    if status_of(&body) == Some(STATUS_DELETED) {
+        bail!("a new surface can't have `status` set to `deleted`");
+    }
+    Ok((id, body))
+}
+
+/// Refuses a surface without a text `pipe_type.type`, which Agent Stream
+/// can't read.
+fn check_pipe_type(surface: &Value) -> Result<()> {
+    if surface
         .pointer("/pipe_type/type")
         .and_then(Value::as_str)
         .is_none()
@@ -473,10 +501,7 @@ fn create_body(
              it; with flags, add --set pipe_type.type=webhook --set pipe_type.endpoint=<url>"
         );
     }
-    if status_of(&body) == Some(STATUS_DELETED) {
-        bail!("a new surface can't have `status` set to `deleted`");
-    }
-    Ok((id, body))
+    Ok(())
 }
 
 /// Changes the surface and returns the text to print, if any: the changes in
@@ -488,10 +513,18 @@ async fn update(
     output: Output,
 ) -> Result<Option<String>> {
     let path = surface_path(&args.id)?;
-    check_flag_paths(&flag_paths(&args.set, &args.unset, &args.add, &args.remove), &FIXED_ON_UPDATE)?;
+    let paths = surface_patch::flag_paths(&args.set, &args.unset, &args.add, &args.remove);
+    check_flag_paths(&paths, &FIXED_ON_UPDATE)?;
+    check_status_flags(&paths)?;
     let before = read_live_surface(client, &path, &args.id).await?;
     let after = match args.file {
-        Some(file) => replacement(read_json(&file)?, &before, &args.id, args.allow_new_field)?,
+        Some(file) => {
+            let replaced = replacement(read_json(&file)?, &before, &args.id, args.allow_new_field)?;
+            for note in &replaced.notes {
+                eprintln!("{note}");
+            }
+            replaced.surface
+        }
         None => {
             let patch = surface_patch::build_patch(&args.set, &args.unset, &args.add, &args.remove, &before)?;
             check_patch_fields(&patch, &before, args.allow_new_field)?;
@@ -503,6 +536,7 @@ async fn update(
             after
         }
     };
+    check_pipe_type(&after)?;
     let changes = surface_validate::changes(&before, &after);
     if args.dry_run {
         return preview_update(&changes, &after, output).map(Some);
@@ -545,7 +579,7 @@ async fn update(
 }
 
 /// Reads the surface at `path` as Agent Stream has it now, refusing one that
-/// is deleted.
+/// is deleted or has no `updated_at` to tell a later save by.
 async fn read_live_surface(
     client: &GatewayClient,
     path: &str,
@@ -559,6 +593,12 @@ async fn read_live_surface(
     }
     if status_of(&surface) == Some(STATUS_DELETED) {
         bail!("surface '{id}' is deleted, so it can't be changed");
+    }
+    if present(&surface, "updated_at").is_none() {
+        bail!(
+            "surface '{id}' has no `updated_at`, so the CLI can't tell whether someone else saves it meanwhile; \
+             nothing was saved"
+        );
     }
     Ok(surface)
 }
@@ -577,41 +617,6 @@ fn present<'a>(
     surface
         .get(field)
         .filter(|value| !value.is_null())
-}
-
-/// Each flag of an edit with the field path it names, split as
-/// [`surface_patch::build_patch`] splits it: at the first `=` of a --set, the
-/// first `=` outside square brackets of an --add or --remove, and the whole
-/// of an --unset.
-fn flag_paths<'a>(
-    sets: &'a [String],
-    unsets: &'a [String],
-    adds: &'a [String],
-    removes: &'a [String],
-) -> Vec<(&'static str, &'a str)> {
-    let before_value = |given: &'a String| {
-        given
-            .split_once('=')
-            .map_or(given.as_str(), |(path, _)| path)
-    };
-    let before_item = |given: &'a String| surface_patch::split_flag(given).map_or(given.as_str(), |(path, _)| path);
-    sets.iter()
-        .map(|given| ("--set", before_value(given)))
-        .chain(
-            unsets
-                .iter()
-                .map(|given| ("--unset", given.as_str())),
-        )
-        .chain(
-            adds.iter()
-                .map(|given| ("--add", before_item(given))),
-        )
-        .chain(
-            removes
-                .iter()
-                .map(|given| ("--remove", before_item(given))),
-        )
-        .collect()
 }
 
 /// Refuses, before anything is read, a flag path an Agent Stream surface
@@ -659,18 +664,46 @@ fn check_flag_paths(
     Ok(())
 }
 
+/// Refuses, before anything is read, a flag on `status` other than `--set
+/// status=<value>`: Agent Stream reads a surface with no `status` as enabled,
+/// so an --unset would turn a disabled surface back on, and a nested path
+/// would replace the status with an object Agent Stream can't read.
+fn check_status_flags(paths: &[(&str, &str)]) -> Result<()> {
+    for (flag, path) in paths {
+        let top = path
+            .split_once('.')
+            .map_or(*path, |(top, _)| top);
+        if top == "status" && (*flag != "--set" || *path != "status") {
+            bail!(
+                "{flag} can't change `{}`: change `status` with --set status=<enabled|disabled>, or run `surfaces \
+                 delete`",
+                tables::flatten(path)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// An `update --file` document ready to send, with the notes to print on
+/// standard error.
+struct Replacement {
+    surface: Value,
+    /// One line for each field of [`KEPT_FROM_STORED`] whose value in --file
+    /// differed from the stored one.
+    notes: Vec<String>,
+}
+
 /// The --file document of `update`, ready to send in place of `stored`. Its
 /// field names are checked against `stored` as the flags' are, its `id` must
 /// be `id` (and is set when missing), and its `updated_at` must be the stored
-/// one, missing on both counting as equal. The fields of
-/// [`KEPT_FROM_STORED`] are replaced with the stored ones, with a note on
-/// standard error for each that differed.
+/// one. The fields of [`KEPT_FROM_STORED`] are replaced with the stored ones,
+/// with a note for each that differed.
 fn replacement(
     mut file: Value,
     stored: &Value,
     id: &str,
     allow_new_field: bool,
-) -> Result<Value> {
+) -> Result<Replacement> {
     let fields = file
         .as_object_mut()
         .context("the --file document must be a JSON object")?;
@@ -694,20 +727,24 @@ fn replacement(
              `fabric agent-stream surfaces get {id}` again and edit that copy"
         );
     }
+    let mut notes = Vec::new();
     for (field, reason) in KEPT_FROM_STORED {
         let kept = present(stored, field);
         let given = fields
             .get(field)
             .filter(|value| !value.is_null());
         if given.is_some() && given != kept {
-            eprintln!("note: the `{field}` in --file was replaced with the stored one ({}); {reason}", describe(kept));
+            notes.push(format!(
+                "note: the `{field}` in --file was replaced with the stored one ({}); {reason}",
+                describe(kept)
+            ));
         }
         match kept {
             Some(value) => fields.insert(field.to_owned(), value.clone()),
             None => fields.remove(field),
         };
     }
-    Ok(file)
+    Ok(Replacement { surface: file, notes })
 }
 
 /// Refuses a top-level field name Agent Stream does not know, so it is not
@@ -962,6 +999,8 @@ mod tests {
     const STORED: &str = r#"{"id":"s-1","name":"Sales","pipe_type":{"type":"webhook","endpoint":"https://hooks.example/in"},"status":"enabled","tenant_id":"t-1","owner_user_id":"u-1","route":"/sales","judge":{"enabled":true,"mode":"llm","llm":{"provider_type":"openai","model":"m-1","endpoint_url":"https://llm.example/v1","timeout_secs":30},"strictness":"balanced"},"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-20T10:00:00Z"}"#;
     const MOVED: &str = r#"{"id":"s-1","name":"Sales","pipe_type":{"type":"webhook","endpoint":"https://hooks.example/in"},"status":"enabled","tenant_id":"t-1","owner_user_id":"u-1","route":"/sales","judge":{"enabled":true,"mode":"llm","llm":{"provider_type":"openai","model":"m-1","endpoint_url":"https://llm.example/v1","timeout_secs":30},"strictness":"balanced"},"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-20T10:05:00Z"}"#;
     const DELETED: &str = r#"{"id":"s-1","name":"Sales","pipe_type":{"type":"webhook","endpoint":"https://hooks.example/in"},"status":"deleted","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-20T10:00:00Z"}"#;
+    /// A surface with no `updated_at`, which Agent Stream's store never saves.
+    const UNSTAMPED: &str = r#"{"id":"s-1","name":"Sales","pipe_type":{"type":"webhook","endpoint":"https://hooks.example/in"},"status":"enabled","created_at":"2026-11-01T00:00:00Z"}"#;
     /// A surface from a newer Agent Stream, with a top-level field this CLI
     /// does not list.
     const NEWER: &str = r#"{"id":"s-1","name":"Sales","pipe_type":{"type":"webhook","endpoint":"https://hooks.example/in"},"status":"enabled","shadow_mode":false,"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-20T10:00:00Z"}"#;
@@ -973,6 +1012,7 @@ mod tests {
     const GET_STORED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", STORED);
     const GET_MOVED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", MOVED);
     const GET_DELETED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", DELETED);
+    const GET_UNSTAMPED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", UNSTAMPED);
     const GET_NEWER: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", NEWER);
     const PUT_SAVED: Route = ("PUT /api/v1/pipes/s-1", "HTTP/1.1 200 OK", STORED);
     /// The answer to a save, with an `updated_at` Agent Stream's store then
@@ -1081,12 +1121,15 @@ mod tests {
     #[tokio::test]
     async fn get_reads_one_surface_by_id() {
         let (host, requests) = scripted_agent_stream(vec![GET_STORED]).await;
+        let client = GatewayClient::for_agent_stream(&host, ACCESS_TOKEN).unwrap();
 
-        run_surfaces(&host, &["surfaces", "get", "s-1"])
+        let printed = get(&client, "s-1")
             .await
             .expect("surfaces get");
 
+        assert_eq!(serde_json::from_str::<Value>(&printed).unwrap(), serde_json::from_str::<Value>(STORED).unwrap());
         assert_eq!(start_lines(&requests), [GET_LINE]);
+        assert!(sends_bearer(&requests.lock().unwrap()[0], ACCESS_TOKEN));
     }
 
     #[tokio::test]
@@ -1192,12 +1235,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_refuses_set_on_id_and_name_and_a_deleted_status() {
+    async fn create_refuses_set_on_fields_with_their_own_source_and_a_deleted_status() {
         let (host, requests) = scripted_agent_stream(vec![POST_CREATED]).await;
 
         for (set, expected) in [
             ("id=s-2", "--set can't change `id`: use --id"),
             ("name=Other", "--set can't change `name`: use --name"),
+            (
+                "created_at=2020-01-01T00:00:00Z",
+                "--set can't change `created_at`: the CLI sets it to the current time; give another in --file",
+            ),
+            ("updated_at=2020-01-01T00:00:00Z", "--set can't change `updated_at`: Agent Stream sets it on every save"),
+            (
+                "tenant_id=t-2",
+                "--set can't change `tenant_id`: give it in --file, where Agent Stream checks it against your token",
+            ),
+            (
+                "owner_user_id.x=u-2",
+                "--set can't change `owner_user_id`: Agent Stream sets it to the user who creates the surface",
+            ),
             ("status=deleted", "a new surface can't have `status` set to `deleted`"),
         ] {
             let error =
@@ -1259,13 +1315,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_dry_run_needs_no_saved_login() {
+    async fn create_dry_run_needs_no_saved_connection() {
         let words =
             ["surfaces", "create", "--name", "Sales", "--set", WEBHOOK_TYPE, "--set", WEBHOOK_ENDPOINT, "--dry-run"];
 
         run_stream(&words, Config::default(), &UnusedKeyring)
             .await
-            .expect("a dry run sends nothing, so it needs no login");
+            .expect("a dry run sends nothing, so it needs no saved connection");
     }
 
     #[tokio::test]
@@ -1471,6 +1527,21 @@ mod tests {
         expected["name"] = json!("Renamed");
         assert_eq!(sent, expected, "only the name changes");
         assert_eq!(sent["updated_at"], STORED_UPDATED_AT);
+        let stored: Value = serde_json::from_str(STORED).unwrap();
+        let replaced = replacement(edited, &stored, "s-1", false).expect("the same --file again");
+        assert_eq!(
+            replaced.notes,
+            [
+                "note: the `status` in --file was replaced with the stored one (\"enabled\"); change it with --set \
+                 status=<enabled|disabled>, or run `surfaces delete`",
+                "note: the `created_at` in --file was replaced with the stored one (\"2026-11-01T00:00:00Z\"); it is \
+                 set once, when the surface is created",
+                "note: the `tenant_id` in --file was replaced with the stored one (\"t-1\"); a surface can't move to \
+                 another tenant or owner",
+                "note: the `owner_user_id` in --file was replaced with the stored one (\"u-1\"); a surface can't move \
+                 to another tenant or owner",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1483,6 +1554,10 @@ mod tests {
             ("--set", "updated_at=2020-01-01T00:00:00Z", "updated_at"),
             ("--set", "tenant_id=t-2", "tenant_id"),
             ("--unset", "owner_user_id", "owner_user_id"),
+            ("--set", "id.x=1", "id"),
+            ("--unset", "updated_at.x", "updated_at"),
+            ("--add", "tenant_id=t-2", "tenant_id"),
+            ("--remove", "owner_user_id=u-1", "owner_user_id"),
         ] {
             let error = run_surfaces(&host, &["surfaces", "update", "s-1", flag, path])
                 .await
@@ -1500,6 +1575,98 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_surface_left_without_a_pipe_type() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED, PUT_SAVED]).await;
+        let mut without_type: Value = serde_json::from_str(STORED).unwrap();
+        without_type
+            .as_object_mut()
+            .unwrap()
+            .remove("pipe_type");
+        let file = json_file(&without_type.to_string());
+
+        for words in [
+            ["--unset", "pipe_type"],
+            ["--unset", "pipe_type.type"],
+            ["--set", "pipe_type.type=123"],
+            ["--file", path_of(&file)],
+        ] {
+            let error = run_surfaces(&host, &[&["surfaces", "update", "s-1"][..], &words].concat())
+                .await
+                .expect_err("Agent Stream can't read a surface without a type");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("a surface needs a `pipe_type.type`"),
+                "{words:?}: {error}"
+            );
+        }
+        assert_eq!(start_lines(&requests), [GET_LINE; 4], "each reads once and sends no PUT");
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_surface_without_updated_at() {
+        let (host, requests) = scripted_agent_stream(vec![GET_UNSTAMPED, PUT_SAVED]).await;
+        let mut edited: Value = serde_json::from_str(UNSTAMPED).unwrap();
+        edited["name"] = json!("Renamed");
+        let file = json_file(&edited.to_string());
+
+        for words in [["--set", "name=Renamed"], ["--file", path_of(&file)]] {
+            let error = run_surfaces(&host, &[&["surfaces", "update", "s-1"][..], &words].concat())
+                .await
+                .expect_err("nothing to tell a later save by");
+            assert_eq!(
+                error.to_string(),
+                "surface 's-1' has no `updated_at`, so the CLI can't tell whether someone else saves it meanwhile; \
+                 nothing was saved",
+                "{words:?}"
+            );
+        }
+        assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE]);
+    }
+
+    #[tokio::test]
+    async fn update_refuses_status_flags_other_than_set_before_reading() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED, PUT_SAVED]).await;
+
+        for (flag, path, shown) in [
+            ("--unset", "status", "status"),
+            ("--unset", "status.x", "status.x"),
+            ("--set", "status.x=1", "status.x"),
+            ("--add", "status=disabled", "status"),
+            ("--remove", "status=enabled", "status"),
+        ] {
+            let error = run_surfaces(&host, &["surfaces", "update", "s-1", flag, path])
+                .await
+                .expect_err("status changes only with --set status=<value>");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{flag} can't change `{shown}`: change `status` with --set status=<enabled|disabled>, or run \
+                     `surfaces delete`"
+                )
+            );
+        }
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_sets_status_to_disabled() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED, PUT_SAVED]).await;
+
+        run_surfaces(&host, &["surfaces", "update", "s-1", "--set", "status=disabled"])
+            .await
+            .expect("--set status=disabled");
+
+        assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE]);
+        assert_eq!(sent_json(&requests, 2)["status"], "disabled");
     }
 
     #[tokio::test]

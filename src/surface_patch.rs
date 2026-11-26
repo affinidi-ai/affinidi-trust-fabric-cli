@@ -1,8 +1,10 @@
 //! Turns the `--set`, `--unset`, `--add` and `--remove` flags of `surfaces
-//! update` into the JSON Merge Patch document the gateway's
-//! `PATCH /v1/surfaces/{id}` applies (https://www.rfc-editor.org/rfc/rfc7396).
-//! Nothing here talks to the gateway, so the patch can be checked before it is
-//! sent.
+//! update` into a JSON Merge Patch document
+//! (https://www.rfc-editor.org/rfc/rfc7396). Agent Gateway's
+//! `PATCH /v1/surfaces/{id}` applies the patch on the gateway. Agent Stream
+//! has no PATCH, so `fabric agent-stream surfaces` merges the patch into the
+//! surface it read, on this machine, and sends the whole surface. Nothing here
+//! talks to either product, so the patch can be checked before it is sent.
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
@@ -18,7 +20,10 @@ struct Edit<'a> {
 }
 
 /// Build one merge patch from every `--set PATH=VALUE`, `--unset PATH`,
-/// `--add PATH=VALUE` and `--remove PATH=VALUE`.
+/// `--add PATH=VALUE` and `--remove PATH=VALUE`, made for `surface`, the
+/// surface the flags change (`null` for a new Agent Gateway surface). Agent
+/// Gateway's commands send the patch, and Agent Stream's merge it into
+/// `surface` and send the result.
 ///
 /// A path is dot-separated object keys (`access_point.rate_limit.requests`).
 /// A value is read as JSON when it parses as JSON with no surrounding spaces
@@ -31,13 +36,16 @@ struct Edit<'a> {
 /// replaces it. Paths that repeat or overlap each other are refused, because
 /// one would silently undo the other.
 ///
-/// A gate's patterns can be edited without resending the gate by naming the
-/// gate by its `id`, else its `name`, in square brackets: `--add
+/// On an Agent Gateway surface, a gate's patterns can be edited without
+/// resending the gate by naming the gate by its `id`, else its `name`, in
+/// square brackets: `--add
 /// 'target.mcp_tool_gating.gates[g-1].action.patterns=^fs_'`. A transit point
 /// is named the same way, by `id` else `alias`
 /// (`transit.points[billing].mcp_tool_gating.gates[g-1].action.patterns`).
 /// The pattern is always text, and the patch holds the surrounding list with
-/// only that gate's patterns changed.
+/// only that gate's patterns changed. Agent Stream surfaces have no gates, so
+/// `fabric agent-stream surfaces` refuses square brackets before it calls
+/// this.
 pub fn build_patch(
     sets: &[String],
     unsets: &[String],
@@ -287,10 +295,46 @@ fn give_surface_protocol(
     }
 }
 
+/// Each flag of an edit with the field path it names, split as
+/// [`build_patch`] splits it: at the first `=` of a --set, the
+/// first `=` outside square brackets of an --add or --remove, and the whole
+/// of an --unset.
+#[cfg(feature = "agent-stream")]
+pub fn flag_paths<'a>(
+    sets: &'a [String],
+    unsets: &'a [String],
+    adds: &'a [String],
+    removes: &'a [String],
+) -> Vec<(&'static str, &'a str)> {
+    let before_value = |given: &'a String| {
+        given
+            .split_once('=')
+            .map_or(given.as_str(), |(path, _)| path)
+    };
+    let before_item = |given: &'a String| split_flag(given).map_or(given.as_str(), |(path, _)| path);
+    sets.iter()
+        .map(|given| ("--set", before_value(given)))
+        .chain(
+            unsets
+                .iter()
+                .map(|given| ("--unset", given.as_str())),
+        )
+        .chain(
+            adds.iter()
+                .map(|given| ("--add", before_item(given))),
+        )
+        .chain(
+            removes
+                .iter()
+                .map(|given| ("--remove", before_item(given))),
+        )
+        .collect()
+}
+
 /// Split an `--add` or `--remove` flag at its first `=` outside square
 /// brackets, so an item named as `gates[g=1]` keeps its `=`. A bracket that is
 /// never closed splits at the first `=`, and the path is refused later.
-pub fn split_flag(given: &str) -> Option<(&str, &str)> {
+fn split_flag(given: &str) -> Option<(&str, &str)> {
     let mut inside = false;
     for (index, c) in given.char_indices() {
         match c {
