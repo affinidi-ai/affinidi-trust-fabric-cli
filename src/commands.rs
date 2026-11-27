@@ -2216,7 +2216,13 @@ pub(crate) enum SharedCommand {
         command: PolicyCommand,
         ask_first: bool,
     },
-    Connections(CrudCommand),
+    /// `ask_first` is set for a delete that must be confirmed at a prompt
+    /// first. Agent Stream's `connections delete` asks unless --yes is given;
+    /// Agent Gateway's `connections delete` never asks and never comes here.
+    Connections {
+        command: CrudCommand,
+        ask_first: bool,
+    },
     ConnectionPoints(CrudCommand),
     Mediators(CrudCommand),
     Settings(SettingsCommand),
@@ -2234,7 +2240,7 @@ impl From<SharedCommand> for Command {
             SharedCommand::Identities(command) => Self::Identities { command },
             SharedCommand::ApiKeys(command) => Self::ApiKeys { command },
             SharedCommand::Policies { command, .. } => Self::Policies { command },
-            SharedCommand::Connections(command) => Self::Connections { command },
+            SharedCommand::Connections { command, .. } => Self::Connections { command },
             SharedCommand::ConnectionPoints(command) => Self::ConnectionPoints { command },
             SharedCommand::Mediators(command) => Self::Mediators { command },
             SharedCommand::Settings(command) => Self::Settings { command },
@@ -2247,46 +2253,71 @@ impl From<SharedCommand> for Command {
 
 /// Runs one shared command on the appliance behind `client` and prints its
 /// answer as the Agent Gateway command of the same name does. A `policies
-/// delete` with `ask_first` set first asks at a prompt naming the policy and
-/// the host, and prints an `Aborted.` line and sends no delete when the answer
-/// is not yes.
+/// delete` or `connections delete` with `ask_first` set first asks at a prompt
+/// naming the record and the host, and prints an `Aborted.` line and sends no
+/// delete when the answer is not yes.
 #[cfg(feature = "agent-stream")]
 pub(crate) async fn run_shared(
     client: &GatewayClient,
     command: SharedCommand,
     output: Output,
 ) -> Result<()> {
-    if let SharedCommand::Policies {
-        command: PolicyCommand::Delete { policy_id },
-        ask_first: true,
-    } = &command
-    {
-        let path = entity_path("/v1/policy-definitions", policy_id);
-        if !confirm_action("delete", policy_id, async {
-            format!("Delete policy {}?", describe_target(client, &path, policy_id).await)
+    if let Some(delete) = command.delete_to_confirm() {
+        if !confirm_action("delete", delete.id, async {
+            format!("Delete {} {}?", delete.kind, describe_target(client, &delete.path, delete.id).await)
         })
         .await?
         {
-            println!("Aborted. Policy '{}' was not deleted.", sanitize_whole(policy_id));
+            println!("Aborted. {} '{}' was not deleted.", sentence_case(delete.kind), sanitize_whole(delete.id));
             return Ok(());
         }
     }
     run_and_print(client, command.into(), output).await
 }
 
+/// A shared delete that asks at a prompt before it is sent: what the record
+/// is called in the prompt, its route, and the ID it was given.
+#[cfg(feature = "agent-stream")]
+struct DeleteToConfirm<'a> {
+    kind: &'static str,
+    path: String,
+    id: &'a str,
+}
+
 #[cfg(feature = "agent-stream")]
 impl SharedCommand {
-    /// Fails, as [`refuse_without_terminal`] does, for an Agent Stream
-    /// `policies delete` that would ask for a confirmation nobody can give.
-    /// Called before the host is asked which product it is, so a refused
-    /// delete sends nothing at all.
-    pub(crate) fn refuse_unconfirmed_policy_delete(&self) -> Result<()> {
+    /// The delete to confirm first, for a `policies delete` or `connections
+    /// delete` with `ask_first` set, and `None` for any other command.
+    fn delete_to_confirm(&self) -> Option<DeleteToConfirm<'_>> {
         match self {
             Self::Policies {
                 command: PolicyCommand::Delete { policy_id },
                 ask_first: true,
-            } => refuse_without_terminal("delete", policy_id, false),
-            _ => Ok(()),
+            } => Some(DeleteToConfirm {
+                kind: "policy",
+                path: entity_path("/v1/policy-definitions", policy_id),
+                id: policy_id,
+            }),
+            Self::Connections {
+                command: CrudCommand::Delete { id },
+                ask_first: true,
+            } => Some(DeleteToConfirm {
+                kind: "Trust Fabric connection",
+                path: entity_path("/v1/gateways", id),
+                id,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Fails, as [`refuse_without_terminal`] does, for an Agent Stream
+    /// `policies delete` or `connections delete` that would ask for a
+    /// confirmation nobody can give. Called before the host is asked which
+    /// product it is, so a refused delete sends nothing at all.
+    pub(crate) fn refuse_unconfirmed_delete(&self) -> Result<()> {
+        match self.delete_to_confirm() {
+            Some(delete) => refuse_without_terminal("delete", delete.id, false),
+            None => Ok(()),
         }
     }
 }

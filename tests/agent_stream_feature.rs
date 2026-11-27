@@ -613,6 +613,40 @@ fn policies_delete_without_yes_and_with_a_typed_host_and_no_terminal_sends_nothi
 
 #[cfg(feature = "agent-stream")]
 #[test]
+fn connections_delete_without_yes_and_with_a_typed_host_and_no_terminal_sends_nothing() {
+    let (host, requests) = agent_stream_host();
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "--host", &host, "connections", "delete", "g-1"],
+        &[],
+        &[("FABRIC_TOKEN", SESSION_TOKEN)],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("refusing to delete 'g-1' without confirmation in a non-interactive session"), "{text}");
+    assert!(request_lines(&requests).is_empty(), "{:?}", request_lines(&requests));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connections_delete_with_yes_sends_the_delete_without_asking() {
+    let (host, requests) = agent_stream_stand_in(vec![("DELETE /api/v1/gateways/g-1", "204 No Content", "")]);
+
+    let output = fabric_on_stream(&host, &["connections", "delete", "g-1", "--yes"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("[y/N]"), "{}", stderr(&output));
+    assert!(
+        request_lines(&requests).contains(&"DELETE /api/v1/gateways/g-1 HTTP/1.1".to_owned()),
+        "{:?}",
+        request_lines(&requests)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
 fn settings_reset_without_force_and_with_a_typed_host_sends_nothing() {
     let (host, requests) = agent_stream_host();
 
@@ -1077,7 +1111,7 @@ fn connections_connection_points_and_mediators_print_the_agent_gateway_lines() {
     for (args, line) in [
         (&["connections", "create", "--file", "-"][..], "Created connection 'g-1'\n"),
         (&["connections", "update", "g-1", "--file", "-"], "Updated connection 'g-1'\n"),
-        (&["connections", "delete", "g-1"], "Deleted connection 'g-1'\n"),
+        (&["connections", "delete", "g-1", "--yes"], "Deleted connection 'g-1'\n"),
         (&["connection-points", "update", "cp-1", "--file", "-"], "Updated connection point 'cp-1'\n"),
         (&["connection-points", "delete", "cp-1"], "Deleted connection point 'cp-1'\n"),
         (&["mediators", "create", "--file", "-"], "Created mediator 'm-1'\n"),

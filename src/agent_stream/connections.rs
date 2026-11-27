@@ -54,14 +54,17 @@ pub enum ConnectionCommand {
     },
     /// Delete a Trust Fabric connection by ID.
     ///
-    /// It runs at once, with no confirmation prompt. Agent Stream refuses to
-    /// delete the `self` record. Deleting a `remote` record stops the
-    /// listeners of its connection points and deletes the connection points
-    /// Agent Stream created for it; the ones a user created are kept. Needs
-    /// the gateways.delete permission.
+    /// The command asks for confirmation first unless you pass --yes. Agent
+    /// Stream refuses to delete the `self` record. Deleting a `remote` record
+    /// stops the listeners of its connection points and deletes the
+    /// connection points Agent Stream created for it; the ones a user created
+    /// are kept. Needs the gateways.delete permission.
     Delete {
         /// Trust Fabric connection ID, as `list` prints it.
         id: String,
+        /// Skip the confirmation prompt. Required when running non-interactively.
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -78,6 +81,25 @@ const UPDATE_EXAMPLES: &str = r#"Examples:
     echo '{"status": "disabled"}' | fabric agent-stream connections update \
       <id> --file -"#;
 
+impl ConnectionCommand {
+    /// Whether this is a delete that asks for confirmation first, because
+    /// --yes was not given.
+    pub(crate) fn asks_before_deleting(&self) -> bool {
+        matches!(self, Self::Delete { yes: false, .. })
+    }
+}
+
+impl commands::SharedCommand {
+    /// The shared form of an Agent Stream connection command, which remembers
+    /// whether a delete asks for confirmation first.
+    pub(crate) fn connections(command: ConnectionCommand) -> Self {
+        Self::Connections {
+            ask_first: command.asks_before_deleting(),
+            command: command.into(),
+        }
+    }
+}
+
 impl From<ConnectionCommand> for commands::CrudCommand {
     fn from(command: ConnectionCommand) -> Self {
         match command {
@@ -85,24 +107,40 @@ impl From<ConnectionCommand> for commands::CrudCommand {
             ConnectionCommand::Get { id } => Self::Get { id },
             ConnectionCommand::Create(args) => Self::Create(args),
             ConnectionCommand::Update { id, file } => Self::Update { id, file },
-            ConnectionCommand::Delete { id } => Self::Delete { id },
+            ConnectionCommand::Delete { id, .. } => Self::Delete { id },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
     use crate::{
-        agent_stream::test_support::{scripted_agent_stream, start_lines},
+        agent_stream::test_support::{json_file, scripted_agent_stream, start_lines},
         client::GatewayClient,
-        commands::{Output, SharedCommand, run_shared},
+        commands::{Cli, Output, SharedCommand, run_shared},
     };
 
     const TOKEN: &str = "aspat_test";
 
     fn client(host: String) -> GatewayClient {
         GatewayClient::for_agent_stream(host, TOKEN).expect("client")
+    }
+
+    #[test]
+    fn only_a_delete_without_yes_asks_first_and_agent_gateway_has_no_yes() {
+        let delete = |yes| ConnectionCommand::Delete { id: "g-1".to_owned(), yes };
+
+        assert!(delete(false).asks_before_deleting());
+        assert!(!delete(true).asks_before_deleting());
+        assert!(!ConnectionCommand::Get { id: "g-1".to_owned() }.asks_before_deleting());
+        assert!(Cli::try_parse_from(["fabric", "agent-stream", "connections", "delete", "g-1", "--yes"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["fabric", "agent-gateway", "connections", "delete", "g-1", "--yes"]).is_err(),
+            "Agent Gateway's connections delete keeps its flags"
+        );
     }
 
     #[tokio::test]
@@ -117,8 +155,7 @@ mod tests {
         ])
         .await;
         let client = client(host);
-        let document = tempfile::NamedTempFile::new().expect("temp file");
-        std::fs::write(document.path(), r#"{"name":"Partner"}"#).expect("write the document");
+        let document = json_file(r#"{"name":"Partner"}"#);
         let file = || document.path().to_path_buf();
 
         for command in [
@@ -129,9 +166,12 @@ mod tests {
                 id: "g-1".to_owned(),
                 file: file(),
             },
-            ConnectionCommand::Delete { id: "g-1".to_owned() },
+            ConnectionCommand::Delete {
+                id: "g-1".to_owned(),
+                yes: true,
+            },
         ] {
-            run_shared(&client, SharedCommand::Connections(command.into()), Output::Json)
+            run_shared(&client, SharedCommand::connections(command), Output::Json)
                 .await
                 .expect("the command succeeds");
         }

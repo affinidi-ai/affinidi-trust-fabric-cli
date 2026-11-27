@@ -537,7 +537,7 @@ async fn run_command(
         AgentStreamCommand::Identities { command } => SharedCommand::Identities(command.into()),
         AgentStreamCommand::ApiKeys { command } => SharedCommand::ApiKeys(command.into()),
         AgentStreamCommand::Policies { command } => SharedCommand::policies(command),
-        AgentStreamCommand::Connections { command } => SharedCommand::Connections(command.into()),
+        AgentStreamCommand::Connections { command } => SharedCommand::connections(command),
         AgentStreamCommand::ConnectionPoints { command } => SharedCommand::ConnectionPoints(command.into()),
         AgentStreamCommand::Mediators { command } => SharedCommand::Mediators(command.into()),
         AgentStreamCommand::Settings { command } => SharedCommand::Settings(command.into()),
@@ -555,9 +555,10 @@ async fn run_command(
 /// revoke, rotate, or delete that would ask for a confirmation nobody can
 /// give, a `settings reset` without --force, a `users update` or `users
 /// delete` naming the reserved `integrations` route, a `metrics truncate` or
-/// `logs truncate` without --yes, and a `policies delete` that would ask for a
-/// confirmation nobody can give. Only refusals that need neither the host
-/// nor a file belong here; the ones that do are checked as the command runs.
+/// `logs truncate` without --yes, and a `policies delete` or `connections
+/// delete` that would ask for a confirmation nobody can give. Only refusals
+/// that need neither the host nor a file belong here; the ones that do are
+/// checked as the command runs.
 fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
     match command {
         SharedCommand::ApiKeys(command) => command.refuse_without_terminal(),
@@ -565,10 +566,9 @@ fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
         SharedCommand::Users(command) => command.refuse_reserved_route(Product::AgentStream),
         SharedCommand::Metrics(command) => command.refuse_unconfirmed_truncate(),
         SharedCommand::Logs(command) => command.refuse_unconfirmed_truncate(),
-        SharedCommand::Policies { .. } => command.refuse_unconfirmed_policy_delete(),
+        SharedCommand::Policies { .. } | SharedCommand::Connections { .. } => command.refuse_unconfirmed_delete(),
         SharedCommand::Secrets { .. }
         | SharedCommand::Identities(_)
-        | SharedCommand::Connections(_)
         | SharedCommand::ConnectionPoints(_)
         | SharedCommand::Mediators(_)
         | SharedCommand::Audit(_) => Ok(()),

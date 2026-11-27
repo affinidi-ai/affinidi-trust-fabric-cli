@@ -89,7 +89,7 @@ impl From<MediatorCommand> for commands::CrudCommand {
 mod tests {
     use super::*;
     use crate::{
-        agent_stream::test_support::{scripted_agent_stream, start_lines},
+        agent_stream::test_support::{json_file, scripted_agent_stream, start_lines},
         client::GatewayClient,
         commands::{Output, SharedCommand, run_shared},
     };
@@ -112,8 +112,7 @@ mod tests {
         ])
         .await;
         let client = client(host);
-        let document = tempfile::NamedTempFile::new().expect("temp file");
-        std::fs::write(document.path(), r#"{"name":"EU mediator"}"#).expect("write the document");
+        let document = json_file(r#"{"name":"EU mediator"}"#);
         let file = || document.path().to_path_buf();
 
         for command in [
