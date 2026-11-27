@@ -20,7 +20,7 @@ use reqwest::Method;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    client::{GatewayClient, pretty_json_for_terminal, sanitize_for_terminal},
+    client::{GatewayClient, pretty_json_for_terminal, response_status, sanitize_for_terminal},
     commands::{Output, confirmation_line, entity_path, print_list, read_json},
     surface_patch,
     surface_validate::{self, Change},
@@ -591,6 +591,17 @@ impl Catalog {
         bail!("the Model catalog has no provider '{id}'; see `fabric agent-stream providers list`")
     }
 
+    /// Whether a provider, built-in or custom, has exactly the id `id`.
+    fn has_exact_id(
+        &self,
+        id: &str,
+    ) -> bool {
+        self.built_in
+            .iter()
+            .chain(custom_providers(&self.custom))
+            .any(|provider| enum_value(provider) == id)
+    }
+
     /// Whether any provider, built-in or custom, has the id `id` in any case,
     /// which Agent Stream refuses for a new one.
     fn has_id(
@@ -698,8 +709,14 @@ async fn create(
     check_provider(&provider)?;
     let id = enum_value(&provider).to_owned();
     let catalog = Catalog::read(client).await?;
+    if catalog.has_exact_id(&id) {
+        bail!(
+            "provider '{id}' already exists, perhaps from an earlier run of this command whose save reached Agent \
+             Stream; see it with `fabric agent-stream providers get {id}`"
+        );
+    }
     if catalog.has_id(&id) {
-        bail!("the Model catalog already has a provider '{id}', whatever the case; choose another id");
+        bail!("the Model catalog already has a provider '{id}' in another case; choose another id");
     }
     let change = Change {
         path: format!("providers.{id}"),
@@ -711,7 +728,7 @@ async fn create(
         return Ok(());
     }
     let new = provider.clone();
-    let answer = edit_custom(client, &catalog.custom, |providers| providers.push(new)).await?;
+    let answer = edit_custom(client, &id, &catalog.custom, |providers| providers.push(new)).await?;
     match output {
         Output::Table => println!("{}", confirmation_line("Created", "custom provider", &id)),
         Output::Json => println!("{}", pretty_json_for_terminal(&saved_custom_provider(&answer, &id)?)?),
@@ -1009,10 +1026,11 @@ async fn save(
             }
             client
                 .request(Method::PUT, &path, Some(after))
-                .await?
+                .await
+                .map_err(|error| may_have_saved(error, &id))?
         }
         Source::Custom => {
-            edit_custom(client, &found.custom, |providers| {
+            edit_custom(client, &id, &found.custom, |providers| {
                 if let Some(slot) = providers
                     .iter_mut()
                     .find(|provider| enum_value(provider) == id)
@@ -1042,9 +1060,11 @@ async fn save(
 }
 
 /// Saves the custom catalog `before` with `edit` applied to its providers,
-/// through [`save_custom`], and returns Agent Stream's answer.
+/// through [`save_custom`], and returns Agent Stream's answer. `id` is the
+/// provider the edit is for, named if the connection fails after the send.
 async fn edit_custom(
     client: &GatewayClient,
+    id: &str,
     before: &Value,
     edit: impl FnOnce(&mut Vec<Value>),
 ) -> Result<Value> {
@@ -1055,7 +1075,7 @@ async fn edit_custom(
     {
         edit(providers);
     }
-    save_custom(client, before, after).await
+    save_custom(client, id, before, after).await
 }
 
 /// Sends `after` as the whole custom catalog, once a fresh read shows the
@@ -1066,6 +1086,7 @@ async fn edit_custom(
 /// only in case. Agent Stream reports any other problem itself.
 async fn save_custom(
     client: &GatewayClient,
+    id: &str,
     before: &Value,
     after: Value,
 ) -> Result<Value> {
@@ -1090,6 +1111,25 @@ async fn save_custom(
     client
         .request(Method::PUT, CUSTOM_PATH, Some(after))
         .await
+        .map_err(|error| may_have_saved(error, id))
+}
+
+/// `error` from sending a change for the provider `id`. A refusal from Agent
+/// Stream, which carries an HTTP status, saved nothing and is returned as it
+/// is. Any other failure, such as a timeout or a dropped connection, came
+/// after the change was sent, so it may have been saved: the error says so,
+/// and how to check before the command is run again.
+fn may_have_saved(
+    error: anyhow::Error,
+    id: &str,
+) -> anyhow::Error {
+    if response_status(&error).is_some() {
+        return error;
+    }
+    error.context(format!(
+        "the connection failed after the change was sent, so Agent Stream may have saved it; check with `fabric \
+         agent-stream providers get {id}` before running this command again"
+    ))
 }
 
 /// The entries of the custom catalog `custom` that Agent Stream refuses in
@@ -1148,13 +1188,12 @@ async fn delete(
         .await?
         .find(id)?;
     let answer = match found.source {
-        Source::BuiltIn => {
-            client
-                .request(Method::DELETE, &entity_path(BUILT_IN_PATH, id), None)
-                .await?
-        }
+        Source::BuiltIn => client
+            .request(Method::DELETE, &entity_path(BUILT_IN_PATH, id), None)
+            .await
+            .map_err(|error| may_have_saved(error, id))?,
         Source::Custom => {
-            edit_custom(client, &found.custom, |providers| {
+            edit_custom(client, id, &found.custom, |providers| {
                 providers.retain(|provider| enum_value(provider) != id);
             })
             .await?;
@@ -1483,7 +1522,8 @@ mod tests {
             vec![GET_BUILT_IN, GET_CUSTOM, PUT_CUSTOM],
         )
         .await;
-        assert!(error_text(result).contains("already has a provider 'OpenAI'"));
+        let text = error_text(result);
+        assert!(text.contains("already has a provider 'OpenAI' in another case; choose another id"), "{text}");
         assert_eq!(sent_writes(&requests), 0);
 
         let (result, requests) = run_providers(
@@ -1493,6 +1533,22 @@ mod tests {
         .await;
         result.unwrap();
         assert_eq!(sent_writes(&requests), 0);
+    }
+
+    #[tokio::test]
+    async fn create_refuses_an_id_that_exists_exactly_and_says_how_to_see_it() {
+        for id in ["acme", "openai"] {
+            let (result, requests) = run_providers(
+                &["providers", "create", "--id", id, "--name", "Again"],
+                vec![GET_BUILT_IN, GET_CUSTOM, PUT_CUSTOM],
+            )
+            .await;
+            let text = error_text(result);
+            assert!(text.contains(&format!("provider '{id}' already exists")), "{text}");
+            assert!(text.contains(&format!("`fabric agent-stream providers get {id}`")), "{text}");
+            assert!(!text.contains("choose another id"), "{text}");
+            assert_eq!(sent_writes(&requests), 0);
+        }
     }
 
     #[tokio::test]
@@ -2001,6 +2057,144 @@ mod tests {
         let text = error_text(result);
         assert!(text.contains("must resolve to a public address"), "{text}");
         assert!(!text.contains(TEST_ACCESS_TOKEN), "{text}");
+    }
+
+    /// A local Agent Stream that answers the two catalog reads and drops the
+    /// connection on any write, after reading it, as a timeout or a network
+    /// failure would after the change was sent.
+    async fn drops_writes() -> (String, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 4096];
+                let head_end = loop {
+                    let read = socket
+                        .read(&mut buf)
+                        .await
+                        .unwrap_or(0);
+                    if read == 0 {
+                        break None;
+                    }
+                    bytes.extend_from_slice(&buf[..read]);
+                    if let Some(end) = bytes
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                    {
+                        break Some(end + 4);
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| {
+                                value
+                                    .trim()
+                                    .parse::<usize>()
+                                    .ok()
+                            })?
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < head_end + length {
+                    let read = socket
+                        .read(&mut buf)
+                        .await
+                        .unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buf[..read]);
+                }
+                let start = head
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(start.clone());
+                let body = if start.starts_with("GET /api/v1/llm-providers/custom ") {
+                    CUSTOM
+                } else if start.starts_with("GET /api/v1/llm-providers ") {
+                    BUILT_IN
+                } else {
+                    drop(socket);
+                    continue;
+                };
+                let response =
+                    format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = socket
+                    .write_all(response.as_bytes())
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (host, requests)
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_connection_fails_says_it_may_have_been_saved_and_how_to_check() {
+        let cases: [(&[&str], &str, &str); 4] = [
+            (
+                &["providers", "create", "--id", "new-llm", "--name", "New"],
+                "new-llm",
+                "PUT /api/v1/llm-providers/custom ",
+            ),
+            (&["providers", "update", "acme", "--set", "name=Acme 2"], "acme", "PUT /api/v1/llm-providers/custom "),
+            (&["providers", "disable-model", "openai", "gpt-4o-mini"], "openai", "PUT /api/v1/llm-providers/openai "),
+            (&["providers", "delete", "openai"], "openai", "DELETE /api/v1/llm-providers/openai "),
+        ];
+        for (words, id, write) in cases {
+            let (host, requests) = drops_writes().await;
+            let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
+            let text = error_text(run_stream(words, saved, &credentials).await);
+            assert!(text.contains("may have saved it"), "{words:?}: {text}");
+            assert!(
+                text.contains(&format!("check with `fabric agent-stream providers get {id}` before running")),
+                "{words:?}: {text}"
+            );
+            assert!(!text.contains(TEST_ACCESS_TOKEN), "{text}");
+            let recorded = requests.lock().unwrap();
+            assert!(
+                recorded
+                    .iter()
+                    .any(|line| line.starts_with(write)),
+                "{words:?}: {recorded:?}"
+            );
+        }
+
+        let (host, _) = drops_writes().await;
+        let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
+        let text = error_text(run_stream(&["providers", "delete", "acme"], saved, &credentials).await);
+        assert!(text.contains("check with `fabric agent-stream providers get acme`"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_with_a_status_is_not_said_to_have_maybe_saved() {
+        let (result, _) = run_providers(
+            &["providers", "delete", "openai"],
+            vec![
+                GET_BUILT_IN,
+                GET_CUSTOM,
+                ("DELETE /api/v1/llm-providers/openai", "HTTP/1.1 409 Conflict", r#"{"error":"in use"}"#),
+            ],
+        )
+        .await;
+        let text = error_text(result);
+        assert!(text.contains("in use"), "{text}");
+        assert!(!text.contains("may have saved"), "{text}");
     }
 
     #[test]
