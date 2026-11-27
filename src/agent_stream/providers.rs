@@ -132,8 +132,12 @@ pub enum ProviderCommand {
     /// surfaces that use it. Deleting a built-in one leaves its surfaces
     /// working, since Agent Stream supports those providers itself, but
     /// without the catalog's prices and model switches, until the next
-    /// catalog refresh brings the provider back. Deleting a custom entry that
-    /// blocks custom saves clears the block. Table output prints one line;
+    /// catalog refresh brings the provider back. A custom entry Agent Stream
+    /// refuses blocks every custom save, deletes of other custom providers
+    /// included; deleting that entry clears the block when its id differs
+    /// from a built-in or another custom id only in case. An entry with an id
+    /// that isn't valid, or with exactly a built-in provider's id, has to be
+    /// fixed in the dashboard's custom catalog. Table output prints one line;
     /// --output json prints `{"deleted": "<id>"}` for either store.
     #[command(after_long_help = DELETE_EXAMPLES)]
     Delete(DeleteArgs),
@@ -1071,8 +1075,9 @@ async fn save_custom(
         bail!(
             "the custom catalog would still hold entries Agent Stream refuses, which block every custom save: {} \
              (an id that is not 1 to {MAX_ID_LEN} letters, digits, '-', or '_', an id a built-in provider also has \
-             in any case, or two custom ids that differ only in case); delete them with `fabric agent-stream \
-             providers delete <id>` or fix them in the dashboard's custom catalog first",
+             in any case, or two custom ids that differ only in case); delete one whose id differs only in case \
+             with `fabric agent-stream providers delete <id>`, and fix an id that isn't valid, or that exactly \
+             matches a built-in id, in the dashboard's custom catalog",
             blocking.join(", ")
         );
     }
@@ -1893,6 +1898,16 @@ mod tests {
         .await;
         result.unwrap();
         assert_eq!(sent_writes(&requests), 0);
+
+        // The preview the dry run prints names the model and each price.
+        let before = json!({"enum_value":"acme","name":"Acme","models":[{"name":"A","value":"a"}]});
+        let mut after = before.clone();
+        after["models"][0]["cost_per_1k_input"] = json!(0.5);
+        after["models"][0]["cost_per_1k_output"] = json!(1.5);
+        let printed = preview(&provider_changes(&before, &after), &after, Output::Table).unwrap();
+        assert!(printed.contains("  models[a].cost_per_1k_input: (absent) -> 0.5"), "{printed}");
+        assert!(printed.contains("  models[a].cost_per_1k_output: (absent) -> 1.5"), "{printed}");
+        assert!(printed.ends_with("Dry run: nothing was saved."), "{printed}");
     }
 
     #[tokio::test]
