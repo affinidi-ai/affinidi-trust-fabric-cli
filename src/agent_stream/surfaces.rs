@@ -204,8 +204,11 @@ pub enum SurfaceCommand {
     /// otherwise sends the whole surface. A surface with no `updated_at` is
     /// refused, since the CLI can't tell whether it was saved meanwhile.
     /// Agent Stream has no version check, so a save that lands in the short
-    /// gap between that last read and the send is still overwritten. A
-    /// change that leaves the surface as it is sends nothing.
+    /// gap between that last read and the send is still overwritten. When the
+    /// send gets no answer, or a success answer the CLI can't read, the error
+    /// says the surface may have been saved, so check it with `surfaces get`
+    /// before running the command again. A change that leaves the surface as
+    /// it is sends nothing.
     ///
     /// Field names are checked against the surface as read: a top-level name
     /// must be one Agent Stream knows, and a name inside an object the
@@ -280,9 +283,11 @@ pub enum SurfaceCommand {
     /// by the same fields, is refused. A new routing rule goes last, and
     /// Agent Stream uses the first rule that matches. Agent Stream ignores
     /// every usage alert while `usage_alerts_enabled` is false, and every
-    /// routing rule while `routing_enabled` is false. Adding the first item
-    /// sets that switch to true; adding to a list whose switch is false
-    /// leaves it false, with a note on how to turn the list on.
+    /// routing rule while `routing_enabled` is false. When that switch is
+    /// false, adding the first item sets it to true, and adding to a list
+    /// that already has items leaves it false, with a note on how to turn the
+    /// list on. A surface without the switch is left without it, since Agent
+    /// Stream reads a missing switch as true.
     ///
     /// Only the base surface is read and changed. A note names any variant
     /// that uses its own value of the feature, and so does not see the
@@ -294,9 +299,10 @@ pub enum SurfaceCommand {
     /// checks the field names, reads it again and stops if it was saved
     /// meanwhile, then sends the whole surface. Agent Stream has no version
     /// check, so a save that lands in the short gap between that last read
-    /// and the send is still overwritten. When Agent Stream gives no answer
-    /// to the send, the error says the surface may have been saved anyway,
-    /// so check it before running the command again. A name inside the JSON
+    /// and the send is still overwritten. When the send gets no answer, or a
+    /// success answer the CLI can't read, the error says the surface may
+    /// have been saved, so check it before running the command again. A name
+    /// inside the JSON
     /// must be one the surface's field already has, unless --allow-new-field
     /// is given; cost-tracking names are always checked against every setting
     /// Agent Stream knows, while nothing is checked inside any other field
@@ -497,86 +503,74 @@ pub struct UpdateArgs {
 }
 
 /// Runs one `surfaces` command. `connect` gives the client of the Agent
-/// Stream to talk to, and is only called for a command that sends something,
-/// so `create --dry-run` needs no saved connection.
+/// Stream to talk to. It is called only for a command that sends something,
+/// and only once the checks that need no connection pass, so `create
+/// --dry-run` and `features` with no id need no saved connection, and a bad
+/// id, feature name, or feature flag is refused before one is made.
 pub async fn run(
     command: SurfaceCommand,
     output: Output,
     connect: impl AsyncFnOnce() -> Result<GatewayClient>,
 ) -> Result<()> {
-    let command = match command {
+    match command {
         SurfaceCommand::Create(args) if args.dry_run => {
             println!("{}", preview_create(args, output)?);
             if let Output::Table = output {
                 eprintln!("Dry run: nothing was sent.");
             }
-            return Ok(());
+            Ok(())
         }
-        SurfaceCommand::Features { id: None } => {
-            println!("{}", features::catalog(output)?);
-            return Ok(());
-        }
-        SurfaceCommand::AddFeature(args) => SurfaceCommand::AddFeature(args.checked()?),
-        SurfaceCommand::RemoveFeature(args) => SurfaceCommand::RemoveFeature(args.checked()?),
-        SurfaceCommand::Features { id: Some(id) } => {
-            check_id(&id)?;
-            SurfaceCommand::Features { id: Some(id) }
-        }
-        SurfaceCommand::Budget { id } => {
-            check_id(&id)?;
-            SurfaceCommand::Budget { id }
-        }
-        command => command,
-    };
-    let client = connect().await?;
-    match command {
         SurfaceCommand::List => {
-            let surfaces = client
+            let surfaces = connect()
+                .await?
                 .request(Method::GET, SURFACES_PATH, None)
                 .await?;
             print_list(&surfaces, output, &tables::AGENT_STREAM_SURFACES, Scope::All)
         }
         SurfaceCommand::Get { id } => {
-            println!("{}", get(&client, &id).await?);
+            println!("{}", get(&connect().await?, &id).await?);
             Ok(())
         }
-        SurfaceCommand::Create(args) => create(&client, args, output).await,
-        SurfaceCommand::Update(args) => {
-            if let Some(printed) = update(&client, args, output).await? {
-                println!("{printed}");
-            }
-            Ok(())
-        }
+        SurfaceCommand::Create(args) => create(&connect().await?, args, output).await,
+        SurfaceCommand::Update(args) => print_change(update(&connect().await?, args, output).await?),
         SurfaceCommand::Delete { id } => {
-            let answer = client
+            let answer = connect()
+                .await?
                 .request(Method::DELETE, &surface_path(&id)?, None)
                 .await?;
             print_outcome(&answer, output, &confirmation_line("Deleted", "surface", &id))
         }
-        SurfaceCommand::Features { id: Some(id) } => {
-            println!("{}", features::on_surface(&client, &id, output).await?);
+        SurfaceCommand::Features { id: None } => {
+            println!("{}", features::catalog(output)?);
             Ok(())
         }
-        SurfaceCommand::Features { id: None } => {
-            unreachable!("the feature list is printed before a connection is made")
+        SurfaceCommand::Features { id: Some(id) } => {
+            check_id(&id)?;
+            println!("{}", features::on_surface(&connect().await?, &id, output).await?);
+            Ok(())
         }
         SurfaceCommand::AddFeature(args) => {
-            if let Some(printed) = features::add(&client, args, output).await? {
-                println!("{printed}");
-            }
-            Ok(())
+            let addition = args.checked()?;
+            print_change(features::add(&connect().await?, addition, output).await?)
         }
         SurfaceCommand::RemoveFeature(args) => {
-            if let Some(printed) = features::remove(&client, args, output).await? {
-                println!("{printed}");
-            }
-            Ok(())
+            let removal = args.checked()?;
+            print_change(features::remove(&connect().await?, removal, output).await?)
         }
         SurfaceCommand::Budget { id } => {
-            println!("{}", features::budget(&client, &id, output).await?);
+            check_id(&id)?;
+            println!("{}", features::budget(&connect().await?, &id, output).await?);
             Ok(())
         }
     }
+}
+
+/// Prints what a change to a surface returned to print, if anything.
+fn print_change(printed: Option<String>) -> Result<()> {
+    if let Some(printed) = printed {
+        println!("{printed}");
+    }
+    Ok(())
 }
 
 /// The API path of the surface `id`, once `id` follows Agent Stream's rules.
@@ -818,9 +812,9 @@ struct Edit<'a> {
 /// print, if any. A dry run returns [`preview_update`] and sends nothing. A
 /// change that leaves the surface as it is sends nothing either. Otherwise
 /// the surface is read again, the save stops if its `updated_at` moved, and
-/// the whole surface is sent; a send Agent Stream gives no answer to fails
-/// with [`unanswered_save`]. Table output then lists the changes, and
-/// --output json reads the saved surface back.
+/// the whole surface is sent; a send that fails gets the advice of
+/// [`failed_save`]. Table output then lists the changes, and --output json
+/// reads the saved surface back.
 async fn save(
     client: &GatewayClient,
     edit: &Edit<'_>,
@@ -849,7 +843,7 @@ async fn save(
     client
         .request(Method::PUT, path, Some(after))
         .await
-        .map_err(|error| unanswered_save(error, id))?;
+        .map_err(|error| failed_save(error, id))?;
     match output {
         Output::Table => {
             let mut lines = vec!["Changes:".to_owned()];
@@ -869,25 +863,79 @@ async fn save(
     }
 }
 
-/// `error` from the save of surface `id`, with advice added when Agent Stream
-/// gave no answer: no HTTP answer at all, such as a timeout or a dropped
-/// connection, or a 502 or 504, which only a proxy in front of Agent Stream
-/// sends on its surface routes. The save may then have been applied anyway,
-/// and running the command again would fail on the change it already made.
-/// Any other answer, such as a refusal, is returned as it is.
-fn unanswered_save(
+/// How the send of a surface failed, as far as the CLI can tell, which
+/// decides whether the surface may have been saved anyway.
+#[derive(Debug, PartialEq)]
+enum SaveFailure {
+    /// The request never left this machine: looking up the host,
+    /// connecting, or the TLS handshake failed. Nothing was saved.
+    NotSent,
+    /// Agent Stream answered with a failure of its own, such as a refusal.
+    /// Nothing was saved.
+    Refused,
+    /// Agent Stream answered with success, but the answer was not JSON, so
+    /// the CLI can't tell what was saved.
+    Unreadable,
+    /// The request was sent and no answer came back whole: a timeout, a
+    /// dropped connection, an answer cut off while being read, or a 502 or
+    /// 504, which only a proxy in front of Agent Stream sends on its surface
+    /// routes. Any failure the CLI can't place counts here too, so it is
+    /// never told that nothing was saved when something may have been.
+    Unanswered,
+}
+
+impl SaveFailure {
+    /// The kind of `error`, which [`GatewayClient::request`] returned for
+    /// the send.
+    fn of(error: &anyhow::Error) -> Self {
+        if let Some(status) = response_status(error) {
+            return if status == StatusCode::BAD_GATEWAY || status == StatusCode::GATEWAY_TIMEOUT {
+                Self::Unanswered
+            } else {
+                Self::Refused
+            };
+        }
+        // The client parses only a success answer as JSON; any other answer
+        // becomes a status error above.
+        if error
+            .downcast_ref::<serde_json::Error>()
+            .is_some()
+        {
+            return Self::Unreadable;
+        }
+        let not_sent = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .is_some_and(reqwest::Error::is_connect);
+        if not_sent {
+            Self::NotSent
+        } else {
+            Self::Unanswered
+        }
+    }
+}
+
+/// `error` from the save of surface `id`, with advice added when the surface
+/// may have been saved anyway, since running the command again would then
+/// fail on the change it already made. A request that never left this
+/// machine or that Agent Stream refused is returned as it is.
+fn failed_save(
     error: anyhow::Error,
     id: &str,
 ) -> anyhow::Error {
-    let answered = response_status(&error)
-        .is_some_and(|status| status != StatusCode::BAD_GATEWAY && status != StatusCode::GATEWAY_TIMEOUT);
-    if answered {
-        return error;
+    let check = format!(
+        "check it with `fabric agent-stream surfaces get {id}` or `fabric agent-stream surfaces features {id}` \
+         before running this again"
+    );
+    match SaveFailure::of(&error) {
+        SaveFailure::NotSent | SaveFailure::Refused => error,
+        SaveFailure::Unreadable => error.context(format!(
+            "Agent Stream answered the save of surface '{id}' with success, but its answer could not be read; {check}"
+        )),
+        SaveFailure::Unanswered => {
+            error.context(format!("Agent Stream gave no answer, so surface '{id}' may have been saved anyway; {check}"))
+        }
     }
-    error.context(format!(
-        "Agent Stream gave no answer, so surface '{id}' may have been saved anyway; check it with `fabric \
-         agent-stream surfaces get {id}` or `fabric agent-stream surfaces features {id}` before running this again"
-    ))
 }
 
 /// Reads the surface at `path` as Agent Stream has it now, refusing one that
@@ -1330,8 +1378,8 @@ mod tests {
         super::{
             AgentStreamCommand,
             test_support::{
-                Route, UnusedKeyring, json_file, request_body, run_stream, saved_login, scripted_agent_stream,
-                sends_bearer, start_lines, stream_args,
+                CUT_OFF, HANG_UP, Route, UnusedKeyring, json_file, request_body, run_stream, saved_login,
+                scripted_agent_stream, sends_bearer, start_lines, stream_args,
             },
         },
         *,
@@ -1374,6 +1422,15 @@ mod tests {
     const READ_BACK: &str = r#"{"id":"s-1","name":"Renamed","status":"enabled","updated_at":"2026-11-20T10:10:01Z"}"#;
     const GET_READ_BACK: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", READ_BACK);
     const GET_FAILED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 500 Internal Server Error", "");
+    /// A save that gets no answer at all.
+    const PUT_HUNG_UP: Route = ("PUT /api/v1/pipes/s-1", HANG_UP, "");
+    /// What the CLI says when the save of `s-1` got no answer.
+    const MAY_HAVE_BEEN_SAVED: &str = "Agent Stream gave no answer, so surface 's-1' may have been saved anyway; \
+                                       check it with `fabric agent-stream surfaces get s-1`";
+    /// What the CLI says when the save of `s-1` got a success answer it
+    /// could not read.
+    const ANSWER_UNREADABLE: &str = "Agent Stream answered the save of surface 's-1' with success, but its answer \
+                                     could not be read; check it with `fabric agent-stream surfaces get s-1`";
     const POST_CREATED: Route = ("POST /api/v1/pipes", "HTTP/1.1 200 OK", STORED);
 
     const GET_LINE: &str = "GET /api/v1/pipes/s-1 HTTP/1.1";
@@ -1793,6 +1850,72 @@ mod tests {
             "{error}"
         );
         assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE, GET_LINE]);
+    }
+
+    #[tokio::test]
+    async fn update_with_no_answer_to_the_save_says_it_may_have_been_saved() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED, PUT_HUNG_UP]).await;
+
+        let error = printed_update(&host, &["surfaces", "update", "s-1", "--set", "name=Renamed"], Output::Table)
+            .await
+            .expect_err("the save got no answer");
+
+        let text = format!("{error:#}");
+        assert!(text.starts_with(MAY_HAVE_BEEN_SAVED), "{text}");
+        assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE]);
+    }
+
+    #[tokio::test]
+    async fn a_save_whose_answer_is_cut_off_says_it_may_have_been_saved() {
+        let (host, requests) =
+            scripted_agent_stream(vec![GET_STORED, ("PUT /api/v1/pipes/s-1", CUT_OFF, STORED)]).await;
+
+        let error = printed_update(&host, &["surfaces", "update", "s-1", "--set", "name=Renamed"], Output::Table)
+            .await
+            .expect_err("the answer was cut off");
+
+        let text = format!("{error:#}");
+        assert!(text.starts_with(MAY_HAVE_BEEN_SAVED), "{text}");
+        assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE]);
+    }
+
+    #[tokio::test]
+    async fn a_save_answered_with_success_that_is_not_json_says_the_answer_could_not_be_read() {
+        let (host, requests) =
+            scripted_agent_stream(vec![GET_STORED, ("PUT /api/v1/pipes/s-1", "HTTP/1.1 200 OK", "<html>saved</html>")])
+                .await;
+
+        let error = printed_update(&host, &["surfaces", "update", "s-1", "--set", "name=Renamed"], Output::Table)
+            .await
+            .expect_err("the answer is not JSON");
+
+        let text = format!("{error:#}");
+        assert!(text.starts_with(ANSWER_UNREADABLE), "{text}");
+        assert!(!text.contains("gave no answer"), "{text}");
+        assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE]);
+    }
+
+    #[tokio::test]
+    async fn a_save_that_never_reached_agent_stream_gets_no_advice() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let host = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("local addr")
+        );
+        drop(listener);
+        let client = GatewayClient::for_agent_stream(host, ACCESS_TOKEN).expect("client");
+
+        let error = client
+            .request(Method::PUT, "/api/v1/pipes/s-1", Some(json!({"id": "s-1"})))
+            .await
+            .expect_err("nothing listens there");
+
+        assert_eq!(SaveFailure::of(&error), SaveFailure::NotSent);
+        let text = format!("{:#}", failed_save(error, "s-1"));
+        assert!(!text.contains("may have been saved"), "{text}");
+        assert!(!text.contains("answered the save"), "{text}");
     }
 
     #[tokio::test]

@@ -15,8 +15,8 @@ use reqwest::Method;
 use serde_json::{Map, Value, json};
 
 use super::{
-    Edit, Given, STATUS_DELETED, check_id, check_nested_fields, closest, pipe_type_of, read_live_surface, save,
-    status_of, surface_path,
+    Edit, Given, STATUS_DELETED, check_nested_fields, closest, pipe_type_of, read_live_surface, save, status_of,
+    surface_path,
 };
 use crate::{
     client::{GatewayClient, is_unexplained_agent_stream_forbidden, pretty_json_for_terminal},
@@ -272,9 +272,6 @@ pub struct AddFeatureArgs {
     /// Show what would change, and save nothing.
     #[arg(long)]
     dry_run: bool,
-    /// The settings from --json or --file, once read.
-    #[arg(skip)]
-    given: Option<Value>,
 }
 
 #[derive(Debug, Args)]
@@ -295,50 +292,82 @@ pub struct RemoveFeatureArgs {
     dry_run: bool,
 }
 
-impl AddFeatureArgs {
-    /// These arguments, once the surface id and the feature name are ones
-    /// the command can use and the settings are JSON of the shape the
-    /// feature takes, checked before any connection is made.
-    pub fn checked(mut self) -> Result<Self> {
-        check_id(&self.id)?;
-        let feature = lookup(&self.feature)?;
-        let given = self.settings()?;
-        check_shape(feature, &given)?;
-        self.given = Some(given);
-        Ok(self)
-    }
+/// An `add-feature` whose surface id, feature, and settings passed the
+/// checks that need no connection, ready for [`add`].
+#[derive(Debug)]
+pub struct FeatureAddition {
+    id: String,
+    /// The API path of the surface.
+    path: String,
+    feature: &'static Feature,
+    /// The settings read from --json or --file, a JSON object.
+    settings: Value,
+    allow_new_field: bool,
+    dry_run: bool,
+}
 
-    /// The settings from --json or --file, read once.
-    fn settings(&mut self) -> Result<Value> {
-        if let Some(given) = self.given.take() {
-            return Ok(given);
-        }
-        match (&self.json, &self.file) {
-            (Some(text), _) => serde_json::from_str(text).context("parse --json as JSON"),
-            (None, Some(file)) => read_json(file),
+/// A `remove-feature` whose surface id, feature, and --item or --all passed
+/// the checks that need no connection, ready for [`remove`].
+#[derive(Debug)]
+pub struct FeatureRemoval {
+    id: String,
+    /// The API path of the surface.
+    path: String,
+    feature: &'static Feature,
+    /// The one list item to remove, or `None` to remove the whole feature.
+    item: Option<String>,
+    dry_run: bool,
+}
+
+impl AddFeatureArgs {
+    /// Checks, before any connection is made, that the surface id and the
+    /// feature name are ones the command can use, and reads the settings
+    /// from --json or --file, which must be JSON of the shape the feature
+    /// takes.
+    pub fn checked(self) -> Result<FeatureAddition> {
+        let path = surface_path(&self.id)?;
+        let feature = lookup(&self.feature)?;
+        let settings = match (&self.json, &self.file) {
+            (Some(text), _) => serde_json::from_str(text).context("parse --json as JSON")?,
+            (None, Some(file)) => read_json(file)?,
             (None, None) => bail!("give the feature's settings with --json '<json>' or --file <path>"),
-        }
+        };
+        check_shape(feature, &settings)?;
+        Ok(FeatureAddition {
+            id: self.id,
+            path,
+            feature,
+            settings,
+            allow_new_field: self.allow_new_field,
+            dry_run: self.dry_run,
+        })
     }
 }
 
 impl RemoveFeatureArgs {
-    /// These arguments, once the surface id and the feature name are ones
-    /// the command can use, and --item or --all is given for a list feature
-    /// and neither for a setting, checked before any connection is made.
-    pub fn checked(self) -> Result<Self> {
-        check_id(&self.id)?;
-        check_remove_flags(lookup(&self.feature)?, &self)?;
-        Ok(self)
+    /// Checks, before any connection is made, that the surface id and the
+    /// feature name are ones the command can use, and that --item or --all
+    /// is given for a list feature and neither for a setting.
+    pub fn checked(self) -> Result<FeatureRemoval> {
+        let path = surface_path(&self.id)?;
+        let feature = lookup(&self.feature)?;
+        check_remove_flags(feature, self.item.is_some() || self.all)?;
+        Ok(FeatureRemoval {
+            id: self.id,
+            path,
+            feature,
+            item: self.item,
+            dry_run: self.dry_run,
+        })
     }
 }
 
-/// Refuses --item or --all on a setting, and a list feature with neither,
-/// so a whole list is never removed by leaving a flag out.
+/// Refuses --item or --all (`named`) on a setting, and a list feature with
+/// neither, so a whole list is never removed by leaving a flag out.
 fn check_remove_flags(
     feature: &Feature,
-    args: &RemoveFeatureArgs,
+    named: bool,
 ) -> Result<()> {
-    let named = args.item.is_some() || args.all;
     match feature.kind {
         Kind::Setting if named => bail!(
             "{} is one group of settings, not a list, so --item and --all do not apply; leave them out to remove the \
@@ -657,23 +686,27 @@ struct Changed {
 /// text to print, as `surfaces update` does.
 pub async fn add(
     client: &GatewayClient,
-    mut args: AddFeatureArgs,
+    addition: FeatureAddition,
     output: Output,
 ) -> Result<Option<String>> {
-    let feature = lookup(&args.feature)?;
-    let path = surface_path(&args.id)?;
-    let given = args.settings()?;
-    check_shape(feature, &given)?;
-    let before = read_live_surface(client, &path, &args.id).await?;
-    let changed = with_feature_added(feature, &before, given, args.allow_new_field, &args.id)?;
+    let FeatureAddition {
+        id,
+        path,
+        feature,
+        settings,
+        allow_new_field,
+        dry_run,
+    } = addition;
+    let before = read_live_surface(client, &path, &id).await?;
+    let changed = with_feature_added(feature, &before, settings, allow_new_field, &id)?;
     for note in &changed.notes {
         eprintln!("{note}");
     }
     let edit = Edit {
         path: &path,
-        id: &args.id,
+        id: &id,
         before: &before,
-        dry_run: args.dry_run,
+        dry_run,
     };
     save(client, &edit, changed.surface, output).await
 }
@@ -684,8 +717,10 @@ pub async fn add(
 /// be one it has, and a name inside cost-tracking must be one of
 /// [`COST_TRACKING_FIELDS`] or one the stored object has, whether or not the
 /// surface has it. An item already in the list is refused. A list's
-/// switch is set to true only when the list was empty, so items left off on
-/// purpose stay off. The notes say what else the change does or does not do.
+/// switch is set to true only when it was false and the list was empty, so
+/// items left off on purpose stay off, and a missing switch stays missing,
+/// since Agent Stream reads it as true. The notes say what else the change
+/// does or does not do.
 fn with_feature_added(
     feature: &Feature,
     surface: &Value,
@@ -727,7 +762,6 @@ fn with_feature_added(
             fields.insert(feature.field.to_owned(), Value::Object(settings));
         }
         Kind::List { .. } => {
-            check_shape(feature, &given)?;
             let added = format!("{}={given}", feature.field);
             let patch = surface_patch::build_patch(&[], &[], &[added], &[], surface)?;
             surface_validate::merge(&mut after, &patch);
@@ -843,22 +877,26 @@ fn variant_note(
 /// returns the text to print, as `surfaces update` does.
 pub async fn remove(
     client: &GatewayClient,
-    args: RemoveFeatureArgs,
+    removal: FeatureRemoval,
     output: Output,
 ) -> Result<Option<String>> {
-    let feature = lookup(&args.feature)?;
-    check_remove_flags(feature, &args)?;
-    let path = surface_path(&args.id)?;
-    let before = read_live_surface(client, &path, &args.id).await?;
-    let changed = with_feature_removed(feature, &before, args.item.as_deref(), &args.id)?;
+    let FeatureRemoval {
+        id,
+        path,
+        feature,
+        item,
+        dry_run,
+    } = removal;
+    let before = read_live_surface(client, &path, &id).await?;
+    let changed = with_feature_removed(feature, &before, item.as_deref(), &id)?;
     for note in &changed.notes {
         eprintln!("{note}");
     }
     let edit = Edit {
         path: &path,
-        id: &args.id,
+        id: &id,
         before: &before,
-        dry_run: args.dry_run,
+        dry_run,
     };
     save(client, &edit, changed.surface, output).await
 }
@@ -1801,6 +1839,63 @@ mod tests {
             "{:?}",
             changed.notes
         );
+    }
+
+    #[test]
+    fn adding_the_first_item_to_a_surface_without_its_switch_leaves_the_switch_out() {
+        let feature = lookup("usage-alerts").unwrap();
+        let mut surface = stored();
+        surface
+            .as_object_mut()
+            .unwrap()
+            .remove("usage_alerts_enabled");
+        let alert: Value = serde_json::from_str(USAGE_ALERT).unwrap();
+
+        let changed = with_feature_added(feature, &surface, alert.clone(), false, "s-1").expect("one alert");
+
+        assert_eq!(changed.surface["usage_alerts"], json!([alert]));
+        assert_eq!(
+            changed
+                .surface
+                .get("usage_alerts_enabled"),
+            None,
+            "Agent Stream reads a missing switch as true"
+        );
+        assert!(
+            !changed
+                .notes
+                .iter()
+                .any(|note| note.contains("usage_alerts_enabled")),
+            "{:?}",
+            changed.notes
+        );
+    }
+
+    #[test]
+    fn adding_an_item_without_an_id_that_has_the_fields_of_one_in_the_list_is_refused() {
+        let rule: Value = serde_json::from_str(ROUTING_RULE).unwrap();
+        let alert: Value = serde_json::from_str(USAGE_ALERT).unwrap();
+        for (name, field, stored_item, added) in [
+            ("routing-rules", "routing_rules", rule.clone(), rule),
+            (
+                "usage-alerts",
+                "usage_alerts",
+                alert,
+                json!({"threshold": 50.0, "alert_type": "cost_threshold", "notification_channels": []}),
+            ),
+        ] {
+            let mut surface = stored();
+            surface[field] = json!([stored_item]);
+
+            let error = with_feature_added(lookup(name).unwrap(), &surface, added, false, "s-1")
+                .expect_err("the item is already in the list");
+
+            assert_eq!(
+                error.to_string(),
+                format!("'{field}' already has {stored_item}: remove it first to replace it"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

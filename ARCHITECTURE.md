@@ -448,8 +448,9 @@ feature table in `features.rs`, which is built around edges and placements. `add
 replaces an object field whole and appends one item to a list through
 `surface_patch::build_patch`'s `--add`, so an item already in the list is refused the same
 way. Adding the first item to `usage_alerts` or `routing_rules` sets `usage_alerts_enabled`
-or `routing_enabled` to true, since Agent Stream ignores the items while that is false;
-adding to a list whose switch is false leaves it false and prints a note. `cost_tracking`
+or `routing_enabled` to true when it is false, since Agent Stream ignores the items while
+it is; adding to a list whose switch is false leaves it false and prints a note, and a
+missing switch is left out, since Agent Stream reads it as true. `cost_tracking`
 also holds the surface's prices, so `add-feature` keeps the stored `enabled` and prices the
 settings leave out. `remove-feature` removes the field, or one item through `--remove`, and
 a list needs `--item` or `--all`. Notes, printed to standard error, name the variants that
@@ -458,7 +459,13 @@ or `ide_catalog` surface. Both then go through `update`'s own `save`: the stale 
 dry run, the no-change case, and the output. Names inside an object the surface already
 has are checked as `update` checks them, `--allow-new-field` included. The feature name,
 the surface id, the shape of the settings, and the `--item` or `--all` flags are checked
-before a connection is resolved, and `features` with no id needs no connection. `budget`
+once, before a connection is resolved, by `AddFeatureArgs::checked` and
+`RemoveFeatureArgs::checked`, which return the `FeatureAddition` or `FeatureRemoval` that
+`add` and `remove` take, and `features` with no id needs no connection. When the send of a
+save fails, `SaveFailure` in `surfaces.rs` sorts the error: never sent (a connect
+`reqwest::Error`) and refused (any status but 502 or 504) print as they are, a
+success answer that is not JSON says it could not be read, and anything else says the
+surface may have been saved anyway. `budget`
 reads `/v1/pipes/{id}/budget`, which Agent Stream gates on `metrics.view`, so a 403 that
 gives no reason of its own (`client::is_unexplained_agent_stream_forbidden`) names that
 permission.

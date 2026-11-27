@@ -51,6 +51,7 @@ Usage alerts and routing rules each have a switch on the surface: `usage_alerts_
 | The list is empty and the switch is false | sets the switch to true, so the new item is used |
 | The list has items and the switch is false | leaves the switch false, and prints a note with the command that turns the whole list on |
 | The switch is true | leaves it true |
+| The surface has no switch | leaves it out, since Agent Stream reads a missing switch as true |
 
 ```sh
 fabric agent-stream surfaces update s-1a2b3c4d5e6f --set routing_enabled=true
@@ -200,7 +201,16 @@ Agent Stream replaces the whole surface on every save and has no version check. 
 3. It reads the surface again, and stops with nothing saved if someone else saved it in the meantime. A save that lands in the short gap before the send is still overwritten.
 4. It sends the whole surface. A change that leaves the surface as it was sends nothing.
 
-When Agent Stream gives no answer to the send, such as a timeout, a dropped connection, or a 502 or 504 from a proxy in front of it, the surface may have been saved anyway. The error then says so: check it with `surfaces get <id>` or `surfaces features <id>` before running the command again, because a second `add-feature` or `remove-feature` can fail on the change the first one already made. A refusal from Agent Stream, such as a 400, prints as it is.
+When the send fails, the error depends on how far it got:
+
+| What happened | Saved? | The error |
+| --- | --- | --- |
+| The CLI could not reach Agent Stream: the host lookup, the connection, or the TLS handshake failed | no | prints as it is |
+| Agent Stream refused the save, such as with a 400 | no | prints as it is |
+| No whole answer came back: a timeout, a dropped connection, an answer cut off, or a 502 or 504 from a proxy in front of Agent Stream | maybe | says the surface may have been saved anyway |
+| Agent Stream answered with success, but the answer was not JSON | maybe | says Agent Stream answered with success but the answer could not be read |
+
+In the last two cases, check the surface with `surfaces get <id>` or `surfaces features <id>` before running the command again, because a second `add-feature` or `remove-feature` can fail on the change the first one already made. `surfaces update` saves the same way, so its errors follow this table too.
 
 After a save, table output lists each changed field with its old and new value, and `--output json` prints the surface as Agent Stream has it after the save. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`. Agent Stream has no dry run of its own, so its checks only run on a real save: a route another surface uses and the drift block on any surface, and those on failover targets, canary splits, and usage limits only on an `llm` surface.
 
