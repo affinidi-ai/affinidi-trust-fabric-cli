@@ -304,8 +304,9 @@ pub enum SurfaceCommand {
     /// a success answer can't be read, the error says to check the surface
     /// before running the command again. A name inside the JSON must be one
     /// the surface's field already has, unless --allow-new-field
-    /// is given; cost-tracking names are always checked against every setting
-    /// Agent Stream knows, while nothing is checked inside any other field
+    /// is given; cost-tracking names are checked against every setting Agent
+    /// Stream knows, even on a surface with no `cost_tracking` yet, unless
+    /// --allow-new-field is given, while nothing is checked inside any other field
     /// the surface does not have yet, or inside a list item. Table output
     /// lists the changes, and --output json prints the surface read back
     /// after the save. --dry-run shows the changes and saves nothing. Agent
@@ -326,7 +327,8 @@ pub enum SurfaceCommand {
     /// match exactly one item. A list's switch, such as `routing_enabled`, is left
     /// as it is. A feature the surface does not have set is refused. Only the
     /// base surface is changed, as for `add-feature`, and the save, the
-    /// output, and --dry-run work as for `add-feature` too.
+    /// output, and --dry-run work as for `add-feature` too. There is no
+    /// confirmation prompt; use --dry-run to check first.
     #[command(after_long_help = REMOVE_FEATURE_EXAMPLES)]
     RemoveFeature(features::RemoveFeatureArgs),
     /// Show this month's spend of a surface against its monthly budget.
@@ -1186,7 +1188,7 @@ enum Given {
     /// An `update --file` document, where `null` means the field is left out.
     File,
     /// The settings `add-feature` replaces a field with, where `null` is sent
-    /// as it is.
+    /// as it is, so a new name set to `null` is checked like any other.
     Feature,
 }
 
@@ -1229,7 +1231,7 @@ fn check_nested_fields(
                 check_nested_fields(&child, nested, inner, allow_new_field, source)?;
             }
             (Some(_), _) => {}
-            (None, Value::Null) if source != Given::Flags => {}
+            (None, Value::Null) if source == Given::File => {}
             (None, _) => {
                 let near = || {
                     closest(

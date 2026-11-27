@@ -117,7 +117,7 @@ The JSON is read and its shape checked before anything is sent: a setting takes 
 
 - **A list** gets the JSON appended as one item, at the end. An item already in the list, by its `id` or by the same fields, is refused. A new routing rule goes last, and Agent Stream uses the first rule that matches.
 
-A name inside the JSON must be one the surface's field already has, unless `--allow-new-field` is given, because a typo would otherwise be dropped by Agent Stream without an error. Agent Stream leaves empty optional settings out of the surface it returns, so a correct name can look new; for example, `alert_threshold_percent` when `cost_tracking` has none yet. So `cost-tracking` names are always checked against every setting Agent Stream knows, even on a surface with no `cost_tracking` yet, and `monthly_budget` instead of `monthly_budget_usd` is refused. Nothing is checked inside any other field the surface does not have yet, or inside a list item.
+A name inside the JSON must be one the surface's field already has, unless `--allow-new-field` is given, because a typo would otherwise be dropped by Agent Stream without an error. Agent Stream leaves empty optional settings out of the surface it returns, so a correct name can look new; for example, `alert_threshold_percent` when `cost_tracking` has none yet. So `cost-tracking` names are checked against every setting Agent Stream knows, even on a surface with no `cost_tracking` yet, unless `--allow-new-field` is given, and `monthly_budget` instead of `monthly_budget_usd` is refused, as is a misspelled name set to `null`. Nothing is checked inside any other field the surface does not have yet, or inside a list item.
 
 ### Cost tracking and prices
 
@@ -158,6 +158,7 @@ fabric agent-stream surfaces remove-feature s-1a2b3c4d5e6f usage-limits --all
 - A list feature needs `--item` to remove one item, or `--all` to remove the whole list. With neither, the command stops before anything is sent, so a whole list is never removed by leaving a flag out.
 - `--item` takes the item's `id`. Routing rules and usage alerts have no id, so give some of the item's fields as JSON instead, which must match exactly one item.
 - A feature the surface does not have set is refused.
+- There is no confirmation prompt, so use `--dry-run` to check what goes first. A removed feature comes back with `add-feature` and the same JSON; for cost tracking, the note lists the prices that were dropped.
 - Removing `cost-tracking` removes the surface's own prices too, and a note says so. To stop only the budget and keep the prices, turn it off instead:
 
   ```sh

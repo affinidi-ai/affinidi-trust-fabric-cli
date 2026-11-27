@@ -2043,6 +2043,24 @@ mod tests {
     }
 
     #[test]
+    fn cost_tracking_refuses_a_mistyped_setting_set_to_null() {
+        let feature = lookup("cost-tracking").unwrap();
+        let mut surface = stored();
+        surface["cost_tracking"] = json!({"enabled": false, "input_price_per_1k": 0.002});
+
+        let error =
+            with_feature_added(feature, &surface, json!({"enabled": true, "input_price_per1k": null}), false, "s-1")
+                .expect_err("a misspelled name set to null is refused, not sent");
+
+        assert!(
+            error
+                .to_string()
+                .contains("input_price_per1k"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn cost_tracking_keeps_the_stored_enabled_and_prices_the_settings_leave_out() {
         let feature = lookup("budget").unwrap();
         let mut surface = stored();
