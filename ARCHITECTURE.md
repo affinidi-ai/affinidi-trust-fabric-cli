@@ -455,6 +455,7 @@ because Agent Stream answers a save with an `updated_at` its store then replaces
 only a fresh read can go back to `--file`. A dry run of `create` or `update` prints the
 same JSON shape (`dry_run`, `changes`, `after`), and `create --dry-run` runs before any
 connection is resolved, so it needs no saved connection.
+
 `fabric agent-stream providers` (in [`agent_stream/providers.rs`](src/agent_stream/providers.rs))
 manages the Model catalog, which Agent Stream keeps in two stores. `Catalog::read` reads
 both: the built-in providers from `/v1/llm-providers`, and the custom catalog from the
@@ -475,6 +476,19 @@ by `value` and endpoints by `path`, so change lists name the item that changed. 
 anything is read. Agent Stream keeps unknown provider fields, so field names are not
 checked, but two models with one `value` are refused. A provider has no `updated_at`, so
 a stale `update --file` can't be detected.
+
+`fabric agent-stream providers connect` (in
+[`agent_stream/providers/connect.rs`](src/agent_stream/providers/connect.rs)) changes a
+surface, not the catalog. It reads the catalog only to check the model, then saves through
+`surfaces::change_surface`, the read, stale check, dry run, and change list that `surfaces
+update` uses. It sets `pipe_type.provider` itself, writing only the fields the chosen
+provider takes on a surface, which stands in for the field-name check of `update`: `KEEP_BASE_URL` and `NO_BASE_URL` list the providers Agent
+Stream knows by name, any other provider keeps a base URL unless its `api_schema` is
+`anthropic` or `gemini`, and `azure` and `custom`, which a surface describes with other
+fields, are refused. A surface moved to another provider gets that provider's default
+upstream path in `pipe_type.endpoint_path` (`default_endpoint_path`, which picks the
+catalog endpoint the dashboard picks). `--secret` is a secret id, checked for its shape and refused when it
+looks like an API key; no secret is read.
 
 `fabric agent-stream prompts` (in [`agent_stream/prompts.rs`](src/agent_stream/prompts.rs))
 manages prompt templates at `/v1/prompts`. A template keeps its versions inside one
@@ -582,7 +596,7 @@ Every file in [`src/`](src/) and what it owns.
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
 | [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, `remembering_probes`, which keeps a host's answer for the length of an interactive shell, and the names messages give each product (`message_name`, `message_subject`, `connection_noun`, `surface_noun`). |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs` with its child `surfaces/features.rs`, `prompts.rs`, `members.rs`, `teams.rs`, `providers.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `connections.rs`, `connection_points.rs`, `mediators.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), `records.rs` for what `members` and `teams` share, and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs` with its child `surfaces/features.rs`, `prompts.rs`, `members.rs`, `teams.rs`, `providers.rs` with `providers/connect.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `connections.rs`, `connection_points.rs`, `mediators.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), `records.rs` for what `members` and `teams` share, and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |

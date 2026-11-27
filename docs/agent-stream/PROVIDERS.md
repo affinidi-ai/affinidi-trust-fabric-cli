@@ -17,12 +17,13 @@ Manage the Model catalog of an Agent Stream: the LLM providers it knows, with th
 | [`providers disable-model <id> <model>`](#models-and-prices) | Disable a model |
 | [`providers set-price <id> <model>`](#models-and-prices) | Set a model's input and output prices |
 | [`providers delete <id>`](#delete-a-provider) | Delete a provider |
+| [`providers connect <id>`](#connect-a-provider-to-a-surface) | Point an LLM surface at a provider, a model, and the secret holding the key |
 
-All commands start with `fabric agent-stream`. Every one of them, reading included, needs the `llm_catalog.edit` permission, which by default only administrators have.
+All commands start with `fabric agent-stream`. Every one of them, reading included, needs the `llm_catalog.edit` permission, which by default only administrators have. `connect` also needs `pipes.view` and `pipes.edit` to read and change the surface, and usually `secrets.view`: Agent Stream asks for it on a save that sends a secret somewhere the surface didn't send it before.
 
 ## API keys are not in the catalog
 
-No `providers` command takes or prints an API key, because the catalog holds none. A provider's key is stored in Agent Stream as a secret, and each surface that uses the provider names that secret. The catalog only describes the key a provider expects, in fields such as `api_key_label` and `api_key_required`.
+No `providers` command takes or prints an API key, because the catalog holds none. A provider's key is stored in Agent Stream as a secret, and each surface that uses the provider names that secret; [`providers connect`](#connect-a-provider-to-a-surface) sets that name. The catalog only describes the key a provider expects, in fields such as `api_key_label` and `api_key_required`.
 
 ## Built-in and custom providers
 
@@ -132,7 +133,36 @@ fabric agent-stream providers delete acme-llm
 - `--output json` prints `{"deleted": "<id>"}` for either store.
 - There is no confirmation prompt.
 
+## Connect a provider to a surface
+
+```sh
+fabric agent-stream providers connect openai --surface s-1a2b3c4d5e6f \
+  --secret openai-key --model gpt-4o-mini --dry-run
+fabric agent-stream providers connect openai --surface s-1a2b3c4d5e6f \
+  --secret openai-key --model gpt-4o-mini
+```
+
+`connect` changes an existing LLM surface so that its calls go to the provider, with the model and the API key you name. It sets the surface's `pipe_type.provider`: `provider_type`, `model`, `api_key_secret`, and, with `--base-url`, `base_url`.
+
+| Flag | What it sets |
+| --- | --- |
+| `--surface` | The LLM surface to change (required) |
+| `--secret` | The id of the stored secret that holds the provider's API key (required). See `fabric agent-stream secrets list` |
+| `--model` | The model, by its `value` in `providers models`. Without it, the surface keeps its model |
+| `--base-url` | Where the surface sends the provider's calls, instead of the catalog's base URL |
+| `--dry-run` | Show the changes, and save nothing |
+
+- The surface keeps only the secret's id. The key itself is never read, sent, or printed. A `--secret` that looks like an API key, 32 characters or more starting the way provider keys do, such as `sk-`, is refused, as is one that can't name a secret: 1 to 256 letters, digits, `-`, `_`, or `.`, without `..`.
+- The model must be in the provider's catalog entry and enabled there, whether it comes from `--model` or is the surface's own. Otherwise nothing is saved, and the error points to `providers models` or `providers enable-model`.
+- `--base-url` must be an http or https URL with no user name or password. It is refused for providers whose surface settings have no base URL, such as `anthropic`, `gemini`, `cohere`, `mistral`, and a custom provider with the `anthropic` or `gemini` API schema, because Agent Stream would drop it without an error.
+- `azure` and `custom` are refused: a surface describes them with other fields, such as an Azure deployment name. Set those with `surfaces update`.
+- On a surface already on the provider, its other provider settings, such as an organization id or a base URL, and its `pipe_type.endpoint_path` are kept. Moving a surface to another provider keeps only `temperature`, `max_tokens`, `top_p`, `frequency_penalty`, and `presence_penalty`, and drops the rest, which belong to the provider it leaves. Without `--base-url`, Agent Stream then uses the catalog's base URL.
+- Moving a surface to another provider also sets `pipe_type.endpoint_path`, the upstream path Agent Stream's execute API calls, to the new provider's default endpoint, chosen as the dashboard chooses it: the catalog's `api_version_prefix` followed by the default chat endpoint, such as `/v1/messages` for `anthropic`. A provider with no endpoint in the catalog leaves it unset, so Agent Stream calls `/v1/chat/completions`; `connect` warns about that.
+- Surface variants and failover targets that name their own provider are left as they are.
+- A webhook or IDE surface, and a deleted surface, are refused.
+
+`connect` saves the way `surfaces update` does, except that in place of its field-name check it writes only the fields the provider takes on a surface. A disabled provider and a plain `http` `--base-url` to a host other than this machine get a warning. It reads the surface, reads it again just before saving, and stops with nothing sent if it was saved in between. A change that leaves the surface as it is sends nothing. After a save, table output lists each changed field, such as `pipe_type.provider.model: "claude-x" -> "gpt-4o-mini"`, and `--output json` prints the surface as Agent Stream has it after the save. `--dry-run` shows the same list; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }` with the whole new surface.
+
 ## Not covered here
 
 - Refreshing the built-in catalog from its published source, and rolling a refresh back: use the dashboard, or `fabric agent-stream api post /v1/llm-providers/refresh`.
-- Connecting a provider and its key to a surface.

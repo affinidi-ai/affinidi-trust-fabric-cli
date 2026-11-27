@@ -225,7 +225,8 @@ enum AgentStreamCommand {
     /// Every providers command, reading included, needs the
     /// `llm_catalog.edit` permission, which by default only administrators
     /// have. The catalog holds no API keys: a provider's key is stored as a
-    /// secret, and the surface that uses the provider names that secret.
+    /// secret, and the surface that uses the provider names that secret,
+    /// which `providers connect` sets.
     Providers {
         #[command(subcommand)]
         command: providers::ProviderCommand,
