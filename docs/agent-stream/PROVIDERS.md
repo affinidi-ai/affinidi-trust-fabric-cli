@@ -33,7 +33,7 @@ Agent Stream keeps providers in two stores:
 | Built-in | The providers Agent Stream ships. A catalog refresh replaces them, undoing any change made to them | One provider at a time |
 | Custom | Providers added here or in the dashboard. They survive a refresh | By sending the whole custom catalog with only the one provider changed |
 
-`list` shows both, with a SOURCE column. Every other command finds the provider in whichever store has it, and uses that store's route. A provider id is matched exactly.
+`list` shows both, with a SOURCE column. Every other command finds the provider in whichever store has it, and uses that store's route. A provider id is matched exactly, so `OPENAI` and `openai` are different ids here; see [When the custom catalog blocks a save](#when-the-custom-catalog-blocks-a-save).
 
 ## Read the catalog
 
@@ -97,7 +97,7 @@ How every change is saved, including the model commands:
 3. It reads again, and stops with nothing saved if, since the first read, the provider changed (for a built-in one) or anything in the custom catalog changed (for a custom one). A save that lands in the short gap before the send is still overwritten.
 4. It saves the provider, or for a custom one the whole custom catalog with only that provider changed. A change that leaves the provider as it was sends nothing.
 
-After a save, table output lists each changed field, and `--output json` prints the provider as Agent Stream has it then. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`.
+After a save, table output lists each changed field, and `--output json` prints the provider as Agent Stream answered the save. A model is named by its `value` and an endpoint by its `path`, so a price change reads `models[gpt-4o-mini].cost_per_1k_input: 0.00015 -> 0.0002`, and an added or removed model shows whole. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`.
 
 ## Models and prices
 
@@ -109,11 +109,14 @@ fabric agent-stream providers set-price openai gpt-4o-mini --input-price 0.00015
 
 - A model is named by its `value`, as `providers models` lists it.
 - Agent Stream hides a disabled model from the dashboard's model pickers and refuses to save a surface that uses it.
-- Prices are USD per 1,000 tokens, from 0 to 100. Give `--input-price`, `--output-price`, or both. Agent Stream uses them for every call on a surface that sets no price of its own, so a change changes every cost and budget figure from then on.
+- Prices are USD per 1,000 tokens, from 0 to 100. Give `--input-price`, `--output-price`, or both. Agent Stream uses a model's catalog prices only when both are set, so `set-price` refuses to leave a model with only one: give the other price too when the model has none.
+- Agent Stream uses the prices for every call on a surface that sets no price of its own, so a change changes every cost and budget figure from then on. An endpoint's own prices win over the model's.
 
 ## When the custom catalog blocks a save
 
-Agent Stream checks the whole custom catalog on every save. A custom entry it refuses, such as one whose id a built-in provider also has after a catalog refresh, blocks every custom create, change, and delete. The CLI names such entries before it sends anything; fix them in the dashboard's custom catalog. Until then, a provider id that both stores have can't be changed or deleted here, and `get` and `models` show the built-in one with a warning.
+Agent Stream checks the whole custom catalog on every save, so a custom entry it refuses blocks every custom create and change. Before it sends anything, the CLI names the entries that would still be there after the change: an id that isn't valid, an id a built-in provider also has in any case (a catalog refresh can add one), and two custom ids that differ only in case. Agent Stream reports any other problem, such as a model without a `value`, in its own error.
+
+To clear the block, delete the entry by its exact id, such as `fabric agent-stream providers delete OPENAI`; that save is allowed because the entry is gone afterwards. Changes to built-in providers never touch the custom catalog, so they go ahead. `get` and `models` show the exactly matching provider with a warning: Agent Stream ignores a custom provider whose id a built-in one has, so its models and prices are not the ones in use. An id that both stores have exactly can't be changed here; fix it in the dashboard's custom catalog.
 
 ## Delete a provider
 
@@ -122,10 +125,10 @@ fabric agent-stream providers get acme-llm > provider.json
 fabric agent-stream providers delete acme-llm
 ```
 
-- A built-in provider is deleted on its own, and comes back with the next catalog refresh.
-- A custom provider is removed by sending the custom catalog without it.
+- A custom provider is removed by sending the custom catalog without it. Surfaces that use it stop working.
+- A built-in provider is deleted on its own. Agent Stream supports those providers itself, so surfaces on it keep working, but without the catalog's prices and model switches, until the next catalog refresh brings the provider back.
 - `--output json` prints `{"deleted": "<id>"}` for either store.
-- There is no confirmation prompt. A surface that uses the provider stops working.
+- There is no confirmation prompt.
 
 ## Not covered here
 

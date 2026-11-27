@@ -1775,3 +1775,27 @@ fn providers_delete_of_a_custom_provider_prints_deleted_and_its_id_as_json() {
         Some("PUT /api/v1/llm-providers/custom HTTP/1.1")
     );
 }
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_list_refused_by_agent_stream_prints_its_reason_and_exits_non_zero() {
+    let probe = PROBE_REQUEST.trim_end_matches(" HTTP/1.1");
+    let (host, requests) = host_replying(
+        vec![(probe, "200 OK", AGENT_STREAM_PERMISSIONS)],
+        ("403 Forbidden", "missing permission llm_catalog.edit"),
+    );
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "providers", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("missing permission llm_catalog.edit"), "{text}");
+    assert!(!text.contains(ACCESS_TOKEN), "{text}");
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/llm-providers HTTP/1.1"]);
+}

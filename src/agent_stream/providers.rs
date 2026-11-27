@@ -56,9 +56,10 @@ pub enum ProviderCommand {
     List,
     /// Get a provider by id, as the JSON document Agent Stream keeps.
     ///
-    /// When a built-in and a custom provider share the id, which a catalog
-    /// refresh can cause, the built-in one is shown with a warning: the custom
-    /// one blocks every custom save until it gets another id.
+    /// Ids are matched exactly. When a custom provider's id is a built-in
+    /// one's in another case, which a catalog refresh can cause, the provider
+    /// shown comes with a warning: Agent Stream ignores the custom one, and it
+    /// blocks every custom save until it is deleted.
     #[command(after_long_help = GET_EXAMPLES)]
     Get {
         /// Id of the provider, its `enum_value` (see `fabric agent-stream
@@ -101,32 +102,39 @@ pub enum ProviderCommand {
     /// in the custom catalog changed (for a custom one); otherwise it saves. A
     /// built-in provider is replaced on its own. A custom provider is saved by
     /// sending the whole custom catalog with only this provider changed. A
-    /// custom catalog that holds an entry Agent Stream refuses, such as one
-    /// whose id a built-in provider also has, blocks every custom save, and
-    /// the error names it. Agent Stream has no version check, so a save that lands in
-    /// the short gap between that last read and the send is still
-    /// overwritten. A change that leaves the provider as it is sends nothing.
+    /// custom catalog that would still hold an entry Agent Stream refuses (an
+    /// id that isn't valid, an id a built-in provider also has in any case,
+    /// or two custom ids that differ only in case) blocks every custom save,
+    /// and the error names the entry; delete it to clear the block. Agent
+    /// Stream reports any other problem in the custom catalog itself. Agent
+    /// Stream has no version check, so a save that lands in the short gap
+    /// between that last read and the send is still overwritten. A change
+    /// that leaves the provider as it is sends nothing.
     ///
     /// A flag path is field names joined by `.`, such as `default_base_url`
     /// or `hero.title`; it can't use brackets or a list position. To change a
     /// list, give its path to --add or --remove, or use the model commands.
     /// `enum_value` can't be changed.
     ///
-    /// Table output lists each changed field; --output json prints the
-    /// provider as Agent Stream has it after the save. --dry-run shows the
-    /// changes, or with --output json the changes and the whole new provider,
-    /// and saves nothing. A built-in provider changed here is replaced again
-    /// by the next catalog refresh.
+    /// Table output lists each changed field, a model or endpoint by its
+    /// `value` or `path`, such as `models[gpt-4o-mini].cost_per_1k_input`;
+    /// --output json prints the provider as Agent Stream answered the save.
+    /// --dry-run shows the changes, or with --output json the changes and the
+    /// whole new provider, and saves nothing. A built-in provider changed here
+    /// is replaced again by the next catalog refresh.
     #[command(after_long_help = UPDATE_EXAMPLES)]
     Update(UpdateArgs),
     /// Delete a provider.
     ///
     /// A built-in provider is deleted on its own. A custom provider is removed
     /// by sending the custom catalog without it, as `providers update` does.
-    /// There is no confirmation prompt. A surface that uses the provider stops
-    /// working, and a built-in provider comes back with the next catalog
-    /// refresh. Table output prints one line; --output json prints
-    /// `{"deleted": "<id>"}` for either store.
+    /// There is no confirmation prompt. Deleting a custom provider stops the
+    /// surfaces that use it. Deleting a built-in one leaves its surfaces
+    /// working, since Agent Stream supports those providers itself, but
+    /// without the catalog's prices and model switches, until the next
+    /// catalog refresh brings the provider back. Deleting a custom entry that
+    /// blocks custom saves clears the block. Table output prints one line;
+    /// --output json prints `{"deleted": "<id>"}` for either store.
     #[command(after_long_help = DELETE_EXAMPLES)]
     Delete(DeleteArgs),
     /// List the models of a provider, with their prices.
@@ -134,8 +142,8 @@ pub enum ProviderCommand {
     /// ENABLED is `no` only for a model with `enabled` set to false: Agent
     /// Stream treats a model with no `enabled` as enabled. Prices are USD per
     /// 1,000 tokens, and "-" means the catalog sets none. --output json prints
-    /// the provider's `models` list. For an id a built-in and a custom
-    /// provider share, the built-in one's models are shown, with a warning.
+    /// the provider's `models` list. Ids are matched exactly, with a warning
+    /// when a custom provider's id is a built-in one's in another case.
     #[command(after_long_help = MODELS_EXAMPLES)]
     Models {
         /// Id of the provider (see `fabric agent-stream providers list`).
@@ -159,10 +167,13 @@ pub enum ProviderCommand {
     /// Set the input and output prices of a model of a provider.
     ///
     /// Prices are USD per 1,000 tokens, from 0 to 100. Give --input-price,
-    /// --output-price, or both. Agent Stream uses them to work out the cost of every call to
-    /// the model on a surface that sets no price of its own, so a change
-    /// changes every cost and budget figure from then on. The save works as
-    /// `providers update` does, --dry-run included.
+    /// --output-price, or both. Agent Stream uses a model's catalog prices
+    /// only when both are set, so the model must end up with both: give the
+    /// other price too when the model has none. An endpoint's own prices win
+    /// over the model's. Agent Stream uses them to work out the cost of every
+    /// call to the model on a surface that sets no price of its own, so a
+    /// change changes every cost and budget figure from then on. The save
+    /// works as `providers update` does, --dry-run included.
     #[command(after_long_help = SET_PRICE_EXAMPLES)]
     SetPrice(SetPriceArgs),
 }
@@ -482,54 +493,68 @@ impl Catalog {
             .collect()
     }
 
-    /// The provider `id` to change, from whichever store has it. An id both
-    /// stores have, in any case, is refused, since the change could reach the
-    /// wrong provider and Agent Stream refuses every custom save until the
-    /// custom one gets another id.
+    /// The provider `id` to change, from whichever store has it, matched
+    /// exactly. An id both stores have exactly is refused, since the change
+    /// could reach the wrong provider. A custom entry whose id a built-in
+    /// provider has in another case doesn't block a change to the built-in
+    /// one, which never touches the custom catalog.
     fn find(
         self,
         id: &str,
     ) -> Result<Found> {
         check_id(id)?;
-        if self.in_both_stores(id) {
+        let exact = |provider: &Value| enum_value(provider) == id;
+        if self
+            .built_in
+            .iter()
+            .any(exact)
+            && custom_providers(&self.custom)
+                .iter()
+                .any(exact)
+        {
             bail!(
-                "'{id}' names both a built-in provider and a custom one, which a catalog refresh can cause; Agent \
-                 Stream refuses to save the custom catalog until the custom one gets another id, so change it in the \
-                 dashboard's custom catalog"
+                "'{id}' names both a built-in provider and a custom one, so the CLI can't tell which to change; \
+                 change the custom one in the dashboard's custom catalog"
             );
         }
         self.locate(id)
     }
 
-    /// The provider `id` to read. For an id both stores have, the built-in
-    /// one is returned, with a warning that the custom one blocks custom
-    /// saves.
+    /// The provider `id` to read, matched exactly, with a warning when a
+    /// custom provider's id is a built-in one's in another case.
     fn find_to_read(
         self,
         id: &str,
     ) -> Result<Found> {
         check_id(id)?;
-        if self.in_both_stores(id) {
-            eprintln!(
-                "warning: '{id}' names both a built-in provider and a custom one; showing the built-in one. Agent \
-                 Stream refuses every custom save until the custom one gets another id in the dashboard's custom \
-                 catalog"
-            );
-        }
-        self.locate(id)
-    }
-
-    /// Whether both stores have a provider with the id `id`, in any case.
-    fn in_both_stores(
-        &self,
-        id: &str,
-    ) -> bool {
-        self.built_in
+        // Only the other store's matches are used below: a built-in one when
+        // the custom provider is shown, and a custom one, the same id
+        // included, when the built-in provider is shown.
+        let same_but_case = |provider: &&Value| enum_value(provider).eq_ignore_ascii_case(id);
+        let built_in_twin = self
+            .built_in
             .iter()
-            .any(|provider| enum_value(provider).eq_ignore_ascii_case(id))
-            && custom_providers(&self.custom)
-                .iter()
-                .any(|provider| enum_value(provider).eq_ignore_ascii_case(id))
+            .find(same_but_case)
+            .map(|provider| enum_value(provider).to_owned());
+        let custom_twin = custom_providers(&self.custom)
+            .iter()
+            .find(same_but_case)
+            .map(|provider| enum_value(provider).to_owned());
+        let found = self.locate(id)?;
+        match (found.source, built_in_twin, custom_twin) {
+            (Source::BuiltIn, _, Some(custom)) => eprintln!(
+                "warning: custom provider '{}' has this built-in provider's id, in any case; Agent Stream ignores it, \
+                 and it blocks every custom save until it is deleted",
+                sanitize_for_terminal(&custom)
+            ),
+            (Source::Custom, Some(built_in), _) => eprintln!(
+                "warning: Agent Stream ignores custom provider '{id}' while built-in provider '{}' exists, so these are \
+                 not the models and prices in use; it also blocks every custom save until it is deleted",
+                sanitize_for_terminal(&built_in)
+            ),
+            _ => {}
+        }
+        Ok(found)
     }
 
     /// The provider `id`, built-in first. Ids are matched exactly, as a
@@ -682,10 +707,10 @@ async fn create(
         return Ok(());
     }
     let new = provider.clone();
-    edit_custom(client, &catalog.custom, |providers| providers.push(new)).await?;
+    let answer = edit_custom(client, &catalog.custom, |providers| providers.push(new)).await?;
     match output {
         Output::Table => println!("{}", confirmation_line("Created", "custom provider", &id)),
-        Output::Json => println!("{}", pretty_json_for_terminal(&read_back(client, &id).await?)?),
+        Output::Json => println!("{}", pretty_json_for_terminal(&saved_custom_provider(&answer, &id)?)?),
     }
     Ok(())
 }
@@ -841,6 +866,15 @@ async fn set_price(
     if let Some(price) = args.output_price {
         model.insert("cost_per_1k_output".to_owned(), json!(price));
     }
+    for (missing, flag) in [("cost_per_1k_input", "--input-price"), ("cost_per_1k_output", "--output-price")] {
+        if !model.contains_key(missing) {
+            bail!(
+                "model '{}' would have only one of its two prices, and Agent Stream uses a model's catalog prices \
+                 only when both are set; give {flag} too",
+                sanitize_for_terminal(&args.model)
+            );
+        }
+    }
     save(client, found, after, args.dry_run, output).await
 }
 
@@ -948,7 +982,7 @@ async fn save(
 ) -> Result<()> {
     check_provider(&after)?;
     let id = enum_value(&found.provider).to_owned();
-    let changes = surface_validate::changes(&found.provider, &after);
+    let changes = provider_changes(&found.provider, &after);
     if dry_run {
         println!("{}", preview(&changes, &after, output)?);
         return Ok(());
@@ -960,7 +994,9 @@ async fn save(
         }
         return Ok(());
     }
-    match found.source {
+    // Agent Stream answers a save with what it stored: the provider, for a
+    // built-in one, and the whole custom catalog, for a custom one.
+    let saved = match found.source {
         Source::BuiltIn => {
             let path = entity_path(BUILT_IN_PATH, &id);
             let current = read_built_in(client).await?;
@@ -969,7 +1005,7 @@ async fn save(
             }
             client
                 .request(Method::PUT, &path, Some(after))
-                .await?;
+                .await?
         }
         Source::Custom => {
             edit_custom(client, &found.custom, |providers| {
@@ -980,9 +1016,9 @@ async fn save(
                     *slot = after;
                 }
             })
-            .await?;
+            .await?
         }
-    }
+    };
     match output {
         Output::Table => {
             let mut lines = vec!["Changes:".to_owned()];
@@ -990,18 +1026,24 @@ async fn save(
             lines.push(confirmation_line("Updated", &format!("{} provider", found.source.label()), &id));
             println!("{}", lines.join("\n"));
         }
-        Output::Json => println!("{}", pretty_json_for_terminal(&read_back(client, &id).await?)?),
+        Output::Json => {
+            let saved = match found.source {
+                Source::BuiltIn => saved,
+                Source::Custom => saved_custom_provider(&saved, &id)?,
+            };
+            println!("{}", pretty_json_for_terminal(&saved)?);
+        }
     }
     Ok(())
 }
 
 /// Saves the custom catalog `before` with `edit` applied to its providers,
-/// through [`save_custom`].
+/// through [`save_custom`], and returns Agent Stream's answer.
 async fn edit_custom(
     client: &GatewayClient,
     before: &Value,
     edit: impl FnOnce(&mut Vec<Value>),
-) -> Result<()> {
+) -> Result<Value> {
     let mut after = before.clone();
     if let Some(providers) = after
         .get_mut("providers")
@@ -1013,30 +1055,24 @@ async fn edit_custom(
 }
 
 /// Sends `after` as the whole custom catalog, once a fresh read shows the
-/// catalog is still `before`. Custom entries Agent Stream would refuse in
-/// any save are named first, since they would block this one.
+/// catalog is still `before`, and returns Agent Stream's answer. Agent Stream
+/// checks the whole catalog it is sent, so entries in `after` that it would
+/// refuse in any save are named first: an id that isn't valid, an id a
+/// built-in provider also has in any case, and two custom ids that differ
+/// only in case. Agent Stream reports any other problem itself.
 async fn save_custom(
     client: &GatewayClient,
     before: &Value,
     after: Value,
-) -> Result<()> {
+) -> Result<Value> {
     let built_in = read_built_in(client).await?;
-    let blocking: Vec<String> = custom_providers(before)
-        .iter()
-        .map(enum_value)
-        .filter(|id| {
-            check_id(id).is_err()
-                || built_in
-                    .iter()
-                    .any(|provider| enum_value(provider).eq_ignore_ascii_case(id))
-        })
-        .map(|id| format!("'{}'", sanitize_for_terminal(id)))
-        .collect();
+    let blocking = blocking_entries(&built_in, &after);
     if !blocking.is_empty() {
         bail!(
-            "the custom catalog has entries Agent Stream refuses, which block every custom save: {} (an id that is \
-             not 1 to {MAX_ID_LEN} letters, digits, '-', or '_', or one a built-in provider also has); fix them in the \
-             dashboard's custom catalog first",
+            "the custom catalog would still hold entries Agent Stream refuses, which block every custom save: {} \
+             (an id that is not 1 to {MAX_ID_LEN} letters, digits, '-', or '_', an id a built-in provider also has \
+             in any case, or two custom ids that differ only in case); delete them with `fabric agent-stream \
+             providers delete <id>` or fix them in the dashboard's custom catalog first",
             blocking.join(", ")
         );
     }
@@ -1048,8 +1084,45 @@ async fn save_custom(
     }
     client
         .request(Method::PUT, CUSTOM_PATH, Some(after))
-        .await?;
-    Ok(())
+        .await
+}
+
+/// The entries of the custom catalog `custom` that Agent Stream refuses in
+/// any save, quoted for an error.
+fn blocking_entries(
+    built_in: &[Value],
+    custom: &Value,
+) -> Vec<String> {
+    let providers = custom_providers(custom);
+    providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| (index, enum_value(provider)))
+        .filter(|(index, id)| {
+            check_id(id).is_err()
+                || built_in
+                    .iter()
+                    .any(|provider| enum_value(provider).eq_ignore_ascii_case(id))
+                || providers
+                    .iter()
+                    .enumerate()
+                    .any(|(other, provider)| other != *index && enum_value(provider).eq_ignore_ascii_case(id))
+        })
+        .map(|(_, id)| format!("'{}'", sanitize_for_terminal(id)))
+        .collect()
+}
+
+/// The provider `id` from Agent Stream's answer to a custom catalog save,
+/// which lists every custom provider it stored.
+fn saved_custom_provider(
+    answer: &Value,
+    id: &str,
+) -> Result<Value> {
+    custom_providers(answer)
+        .iter()
+        .find(|provider| enum_value(provider) == id)
+        .cloned()
+        .with_context(|| format!("provider '{id}' was saved, but Agent Stream's answer did not include it"))
 }
 
 fn stale_message(id: &str) -> String {
@@ -1057,18 +1130,6 @@ fn stale_message(id: &str) -> String {
         "provider '{id}' was saved by someone else after it was read, so nothing was saved; run the command again to \
          change the new version"
     )
-}
-
-/// The provider `id` as Agent Stream has it after a save.
-async fn read_back(
-    client: &GatewayClient,
-    id: &str,
-) -> Result<Value> {
-    Catalog::read(client)
-        .await
-        .and_then(|catalog| catalog.find(id))
-        .map(|found| found.provider)
-        .with_context(|| format!("provider '{id}' was saved, but reading it back failed"))
 }
 
 /// `providers delete`: deletes a built-in provider on its own, or sends the
@@ -1102,6 +1163,94 @@ async fn delete(
         Output::Json => println!("{}", pretty_json_for_terminal(&answer)?),
     }
     Ok(())
+}
+
+/// What differs between the providers `before` and `after`. Models are
+/// matched by `value` and endpoints by `path`, so a change to one names it,
+/// such as `models[gpt-4o-mini].cost_per_1k_input`, and an added or removed
+/// one shows whole. A list whose items can't be matched that way (an item
+/// without the key, or a key twice), or whose only change is its order, is
+/// compared whole.
+fn provider_changes(
+    before: &Value,
+    after: &Value,
+) -> Vec<Change> {
+    const LISTS: [(&str, &str); 2] = [("models", "value"), ("endpoints", "path")];
+    let without_lists = |provider: &Value| {
+        let mut copy = provider.clone();
+        if let Some(fields) = copy.as_object_mut() {
+            for (list, _) in LISTS {
+                fields.remove(list);
+            }
+        }
+        copy
+    };
+    let mut changes = surface_validate::changes(&without_lists(before), &without_lists(after));
+    for (list, key) in LISTS {
+        let (old, new) = (before.get(list), after.get(list));
+        if old == new {
+            continue;
+        }
+        let keyed = |items: Option<&Value>| -> Option<Vec<(String, Value)>> {
+            let items = match items {
+                None => return Some(Vec::new()),
+                Some(items) => items.as_array()?,
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            items
+                .iter()
+                .map(|item| {
+                    let name = text_field(item, key);
+                    (!name.is_empty() && seen.insert(name)).then(|| (name.to_owned(), item.clone()))
+                })
+                .collect()
+        };
+        let mut item_changes = Vec::new();
+        if let (Some(old_items), Some(new_items)) = (keyed(old), keyed(new)) {
+            for (name, item) in &old_items {
+                let path = format!("{list}[{name}]");
+                match new_items
+                    .iter()
+                    .find(|(other, _)| other == name)
+                {
+                    None => item_changes.push(Change {
+                        path,
+                        before: Some(item.clone()),
+                        after: None,
+                    }),
+                    Some((_, new_item)) => item_changes.extend(
+                        surface_validate::changes(item, new_item)
+                            .into_iter()
+                            .map(|change| Change {
+                                path: format!("{path}.{}", change.path),
+                                ..change
+                            }),
+                    ),
+                }
+            }
+            for (name, item) in &new_items {
+                if !old_items
+                    .iter()
+                    .any(|(other, _)| other == name)
+                {
+                    item_changes.push(Change {
+                        path: format!("{list}[{name}]"),
+                        before: None,
+                        after: Some(item.clone()),
+                    });
+                }
+            }
+        }
+        if item_changes.is_empty() {
+            item_changes.push(Change {
+                path: list.to_owned(),
+                before: old.cloned(),
+                after: new.cloned(),
+            });
+        }
+        changes.extend(item_changes);
+    }
+    changes
 }
 
 /// What a dry run prints: the changes, or with --output json the changes and
@@ -1197,12 +1346,11 @@ mod tests {
 
     use super::{
         super::test_support::{
-            Route, json_file, request_body, run_stream, saved_login, scripted_agent_stream, sends_bearer, start_lines,
+            Route, TEST_ACCESS_TOKEN, json_file, request_body, run_stream, saved_login, scripted_agent_stream,
+            sends_bearer, start_lines,
         },
         *,
     };
-
-    const ACCESS_TOKEN: &str = "aspat_live-secret";
 
     const BUILT_IN: &str = r#"{"providers":[{"enum_value":"openai","name":"OpenAI","enabled":true,
         "models":[{"name":"GPT-4o mini","value":"gpt-4o-mini","cost_per_1k_input":0.00015},
@@ -1224,7 +1372,7 @@ mod tests {
         routes: Vec<Route>,
     ) -> (Result<()>, Arc<Mutex<Vec<String>>>) {
         let (host, requests) = scripted_agent_stream(routes).await;
-        let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+        let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
         let result = run_stream(words, saved, &credentials).await;
         (result, requests)
     }
@@ -1259,7 +1407,7 @@ mod tests {
             start_lines(&requests),
             ["GET /api/v1/llm-providers HTTP/1.1", "GET /api/v1/llm-providers/custom HTTP/1.1"]
         );
-        assert!(sends_bearer(&requests.lock().unwrap()[0], ACCESS_TOKEN));
+        assert!(sends_bearer(&requests.lock().unwrap()[0], TEST_ACCESS_TOKEN));
     }
 
     #[test]
@@ -1544,30 +1692,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_custom_entry_agent_stream_refuses_is_named_and_an_id_in_both_stores_is_refused() {
+    async fn a_custom_entry_whose_id_a_built_in_has_in_another_case_blocks_custom_saves_until_deleted() {
         let clashing = r#"{"raw":"{\"providers\":[{\"enum_value\":\"acme\",\"name\":\"Acme\"},{\"enum_value\":\"OPENAI\",\"name\":\"Copy\"}]}","providers":[]}"#;
-        let routes =
-            || vec![GET_BUILT_IN, ("GET /api/v1/llm-providers/custom", "HTTP/1.1 200 OK", clashing), PUT_CUSTOM];
+        let get_clashing: Route = ("GET /api/v1/llm-providers/custom", "HTTP/1.1 200 OK", clashing);
+        let routes = || {
+            vec![
+                GET_BUILT_IN,
+                get_clashing,
+                PUT_CUSTOM,
+                PUT_OPENAI,
+                ("DELETE /api/v1/llm-providers/openai", "HTTP/1.1 200 OK", r#"{"deleted":"openai"}"#),
+            ]
+        };
+
+        // A custom save that would keep the clashing entry is refused, naming it.
         let (result, requests) =
             run_providers(&["providers", "update", "acme", "--set", "description=x"], routes()).await;
         let text = error_text(result);
         assert!(text.contains("block every custom save: 'OPENAI'"), "{text}");
         assert_eq!(sent_writes(&requests), 0);
 
-        let (result, requests) = run_providers(&["providers", "delete", "openai"], routes()).await;
-        assert!(error_text(result).contains("names both a built-in provider and a custom one"));
-        assert_eq!(sent_writes(&requests), 0);
-        let (result, requests) = run_providers(&["providers", "enable-model", "openai", "gpt-4o"], routes()).await;
-        assert!(error_text(result).contains("names both a built-in provider and a custom one"));
-        assert_eq!(sent_writes(&requests), 0);
+        // Deleting the clashing entry is allowed, and sends the catalog without it.
+        let (result, requests) = run_providers(&["providers", "delete", "OPENAI"], routes()).await;
+        result.unwrap();
+        let lines = start_lines(&requests);
+        assert_eq!(lines.last().unwrap(), "PUT /api/v1/llm-providers/custom HTTP/1.1");
+        assert_eq!(body_of(&requests, lines.len() - 1), json!({"providers":[{"enum_value":"acme","name":"Acme"}]}));
 
-        // Reads still work, returning the built-in one with a warning.
-        for words in [&["providers", "get", "openai"][..], &["providers", "models", "openai"]] {
-            let (result, requests) = run_providers(words, routes()).await;
-            result.unwrap_or_else(|error| panic!("{words:?}: {error:#}"));
-            assert_eq!(sent_writes(&requests), 0, "{words:?}");
-        }
-        let catalog = Catalog {
+        // Changes to the built-in provider never touch the custom catalog, so they go ahead.
+        let (result, requests) =
+            run_providers(&["providers", "disable-model", "openai", "gpt-4o-mini"], routes()).await;
+        result.unwrap();
+        assert_eq!(
+            start_lines(&requests)
+                .last()
+                .unwrap(),
+            "PUT /api/v1/llm-providers/openai HTTP/1.1"
+        );
+
+        // Reads match the id exactly.
+        let catalog = || Catalog {
             built_in: serde_json::from_str::<Value>(BUILT_IN).unwrap()["providers"]
                 .as_array()
                 .unwrap()
@@ -1575,12 +1739,45 @@ mod tests {
             custom: json!({"providers":[{"enum_value":"OPENAI","name":"Copy"}]}),
         };
         assert_eq!(
-            catalog
+            catalog()
                 .find_to_read("openai")
                 .unwrap()
                 .source,
             Source::BuiltIn
         );
+        let custom = catalog()
+            .find_to_read("OPENAI")
+            .unwrap();
+        assert_eq!(custom.source, Source::Custom);
+        assert_eq!(custom.provider["name"], json!("Copy"));
+    }
+
+    #[test]
+    fn an_id_both_stores_have_exactly_is_refused_for_changes() {
+        let catalog = Catalog {
+            built_in: serde_json::from_str::<Value>(BUILT_IN).unwrap()["providers"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            custom: json!({"providers":[{"enum_value":"openai","name":"Copy"}]}),
+        };
+        let text = format!(
+            "{:#}",
+            catalog
+                .find("openai")
+                .unwrap_err()
+        );
+        assert!(text.contains("names both a built-in provider and a custom one"), "{text}");
+    }
+
+    #[test]
+    fn blocking_entries_name_bad_ids_built_in_ids_and_custom_ids_twice_ignoring_case() {
+        let built_in = vec![json!({"enum_value":"openai"})];
+        let custom = json!({"providers":[
+            {"enum_value":"ok"}, {"enum_value":"bad id"}, {"enum_value":"OpenAI"},
+            {"enum_value":"dup"}, {"enum_value":"DUP"}]});
+        assert_eq!(blocking_entries(&built_in, &custom), ["'bad id'", "'OpenAI'", "'dup'", "'DUP'"]);
+        assert!(blocking_entries(&built_in, &json!({"providers":[{"enum_value":"ok"}]})).is_empty());
     }
 
     #[tokio::test]
@@ -1653,6 +1850,142 @@ mod tests {
         .await;
         result.unwrap();
         assert_eq!(last_provider(&requests)["enabled"], json!(true));
+    }
+
+    #[test]
+    fn model_and_endpoint_changes_name_the_item_they_change() {
+        let before = json!({"enum_value":"openai","name":"OpenAI",
+            "models":[{"name":"Mini","value":"gpt-4o-mini","cost_per_1k_input":0.00015,"cost_per_1k_output":0.0006},
+                      {"name":"Old","value":"old"}],
+            "endpoints":[{"name":"Chat","path":"/v1/chat"}]});
+        let mut after = before.clone();
+        after["models"][0]["cost_per_1k_input"] = json!(0.0002);
+        after["models"][1] = json!({"name":"New","value":"new"});
+        after["endpoints"][0]["name"] = json!("Chat completions");
+        let changes = provider_changes(&before, &after);
+        assert_eq!(
+            change_lines(&changes),
+            [
+                "  models[gpt-4o-mini].cost_per_1k_input: 0.00015 -> 0.0002",
+                "  models[old]: {\"name\":\"Old\",\"value\":\"old\"} -> (absent)",
+                "  models[new]: (absent) -> {\"name\":\"New\",\"value\":\"new\"}",
+                "  endpoints[/v1/chat].name: \"Chat\" -> \"Chat completions\"",
+            ]
+        );
+        let printed: Value = serde_json::from_str(&preview(&changes, &after, Output::Json).unwrap()).unwrap();
+        assert_eq!(
+            printed["changes"][0],
+            json!({"path":"models[gpt-4o-mini].cost_per_1k_input","before":0.00015,"after":0.0002})
+        );
+
+        // A list whose only change is its order is shown whole.
+        let mut reordered = before.clone();
+        reordered["models"] = json!([before["models"][1], before["models"][0]]);
+        assert_eq!(provider_changes(&before, &reordered)[0].path, "models");
+    }
+
+    #[tokio::test]
+    async fn a_set_price_dry_run_names_the_model_and_saves_nothing() {
+        let (result, requests) = run_providers(
+            &["providers", "set-price", "acme", "a", "--input-price", "0.5", "--output-price", "1.5", "--dry-run"],
+            vec![GET_BUILT_IN, GET_CUSTOM, PUT_CUSTOM],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(sent_writes(&requests), 0);
+    }
+
+    #[tokio::test]
+    async fn set_price_refuses_to_leave_a_model_with_only_one_price() {
+        let (result, requests) = run_providers(
+            &["providers", "set-price", "openai", "gpt-4o-mini", "--input-price", "0.0002"],
+            vec![GET_BUILT_IN, GET_CUSTOM, PUT_OPENAI],
+        )
+        .await;
+        let text = error_text(result);
+        assert!(text.contains("only one of its two prices"), "{text}");
+        assert!(text.contains("give --output-price too"), "{text}");
+        assert_eq!(sent_writes(&requests), 0);
+
+        let (result, requests) = run_providers(
+            &["providers", "set-price", "openai", "gpt-4o-mini", "--output-price", "0.0006"],
+            vec![GET_BUILT_IN, GET_CUSTOM, PUT_OPENAI],
+        )
+        .await;
+        result.unwrap();
+        let sent = body_of(&requests, start_lines(&requests).len() - 1);
+        assert_eq!(sent["models"][0]["cost_per_1k_output"], json!(0.0006));
+    }
+
+    #[tokio::test]
+    async fn json_output_after_a_save_comes_from_agent_stream_s_answer_with_no_extra_read() {
+        let stored = r#"{"providers":[{"enum_value":"acme","name":"Acme","description":"x"},{"enum_value":"other","name":"Other","extra":1}]}"#;
+        let (result, requests) = run_providers(
+            &["-o", "json", "providers", "update", "acme", "--set", "description=x"],
+            vec![GET_BUILT_IN, GET_CUSTOM, ("PUT /api/v1/llm-providers/custom", "HTTP/1.1 200 OK", stored)],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            start_lines(&requests)
+                .last()
+                .unwrap(),
+            "PUT /api/v1/llm-providers/custom HTTP/1.1"
+        );
+
+        let (result, requests) = run_providers(
+            &["-o", "json", "providers", "create", "--id", "new-llm", "--name", "New"],
+            vec![
+                GET_BUILT_IN,
+                GET_CUSTOM,
+                (
+                    "PUT /api/v1/llm-providers/custom",
+                    "HTTP/1.1 200 OK",
+                    r#"{"providers":[{"enum_value":"new-llm","name":"New","enabled":true}]}"#,
+                ),
+            ],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            start_lines(&requests)
+                .last()
+                .unwrap(),
+            "PUT /api/v1/llm-providers/custom HTTP/1.1"
+        );
+
+        let (result, requests) = run_providers(
+            &["-o", "json", "providers", "disable-model", "openai", "gpt-4o-mini"],
+            vec![GET_BUILT_IN, GET_CUSTOM, PUT_OPENAI],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            start_lines(&requests)
+                .last()
+                .unwrap(),
+            "PUT /api/v1/llm-providers/openai HTTP/1.1"
+        );
+
+        assert_eq!(
+            saved_custom_provider(&serde_json::from_str(stored).unwrap(), "acme").unwrap(),
+            json!({"enum_value":"acme","name":"Acme","description":"x"})
+        );
+        let missing = format!("{:#}", saved_custom_provider(&json!({"providers":[]}), "acme").unwrap_err());
+        assert!(missing.contains("was saved, but Agent Stream's answer did not include it"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn agent_stream_s_refusal_of_a_custom_save_reaches_the_user() {
+        let refusal = r#"{"error":"default_base_url 'https://10.0.0.1' must resolve to a public address"}"#;
+        let (result, _) = run_providers(
+            &["providers", "update", "acme", "--set", "default_base_url=https://10.0.0.1"],
+            vec![GET_BUILT_IN, GET_CUSTOM, ("PUT /api/v1/llm-providers/custom", "HTTP/1.1 400 Bad Request", refusal)],
+        )
+        .await;
+        let text = error_text(result);
+        assert!(text.contains("must resolve to a public address"), "{text}");
+        assert!(!text.contains(TEST_ACCESS_TOKEN), "{text}");
     }
 
     #[test]

@@ -460,13 +460,17 @@ manages the Model catalog, which Agent Stream keeps in two stores. `Catalog::rea
 both: the built-in providers from `/v1/llm-providers`, and the custom catalog from the
 `raw` text of `/v1/llm-providers/custom`, not its parsed `providers`, which leave out any
 entry Agent Stream can't use, so a save never drops one silently. A provider is found in
-whichever store has it. A built-in one is saved with `PUT` or removed with `DELETE` on its
+whichever store has it, by its exact id. A built-in one is saved with `PUT` or removed with `DELETE` on its
 own route; a custom one, and every new provider, by sending the whole custom catalog with
 `PUT /v1/llm-providers/custom`. Neither store has a version check or an `updated_at`, so
 `save` reads the store again and sends only when it is unchanged: the provider for a
-built-in one, the whole custom catalog for a custom one. Before a custom save, entries
-Agent Stream would refuse (an invalid id, or one a built-in provider also has) are named,
-since they block every custom save. Flag edits reuse `surface_patch::build_patch` and
+built-in one, the whole custom catalog for a custom one. Agent Stream answers a save with
+what it stored, so `--output json` prints from that answer with no read after it. Before a
+custom save, `blocking_entries` names the entries of the catalog about to be sent that
+Agent Stream would refuse (an invalid id, an id a built-in provider has in any case, or
+two custom ids that differ only in case), since they block every custom save; checking
+the catalog after the change lets a delete clear one. `provider_changes` matches models
+by `value` and endpoints by `path`, so change lists name the item that changed. Flag edits reuse `surface_patch::build_patch` and
 `surface_validate::merge`, but refuse brackets, list positions, and `enum_value` before
 anything is read. Agent Stream keeps unknown provider fields, so field names are not
 checked, but two models with one `value` are refused. A provider has no `updated_at`, so
