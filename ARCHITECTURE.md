@@ -480,6 +480,28 @@ is refused, and so is removing the last version.
 version unless `--make-default` is given, so callers who name no version keep the version
 they had. `create --dry-run` runs before any connection is resolved.
 
+`fabric agent-stream members` and `fabric agent-stream teams` (in
+[`agent_stream/members.rs`](src/agent_stream/members.rs) and
+[`agent_stream/teams.rs`](src/agent_stream/teams.rs)) manage `/v1/members` and
+`/v1/teams`. Both go through [`agent_stream/records.rs`](src/agent_stream/records.rs),
+which holds what they share: `Kind` (a collection's path and how messages name it), the
+id check before an id goes into a path, the field-name check, the `update --file`
+replacement, and `save`. Agent Stream replaces the whole record on `PUT` and has no
+version check, so `save` sends the record built on this machine only after a second read
+shows `updated_at` unchanged; Agent Stream stamps `updated_at` on every save and answers
+the save with the record as stored, which `--output json` prints. Agent Stream checks only
+a member's first identifier against the others, so `members create`, and an `update` that
+changes identifiers, read `GET /v1/members` first and refuse any identifier value another
+member has, of any kind. Agent Stream filters that list by the login's tenant and scope, so
+the check covers only the members the login can see. A field name
+the stored record already has counts as known, so a field a newer Agent Stream adds does
+not block a save. Each `Kind` names the fields these commands never change (a member's
+budget and limits, a team's budget and token cap): `update` keeps them, `update --file`
+refuses a change to them and fills in any it leaves out, and `create` refuses them.
+Agent Stream assigns member and team ids, so `create` sends an empty `id`. A team holds member ids only: `teams` resolves a member named by identifier through
+`GET /v1/members`, and `add-member` and `remove-member` use the team's own member routes,
+which change the stored team without a full replace.
+
 ## Invariants
 
 Breaking one of these is a correctness bug, not a style question.
@@ -508,7 +530,7 @@ Every file in [`src/`](src/) and what it owns.
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
 | [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, `remembering_probes`, which keeps a host's answer for the length of an interactive shell, and the names messages give each product (`message_name`, `message_subject`, `connection_noun`, `surface_noun`). |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, `prompts.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, `prompts.rs`, `members.rs`, `teams.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), `records.rs` for what `members` and `teams` share, and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |

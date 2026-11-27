@@ -18,15 +18,18 @@ mod identities;
 mod jwt_verification_strategies;
 mod login;
 mod logs;
+mod members;
 mod metrics;
 mod notifications;
 mod policies;
 mod prompt_content;
 mod prompts;
+mod records;
 mod request;
 mod secrets;
 mod settings;
 mod surfaces;
+mod teams;
 mod tenant_ownership;
 mod terms;
 #[cfg(test)]
@@ -170,6 +173,29 @@ enum AgentStreamCommand {
     Config {
         #[command(subcommand)]
         command: config::ConfigCommand,
+    },
+    /// Manage Members: the known callers, a person, service, or API key, that
+    /// usage, limits, and spend are counted against.
+    ///
+    /// Reading members needs the `members.view` permission, creating and
+    /// changing them `members.edit`, and deleting them `members.delete`; by
+    /// default only administrators have them. `create` and `update` also read
+    /// the member list or the member first, so they need `members.view` too.
+    Members {
+        #[command(subcommand)]
+        command: members::MemberCommand,
+    },
+    /// Manage Teams: groups of Members with a shared budget.
+    ///
+    /// Reading teams needs the `teams.view` permission, creating and changing
+    /// them, members included, `teams.edit`, and deleting them
+    /// `teams.delete`; by default only administrators have them. `update`,
+    /// `add-member`, and `remove-member` also read the team first, so they
+    /// need `teams.view` too. Naming a member by identifier, and the members
+    /// table of `teams get`, need `members.view`.
+    Teams {
+        #[command(subcommand)]
+        command: teams::TeamCommand,
     },
     /// Manage surfaces.
     ///
@@ -578,6 +604,12 @@ async fn run_command(
         }
         AgentStreamCommand::Prompts { command } => {
             return prompts::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+        }
+        AgentStreamCommand::Members { command } => {
+            return members::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+        }
+        AgentStreamCommand::Teams { command } => {
+            return teams::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
         }
         AgentStreamCommand::Tokens { command } => {
             let command = AccessTokenCommand::from(command);
