@@ -272,16 +272,16 @@ the uncapped and multi-line variants.
 
 After the client is built, `dispatch_with` calls `run_and_print`, which does some
 per-command preparation, then calls the group's handler. `fabric agent-stream secrets`,
-`users`, `identities`, `api-keys`, `policies`, `settings`, `user-settings`, `terms`,
-`notifications`, `certificates`, `credential-providers`, `jwt-verification-strategies`,
-`delegation-vault`, `audit`, `metrics`, and `logs` reach the same function through
-`run_shared`, with a `SharedCommand` mapped from their own clap enums, so both products
+`users`, `identities`, `api-keys`, `policies`, `connections`, `connection-points`,
+`mediators`, `settings`, `user-settings`, `terms`, `notifications`, `certificates`,
+`credential-providers`, `jwt-verification-strategies`, `delegation-vault`, `audit`,
+`metrics`, and `logs` reach the same function through `run_shared`, with a `SharedCommand` mapped from their own clap enums, so both products
 print the same tables and confirmation lines. `tenant-ownership` takes Agent Stream's
 own resource kinds, so `run_shared` sends it straight to `run_ownership_change`, which
 the Agent Gateway command also ends in. An Agent Stream delete or revoke without `--yes`
-(`policies delete`, `certificates delete`, `credential-providers delete`,
-`jwt-verification-strategies delete`, `delegation-vault revoke`, and `revoke-user`)
-carries `ask_first`, so `run_shared` asks first through a `Prompter`, the terminal in a
+(`policies delete`, `connections delete`, `certificates delete`,
+`credential-providers delete`, `jwt-verification-strategies delete`,
+`delegation-vault revoke`, and `revoke-user`) carries `ask_first`, so `run_shared` asks first through a `Prompter`, the terminal in a
 real run and `ScriptedPrompter` in tests, and `refuse_before_connecting` refuses it with
 no terminal before anything is sent. Before asking, `revoke-user` counts the hash's grants
 in the grant list, so the question says how many the list shows; with none, it asks whether
@@ -408,9 +408,9 @@ a bad edit fails with a clear message before anything is sent.
 
 | Module | Owns | Used by |
 | --- | --- | --- |
-| [`surface_patch.rs`](src/surface_patch.rs) | `build_patch` turns `--set`, `--unset`, `--add`, and `--remove` into one JSON Merge Patch (RFC 7396). Handles bracketed selectors such as `gates[g-1]` and `transit.points[billing]`, and refuses overlapping paths. | `surfaces update`, `add-transit-point`, `remove-transit-point` |
+| [`surface_patch.rs`](src/surface_patch.rs) | `build_patch` turns `--set`, `--unset`, `--add`, and `--remove` into one JSON Merge Patch (RFC 7396). Handles bracketed selectors such as `gates[g-1]` and `transit.points[billing]`, and refuses overlapping paths. | `surfaces update`, `add-transit-point`, `remove-transit-point`; `fabric agent-stream providers update` |
 | [`features.rs`](src/features.rs) | The `FEATURES` registry: each `Feature` has a key, aliases, a description, and `Placement`s (edge, direction, JSON pointer, `ValueKind`). `build_patch` makes the merge patch that adds or removes one feature. `on_surface` reports which features a surface has. | `surfaces features`, `add-feature`, `remove-feature` |
-| [`surface_validate.rs`](src/surface_validate.rs) | `merge` applies a merge patch the way the gateway does; `check_surface` checks the fields every surface needs; `changes` lists what a patch changes. | Every surface edit, and dry runs |
+| [`surface_validate.rs`](src/surface_validate.rs) | `merge` applies a merge patch the way the gateway does; `check_surface` checks the fields every surface needs; `changes` lists what a patch changes. | Every surface edit, and dry runs; `fabric agent-stream providers update` and its model commands |
 | [`tool_gate_preview.rs`](src/tool_gate_preview.rs) | Follows the gateway's MCP tool-gating rules (`decide`, `preview`) to show which gate allows or denies each tool, trying unpinned condition policies both ways. | `surfaces tool-gate-preview`, and pattern checks in `surface_patch` |
 
 A surface edit in `commands.rs` follows one shape (the exceptions are `surfaces update
@@ -455,6 +455,72 @@ because Agent Stream answers a save with an `updated_at` its store then replaces
 only a fresh read can go back to `--file`. A dry run of `create` or `update` prints the
 same JSON shape (`dry_run`, `changes`, `after`), and `create --dry-run` runs before any
 connection is resolved, so it needs no saved connection.
+`fabric agent-stream providers` (in [`agent_stream/providers.rs`](src/agent_stream/providers.rs))
+manages the Model catalog, which Agent Stream keeps in two stores. `Catalog::read` reads
+both: the built-in providers from `/v1/llm-providers`, and the custom catalog from the
+`raw` text of `/v1/llm-providers/custom`, not its parsed `providers`, which leave out any
+entry Agent Stream can't use, so a save never drops one silently. A provider is found in
+whichever store has it, by its exact id. A built-in one is saved with `PUT` or removed with `DELETE` on its
+own route; a custom one, and every new provider, by sending the whole custom catalog with
+`PUT /v1/llm-providers/custom`. Neither store has a version check or an `updated_at`, so
+`save` reads the store again and sends only when it is unchanged: the provider for a
+built-in one, the whole custom catalog for a custom one. Agent Stream answers a save with
+what it stored, so `--output json` prints from that answer with no read after it. Before a
+custom save, `blocking_entries` names the entries of the catalog about to be sent that
+Agent Stream would refuse (an invalid id, an id a built-in provider has in any case, or
+two custom ids that differ only in case), since they block every custom save; checking
+the catalog after the change lets a delete clear one. `provider_changes` matches models
+by `value` and endpoints by `path`, so change lists name the item that changed. Flag edits reuse `surface_patch::build_patch` and
+`surface_validate::merge`, but refuse brackets, list positions, and `enum_value` before
+anything is read. Agent Stream keeps unknown provider fields, so field names are not
+checked, but two models with one `value` are refused. A provider has no `updated_at`, so
+a stale `update --file` can't be detected.
+
+`fabric agent-stream prompts` (in [`agent_stream/prompts.rs`](src/agent_stream/prompts.rs))
+manages prompt templates at `/v1/prompts`. A template keeps its versions inside one
+document, and Agent Stream has no route for one version, no `PATCH`, and no version
+check, so every change (`update`, `add-version`, `set-default`, `remove-version`) reads
+the template, builds the whole new template on this machine, and goes through `save`.
+`save` checks the template as Agent Stream would (`check_template`: the id, a name,
+unique version numbers, at least one message per version, a default that exists) and
+refuses field names outside `PROMPT_FIELDS`, `VERSION_FIELDS`, and `MESSAGE_FIELDS`,
+since Agent Stream drops an unknown field without an error. A name the stored template
+already has at the same level counts as known, for a field a newer Agent Stream added.
+It then reads the template again and sends it with `PUT` only when `updated_at` has not
+moved; a `--file` must carry the current `updated_at`. Changes, in table output and in a
+dry run's `--output json`, are listed per field outside `versions` and per version
+number, and `prompts list` leaves out every version's messages in both outputs. Messages
+print only where a whole template or a render is shown: `get`, `render`, `create`'s
+`--dry-run` and `--output json`, the `after` of a dry run's `--output json`, and the
+`--output json` of a save or of a change that sends nothing. A save's `--output json` is
+Agent Stream's answer to the `PUT`, which is the template as stored, `updated_at` included,
+so it can go straight back to `--file` without another read. A template with no versions
+is refused, and so is removing the last version.
+`add-version` on a template with no `default_version` sets it to the highest existing
+version unless `--make-default` is given, so callers who name no version keep the version
+they had. `create --dry-run` runs before any connection is resolved.
+
+`fabric agent-stream members` and `fabric agent-stream teams` (in
+[`agent_stream/members.rs`](src/agent_stream/members.rs) and
+[`agent_stream/teams.rs`](src/agent_stream/teams.rs)) manage `/v1/members` and
+`/v1/teams`. Both go through [`agent_stream/records.rs`](src/agent_stream/records.rs),
+which holds what they share: `Kind` (a collection's path and how messages name it), the
+id check before an id goes into a path, the field-name check, the `update --file`
+replacement, and `save`. Agent Stream replaces the whole record on `PUT` and has no
+version check, so `save` sends the record built on this machine only after a second read
+shows `updated_at` unchanged; Agent Stream stamps `updated_at` on every save and answers
+the save with the record as stored, which `--output json` prints. Agent Stream checks only
+a member's first identifier against the others, so `members create`, and an `update` that
+changes identifiers, read `GET /v1/members` first and refuse any identifier value another
+member has, of any kind. Agent Stream filters that list by the login's tenant and scope, so
+the check covers only the members the login can see. A field name
+the stored record already has counts as known, so a field a newer Agent Stream adds does
+not block a save. Each `Kind` names the fields these commands never change (a member's
+budget and limits, a team's budget and token cap): `update` keeps them, `update --file`
+refuses a change to them and fills in any it leaves out, and `create` refuses them.
+Agent Stream assigns member and team ids, so `create` sends an empty `id`. A team holds member ids only: `teams` resolves a member named by identifier through
+`GET /v1/members`, and `add-member` and `remove-member` use the team's own member routes,
+which change the stored team without a full replace.
 
 `surfaces features`, `add-feature`, `remove-feature`, and `budget` live in
 [`agent_stream/surfaces/features.rs`](src/agent_stream/surfaces/features.rs), a child of
@@ -516,7 +582,7 @@ Every file in [`src/`](src/) and what it owns.
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
 | [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, `remembering_probes`, which keeps a host's answer for the length of an interactive shell, and the names messages give each product (`message_name`, `message_subject`, `connection_noun`, `surface_noun`). |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs` with its child `surfaces/features.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs` with its child `surfaces/features.rs`, `prompts.rs`, `members.rs`, `teams.rs`, `providers.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `connections.rs`, `connection_points.rs`, `mediators.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), `records.rs` for what `members` and `teams` share, and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |

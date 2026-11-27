@@ -613,6 +613,40 @@ fn policies_delete_without_yes_and_with_a_typed_host_and_no_terminal_sends_nothi
 
 #[cfg(feature = "agent-stream")]
 #[test]
+fn connections_delete_without_yes_and_with_a_typed_host_and_no_terminal_sends_nothing() {
+    let (host, requests) = agent_stream_host();
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "--host", &host, "connections", "delete", "g-1"],
+        &[],
+        &[("FABRIC_TOKEN", SESSION_TOKEN)],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("refusing to delete 'g-1' without confirmation in a non-interactive session"), "{text}");
+    assert!(request_lines(&requests).is_empty(), "{:?}", request_lines(&requests));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connections_delete_with_yes_sends_the_delete_without_asking() {
+    let (host, requests) = agent_stream_stand_in(vec![("DELETE /api/v1/gateways/g-1", "204 No Content", "")]);
+
+    let output = fabric_on_stream(&host, &["connections", "delete", "g-1", "--yes"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("[y/N]"), "{}", stderr(&output));
+    assert!(
+        request_lines(&requests).contains(&"DELETE /api/v1/gateways/g-1 HTTP/1.1".to_owned()),
+        "{:?}",
+        request_lines(&requests)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
 fn credential_deletes_and_revokes_without_yes_and_with_a_typed_host_and_no_terminal_send_nothing() {
     for (words, refusal) in [
         (&["certificates", "delete", "cert-1"][..], "refusing to delete 'cert-1'"),
@@ -1036,6 +1070,113 @@ fn drift_runs_get_hides_samples_unless_reveal_and_then_warns() {
     assert!(stderr(&shown).contains("warning: this output contains prompt content"), "{}", stderr(&shown));
 }
 
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connections_connection_points_and_mediators_lists_print_the_agent_gateway_tables_and_runtime_status_json() {
+    let (host, _) = agent_stream_stand_in(vec![
+        (
+            "GET /api/v1/gateways",
+            "200 OK",
+            r#"[{"id":"g-1","name":"Partner","description":"","did":"did:web:partner.example","gateway_type":"remote","status":"active","creation_type":"user","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-02T00:00:00Z","exposed_channels":[],"runtime_status":{"status":"connected","last_active_at":"2026-11-02T00:00:00Z"}}]"#,
+        ),
+        (
+            "GET /api/v1/connection-points",
+            "200 OK",
+            r#"[{"id":"cp-1","gateway_id":"g-self","mediator_id":"m-1","connection_point_did":"did:web:x","name":"Front door","description":"","oob_url":"https://x","use_count":2,"expires_at":null,"integration_id":null,"integration_variables":{},"integrations":[],"cp_type":"user","exposed_channels":[],"enabled":true,"did_method":"web"}]"#,
+        ),
+        (
+            "GET /api/v1/mediators",
+            "200 OK",
+            r#"[{"id":"m-1","name":"EU mediator","description":"Main","did":"did:web:mediator.example","status":"active","our_did":"did:peer:2.x","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-01T00:00:00Z"}]"#,
+        ),
+    ]);
+
+    let connections = fabric_on_stream(&host, &["connections", "list"], "");
+    let connections_json = fabric_on_stream(&host, &["--output", "json", "connections", "list"], "");
+    let points = fabric_on_stream(&host, &["connection-points", "list"], "");
+    let mediators = fabric_on_stream(&host, &["mediators", "list"], "");
+
+    assert_eq!(
+        stdout(&connections),
+        "NAME     ID   TYPE    STATUS  UPDATED\n\
+         Partner  g-1  remote  active  2026-11-02T00:00:00Z\n",
+        "{}",
+        stderr(&connections)
+    );
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&connections_json)).expect("JSON");
+    assert_eq!(listed[0]["runtime_status"]["status"], "connected", "{}", stderr(&connections_json));
+    assert_eq!(
+        stdout(&points),
+        "NAME        ID    CONNECTION  ENABLED  USES  EXPIRES\n\
+         Front door  cp-1  g-self      yes      2     never\n",
+        "{}",
+        stderr(&points)
+    );
+    assert_eq!(
+        stdout(&mediators),
+        "NAME         ID   STATUS  DID                       DESCRIPTION\n\
+         EU mediator  m-1  active  did:web:mediator.example  Main\n",
+        "{}",
+        stderr(&mediators)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connections_connection_points_and_mediators_print_the_agent_gateway_lines() {
+    let (host, _) = agent_stream_stand_in(vec![
+        ("POST /api/v1/gateways", "200 OK", r#"{"id":"g-1","name":"Partner"}"#),
+        ("PUT /api/v1/gateways/g-1", "200 OK", r#"{"id":"g-1","name":"Partner"}"#),
+        ("DELETE /api/v1/gateways/g-1", "204 No Content", ""),
+        ("PUT /api/v1/connection-points/cp-1", "200 OK", r#"{"id":"cp-1","name":"Door"}"#),
+        ("DELETE /api/v1/connection-points/cp-1", "204 No Content", ""),
+        ("POST /api/v1/mediators", "200 OK", r#"{"id":"m-1","name":"EU mediator"}"#),
+        ("PUT /api/v1/mediators/m-1", "200 OK", r#"{"id":"m-1","name":"EU mediator"}"#),
+        ("DELETE /api/v1/mediators/m-1", "204 No Content", ""),
+    ]);
+    let run = |args: &[&str]| fabric_on_stream(&host, args, r#"{"name":"x"}"#);
+
+    for (args, line) in [
+        (&["connections", "create", "--file", "-"][..], "Created connection 'g-1'\n"),
+        (&["connections", "update", "g-1", "--file", "-"], "Updated connection 'g-1'\n"),
+        (&["connections", "delete", "g-1", "--yes"], "Deleted connection 'g-1'\n"),
+        (&["connection-points", "update", "cp-1", "--file", "-"], "Updated connection point 'cp-1'\n"),
+        (&["connection-points", "delete", "cp-1"], "Deleted connection point 'cp-1'\n"),
+        (&["mediators", "create", "--file", "-"], "Created mediator 'm-1'\n"),
+        (&["mediators", "update", "m-1", "--file", "-"], "Updated mediator 'm-1'\n"),
+        (&["mediators", "delete", "m-1"], "Deleted mediator 'm-1'\n"),
+    ] {
+        let output = run(args);
+
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), line, "{args:?}: {}", stderr(&output));
+    }
+}
+
+/// The invitation secret a `connection-points create` document sends, which
+/// the stand-in sends back in its create answer.
+#[cfg(feature = "agent-stream")]
+const INVITATION_SECRET: &str = "invitation-secret-of-at-least-32-bytes";
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connection_points_create_prints_only_the_id_in_a_table_and_the_answer_in_json() {
+    let answer = r#"{"connection_point":{"id":"cp-1","gateway_id":"g-self","mediator_id":"m-1","name":"Door","use_count":0,"secret":"invitation-secret-of-at-least-32-bytes"}}"#;
+    let (host, _) = agent_stream_stand_in(vec![("POST /api/v1/connection-points", "200 OK", answer)]);
+    let document = format!(
+        r#"{{"gateway_id":"g-self","mediator_id":"m-1","name":"Door","description":"","secret":"{INVITATION_SECRET}"}}"#
+    );
+
+    let table = fabric_on_stream(&host, &["connection-points", "create", "--file", "-"], &document);
+    let json = fabric_on_stream(&host, &["--output", "json", "connection-points", "create", "--file", "-"], &document);
+
+    assert!(table.status.success(), "{}", stderr(&table));
+    assert_eq!(stdout(&table), "Created connection point 'cp-1'\n");
+    assert!(!stderr(&table).contains(INVITATION_SECRET), "{}", stderr(&table));
+    let printed: serde_json::Value = serde_json::from_str(&stdout(&json)).expect("JSON");
+    assert_eq!(printed["connection_point"]["secret"], INVITATION_SECRET);
+}
+
 /// The groups this build adds for an Agent Stream's account settings and
 /// credentials, each with a command that would otherwise parse.
 #[cfg(not(feature = "agent-stream"))]
@@ -1428,6 +1569,376 @@ fn tenant_ownership_set_names_the_agent_stream_impact_command_when_a_move_is_blo
         "{}",
         stderr(&output)
     );
+}
+
+/// Two prompt templates as Agent Stream lists them, messages included.
+#[cfg(feature = "agent-stream")]
+const PROMPT_TEMPLATES: &str = r#"[{"id":"greeter","name":"Greeter","status":"enabled","default_version":2,
+  "versions":[{"version":1,"messages":[{"role":"system","content":"SECRET-PROMPT-TEXT"}]},
+              {"version":2,"messages":[{"role":"system","content":"SECRET-PROMPT-TEXT"}]}],
+  "updated_at":"2026-11-02T00:00:00Z"}]"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_list_prints_each_template_with_its_version_numbers_and_never_its_messages() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, PROMPT_TEMPLATES);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "prompts", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("ID") && text.contains("VERSIONS") && text.contains("DEFAULT"), "{text}");
+    assert!(text.contains("greeter") && text.contains("1, 2"), "{text}");
+    assert!(!text.contains("SECRET-PROMPT-TEXT"), "{text}");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/prompts HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_render_prints_each_message_role_and_content() {
+    let answer = r#"{"messages":[{"role":"system","content":"Hi Ada"},{"role":"user","content":"Where is it?"}],"variables":["name"]}"#;
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, answer);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "prompts", "render", "greeter", "--var", "name=Ada"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "[system]\nHi Ada\n\n[user]\nWhere is it?\n");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "POST /api/v1/prompts/greeter/render HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_create_dry_run_prints_the_preview_and_needs_no_login() {
+    let home = tempfile::TempDir::new().expect("temp dir");
+    let template = home
+        .path()
+        .join("template.json");
+    std::fs::write(
+        &template,
+        r#"{"id":"greeter","name":"Greeter","versions":[{"version":1,"messages":[{"role":"user","content":"Hi"}]}]}"#,
+    )
+    .expect("template file");
+
+    let output = fabric_in_home(
+        home.path(),
+        &[
+            "agent-stream",
+            "prompts",
+            "create",
+            "--file",
+            template
+                .to_str()
+                .expect("path"),
+            "--dry-run",
+            "--output",
+            "json",
+        ],
+        &[],
+        &[UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let preview: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON preview");
+    assert_eq!(preview["dry_run"], serde_json::json!(true));
+    assert_eq!(preview["after"]["id"], serde_json::json!("greeter"));
+    assert!(
+        preview["changes"]
+            .as_array()
+            .expect("changes")
+            .contains(&serde_json::json!({"version": 1, "change": "added"})),
+        "{preview}"
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_list_as_json_keeps_each_template_but_never_its_messages() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, PROMPT_TEMPLATES);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "prompts", "list", "--output", "json"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(!text.contains("SECRET-PROMPT-TEXT"), "{text}");
+    let listed: serde_json::Value = serde_json::from_str(&text).expect("JSON list");
+    assert_eq!(listed[0]["id"], serde_json::json!("greeter"));
+    assert_eq!(listed[0]["versions"], serde_json::json!([{"version": 1}, {"version": 2}]));
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/prompts HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_create_shows_agent_streams_plain_text_refusal_and_exits_non_zero() {
+    let (host, requests) = host_replying(
+        vec![("GET /api/v1/permissions/public", "200 OK", AGENT_STREAM_PERMISSIONS)],
+        ("409 Conflict", "A prompt with id 'greeter' already exists"),
+    );
+    let home = tempfile::TempDir::new().expect("temp dir");
+    let template = home
+        .path()
+        .join("template.json");
+    std::fs::write(
+        &template,
+        r#"{"id":"greeter","name":"Greeter","versions":[{"version":1,"messages":[{"role":"user","content":"Hi"}]}]}"#,
+    )
+    .expect("template file");
+
+    let output = fabric_in_home(
+        home.path(),
+        &[
+            "agent-stream",
+            "prompts",
+            "create",
+            "--file",
+            template
+                .to_str()
+                .expect("path"),
+        ],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("A prompt with id 'greeter' already exists"), "{text}");
+    assert!(!text.contains(ACCESS_TOKEN), "{text}");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "POST /api/v1/prompts HTTP/1.1"]);
+}
+
+/// One member as Agent Stream lists it.
+#[cfg(feature = "agent-stream")]
+const MEMBER_LIST: &str = r#"[{"id":"m-ada","name":"Ada","status":"enabled","monthly_budget_usd":50,
+  "identifiers":[{"kind":"email","email":"ada@example.com"},{"kind":"api_key","key_name":"ada-key"}],
+  "updated_at":"2026-11-02T00:00:00Z"}]"#;
+
+/// One team as Agent Stream lists it.
+#[cfg(feature = "agent-stream")]
+const TEAM_LIST: &str = r#"[{"id":"t-research","name":"Research","status":"enabled","members":["m-ada","m-bob"],
+  "monthly_budget_usd":100,"updated_at":"2026-11-02T00:00:00Z"}]"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn members_list_prints_each_member_with_its_identifiers() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, MEMBER_LIST);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "members", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("IDENTIFIERS"), "{text}");
+    assert!(text.contains("m-ada") && text.contains("email:ada@example.com, api_key:ada-key"), "{text}");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/members HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn teams_list_prints_each_team_with_its_number_of_members() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, TEAM_LIST);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "teams", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("t-research"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        row.contains("Research")
+            && row
+                .split_whitespace()
+                .any(|cell| cell == "2"),
+        "{row}"
+    );
+    assert!(!text.contains("m-bob"), "{text}");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/teams HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn teams_create_dry_run_prints_the_preview_and_needs_no_login() {
+    let output = fabric_in_fresh_home(
+        &[
+            "agent-stream",
+            "teams",
+            "create",
+            "--name",
+            "Research",
+            "--member",
+            "m-ada",
+            "--dry-run",
+            "--output",
+            "json",
+        ],
+        &[],
+        &[UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let preview: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON preview");
+    assert_eq!(preview["dry_run"], serde_json::json!(true));
+    assert_eq!(preview["after"], serde_json::json!({"id": "", "name": "Research", "members": ["m-ada"]}));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn members_delete_shows_agent_stream_refusal_and_exits_non_zero() {
+    let (host, requests) = agent_stream_stand_in(vec![(
+        "DELETE /api/v1/members/m-ada",
+        "409 Conflict",
+        "Member belongs to team(s): Research. Remove them first.",
+    )]);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "members", "delete", "m-ada"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("Member belongs to team(s): Research. Remove them first."), "{text}");
+    assert!(!text.contains(ACCESS_TOKEN), "{text}");
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "DELETE /api/v1/members/m-ada HTTP/1.1"]);
+}
+
+/// One answer that serves both catalog reads: built-in providers under
+/// `providers`, and the custom catalog's text under `raw`.
+#[cfg(feature = "agent-stream")]
+const CATALOG: &str = r#"{"providers":[{"enum_value":"openai","name":"OpenAI","enabled":true,
+  "models":[{"name":"GPT-4o mini","value":"gpt-4o-mini","cost_per_1k_input":0.00015,"cost_per_1k_output":0.0006},
+            {"name":"GPT-4o","value":"gpt-4o","enabled":false}]}],
+  "raw":"{\"providers\":[{\"enum_value\":\"acme\",\"name\":\"Acme\"}]}"}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_list_prints_built_in_and_custom_providers_with_their_source() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, CATALOG);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "providers", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let row = |id: &str| {
+        text.lines()
+            .find(|line| line.starts_with(id))
+            .unwrap_or_else(|| panic!("{text}"))
+            .to_owned()
+    };
+    assert!(row("openai").contains("built-in"), "{text}");
+    assert!(row("acme").contains("custom"), "{text}");
+    assert_eq!(
+        request_lines(&requests),
+        [PROBE_REQUEST, "GET /api/v1/llm-providers HTTP/1.1", "GET /api/v1/llm-providers/custom HTTP/1.1"]
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_models_prints_each_model_with_its_prices_and_whether_it_is_enabled() {
+    let (host, _) = host_answering(AGENT_STREAM_PERMISSIONS, CATALOG);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "providers", "models", "openai"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let mini = text
+        .lines()
+        .find(|line| line.starts_with("gpt-4o-mini"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(mini.contains("yes") && mini.contains("0.00015") && mini.contains("0.0006"), "{mini}");
+    let full = text
+        .lines()
+        .find(|line| line.starts_with("gpt-4o "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(full.contains("no"), "{full}");
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_delete_of_a_custom_provider_prints_deleted_and_its_id_as_json() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, CATALOG);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "-o", "json", "providers", "delete", "acme"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let answer: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON answer");
+    assert_eq!(answer, serde_json::json!({"deleted": "acme"}));
+    assert_eq!(
+        request_lines(&requests)
+            .last()
+            .map(String::as_str),
+        Some("PUT /api/v1/llm-providers/custom HTTP/1.1")
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_list_refused_by_agent_stream_prints_its_reason_and_exits_non_zero() {
+    let probe = PROBE_REQUEST.trim_end_matches(" HTTP/1.1");
+    let (host, requests) = host_replying(
+        vec![(probe, "200 OK", AGENT_STREAM_PERMISSIONS)],
+        ("403 Forbidden", "missing permission llm_catalog.edit"),
+    );
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "providers", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("missing permission llm_catalog.edit"), "{text}");
+    assert!(!text.contains(ACCESS_TOKEN), "{text}");
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/llm-providers HTTP/1.1"]);
 }
 
 /// What Agent Stream answers to `GET /v1/pipes/s-1/budget`.

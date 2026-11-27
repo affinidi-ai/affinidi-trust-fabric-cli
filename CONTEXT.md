@@ -30,7 +30,7 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 | **System-owned resource** (Agent Stream) | A resource Agent Stream will not move to another tenant. `tenant-ownership impact` reports it as `immutable`, and `tenant-ownership set` refuses it. |
 | **Grant** (_delegated credential grant_) | The access and refresh tokens a user's OAuth consent to a credential provider leaves in the delegation vault, held for one agent (`agent_did`) and one user (`user_identity_hash`). Listed and revoked with `delegation-vault`; the CLI never prints a grant's tokens. A revoked grant comes back only when that user completes the provider's OAuth flow again. |
 | **OS credential store** | The macOS Keychain, Windows Credential Manager, or Linux Secret Service, where the CLI keeps tokens. Tokens are never written to the configuration file. |
-| **Gateway connection** | A gateway-to-gateway link managed with `fabric agent-gateway connections`. Unrelated to a connection profile. |
+| **Gateway connection** | A gateway-to-gateway link managed with `fabric agent-gateway connections`. On Agent Stream the counterpart is a **Trust Fabric connection**, defined under Trust Fabric, below. Unrelated to a connection profile. |
 
 ## Agent Surfaces
 
@@ -59,7 +59,7 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 | Term | Meaning |
 | --- | --- |
 | **Connection point** | A DIDComm endpoint, with its own DID and keys, through which an appliance exchanges messages with a peer appliance over the Trust Fabric. Managed with `fabric agent-gateway connection-points`. On Agent Stream, the connection point manages its own identity, so `fabric agent-stream identities` cannot change it. _Not the same as an access point._ |
-| **Trust Fabric connection** (Agent Stream) | An Agent Stream's record of one appliance in the Trust Fabric, itself or a peer, which its API calls a gateway and serves at `/v1/gateways`. A policy can be set on it, and in the audit log a decision by that policy has the scope `gateway`. The Agent Stream counterpart of a gateway connection. _Not the same as a connection, the saved profile._ |
+| **Trust Fabric connection** (Agent Stream) | An Agent Stream's record of one appliance in the Trust Fabric, itself (type `self`) or a peer (type `remote`), which its API calls a gateway and serves at `/v1/gateways`. Managed with `fabric agent-stream connections` in builds with the `agent-stream` feature. A policy can be set on it, and in the audit log a decision by that policy has the scope `gateway`. The Agent Stream counterpart of a gateway connection. _Not the same as a connection, the saved profile._ |
 
 ## Agent Stream governance and drift
 
@@ -83,6 +83,19 @@ Only in builds with the `agent-stream` feature. See [Governance and drift](docs/
 | **JSON output** | `--output json`: what the gateway or Agent Stream returned, for scripts, with masked values still masked and removed fields still left out. Agent Stream's `surfaces create --dry-run` and `surfaces update --dry-run` print a preview the CLI builds, `{dry_run, changes, after}`, and send nothing, and `surfaces update` prints the surface read back after the save. |
 | **Masked value** | A secret value, private key, or similar field the CLI hides in output unless `--reveal` is passed. A masked document must not be sent back, and the CLI refuses one that is. Agent Stream's `certificates`, `identities`, and `delegation-vault` have no `--reveal`, because Agent Stream never sends a private key or a grant's tokens: an identity carries only its `public_key`, and the CLI removes a certificate's `private_key_pem` or a grant's `access_token` and `refresh_token` should one appear, and prints a `note: hid` line naming what it removed. |
 | **Redaction** | Replacing credentials and personal data with `[redacted]`: always in error messages, and in audit and payment records unless `--reveal` is passed, so output can be logged safely. |
+
+## Agent Stream resources
+
+These exist only in builds with the `agent-stream` feature.
+
+| Term | Meaning |
+| --- | --- |
+| **Prompt template** | A saved prompt on an Agent Stream that a model request names by its id, filling `{{name}}` placeholders from the request's variables, instead of sending the prompt text. It holds numbered **versions**, each a list of messages with a role and content. Managed with `fabric agent-stream prompts`. Agent Stream's API calls it a _prompt_ and serves it at `/v1/prompts`. |
+| **Default version** | The version of a prompt template a request gets when it names none: `default_version`, or the highest version when that is unset. Changed with `prompts set-default`, which is how a template is rolled back. |
+| **Member** | A known caller of an Agent Stream, a person, service, or API key, that usage, limits, and spend are counted against. Recognised by its **identifiers**, written `KIND:VALUE` on the command line (`email:`, `subject:`, `api_key:`, or `custom:`). Managed with `fabric agent-stream members`. |
+| **Team** | A group of Members on an Agent Stream with a shared budget. A team holds member ids only; `teams add-member` and `teams remove-member` take a member's id or one of its identifiers. Managed with `fabric agent-stream teams`. |
+| **Model catalog** | The LLM providers an Agent Stream knows, with their endpoints, models, and prices, which it uses to route calls and work out their cost. Managed with `fabric agent-stream providers`. It holds no API keys: a provider's key is a secret that a surface names. |
+| **Provider** | One entry of the Model catalog, known by its id (`enum_value`), which a surface names. A **built-in** provider ships with Agent Stream and is replaced by a catalog refresh; a **custom** provider is added by a user, survives a refresh, and is saved by replacing the whole custom catalog. _Agent Stream's API calls these LLM providers._ |
 
 ## Related
 

@@ -407,3 +407,8 @@ impl Prompter for ScriptedPrompter {
             .push(line.to_owned());
     }
 }
+
+/// The access token tests save and send. It carries the `aspat_` prefix, so
+/// the CLI treats it as an Agent Stream access token, and says plainly that it
+/// is not a real one.
+pub const TEST_ACCESS_TOKEN: &str = "aspat_test-not-real";
