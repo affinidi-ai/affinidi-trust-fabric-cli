@@ -47,21 +47,24 @@ every place on this list that applies to a command that changes a surface: all b
   shell wiring.
 - `secrets`, `users`, `identities`, `api-keys`, `policies`, `connections`,
   `connection-points`, `mediators`, `settings`, `user-settings`, `terms`, `notifications`, `tenant-ownership`, `certificates`,
-  `credential-providers`, `jwt-verification-strategies`, `delegation-vault`, `audit`,
-  `metrics`, and `logs` also run on Agent Stream, through their own enums in
-  [`src/agent_stream/`](../../src/agent_stream/), which a `From` maps onto the shared
-  enums: the Agent Gateway ones (`CrudCommand` for `connections`,
-  `connection-points`, `mediators`, `certificates`, and `credential-providers`), or, through a `TryFrom`, `OwnershipChange`, which both
-  products' `tenant-ownership` map onto because their resource kinds differ. The
-  compiler does not point at them, but
+  `credential-providers`, `jwt-verification-strategies`, `delegation-vault`,
+  `integrations`, `audit`, `metrics`, and `logs` also run on Agent Stream, through their
+  own enums in [`src/agent_stream/`](../../src/agent_stream/), which a `From` maps onto
+  the shared enums: the Agent Gateway ones (`CrudCommand` for `connections`,
+  `connection-points`, `mediators`, `certificates`, and `credential-providers`),
+  `SharedIntegrationCommand`, which wraps `CrudCommand` and adds the two read-only routes
+  only Agent Stream has, or, through a `TryFrom`, `OwnershipChange`, which both
+  products' `tenant-ownership` map onto because their resource kinds differ.
+  The compiler does not point at them, but
   `each_shared_group_has_every_agent_gateway_subcommand_or_leaves_it_out_on_purpose` in
   `agent_stream/mod.rs` fails for a new Agent Gateway subcommand in one of these groups.
   When Agent Stream has the route, add the variant to the Agent Stream enum and its
   `From` too, with help that names Agent Stream. When it has none, add the subcommand to
-  `LEFT_OUT_OF_AGENT_STREAM` in that test, as `metrics status` is. Any message the shared code prints at
-  run time names the product through `client.product()` (`message_name`,
-  `message_subject`, `command`, `surface_noun`), never a literal `gateway` or `fabric
-  agent-gateway`.
+  `LEFT_OUT_OF_AGENT_STREAM` in that test, as `metrics status` is. A subcommand only
+  Agent Stream has goes in `ONLY_ON_AGENT_STREAM`, as `integrations config` is. Any
+  message the shared code prints at run time names the product through
+  `client.product()` (`message_name`, `message_subject`, `command`, `surface_noun`),
+  never a literal `gateway` or `fabric agent-gateway`.
 
 ## Add a new command group
 

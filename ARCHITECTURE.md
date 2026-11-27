@@ -274,14 +274,23 @@ After the client is built, `dispatch_with` calls `run_and_print`, which does som
 per-command preparation, then calls the group's handler. `fabric agent-stream secrets`,
 `users`, `identities`, `api-keys`, `policies`, `connections`, `connection-points`,
 `mediators`, `settings`, `user-settings`, `terms`, `notifications`, `certificates`,
-`credential-providers`, `jwt-verification-strategies`, `delegation-vault`, `audit`,
-`metrics`, and `logs` reach the same function through `run_shared`, with a `SharedCommand` mapped from their own clap enums, so both products
-print the same tables and confirmation lines. `tenant-ownership` takes Agent Stream's
+`credential-providers`, `jwt-verification-strategies`, `delegation-vault`, `integrations`,
+`audit`, `metrics`, and `logs` reach the same function through `run_shared`, with a
+`SharedCommand` mapped from their own clap enums, so both products print the same tables
+and confirmation lines. `integrations config` and
+`integrations runtime-variables`, which only Agent Stream has, are read and printed in
+`run_shared_command`, which `run_shared` calls, and `run_integrations` hides any
+secret-looking `configuration` value in an Agent Stream integration answer: it removes a
+credential Agent Stream keeps when an update leaves it out (a top-level credential key, or an
+entry of the top-level `headers` object) and masks any other, at any depth, which
+`checked_body` then refuses to send; `dispatch_with` adds to that refusal how Agent Stream's
+`api` reads the stored value, so Agent Gateway's names no other product. `tenant-ownership` takes Agent Stream's
 own resource kinds, so `run_shared` sends it straight to `run_ownership_change`, which
 the Agent Gateway command also ends in. An Agent Stream delete or revoke without `--yes`
 (`policies delete`, `connections delete`, `certificates delete`,
 `credential-providers delete`, `jwt-verification-strategies delete`,
-`delegation-vault revoke`, and `revoke-user`) carries `ask_first`, so `run_shared` asks first through a `Prompter`, the terminal in a
+`delegation-vault revoke`, `revoke-user`, and `integrations delete`)
+carries `ask_first`, so `run_shared` asks first through a `Prompter`, the terminal in a
 real run and `ScriptedPrompter` in tests, and `refuse_before_connecting` refuses it with
 no terminal before anything is sent. Before asking, `revoke-user` counts the hash's grants
 in the grant list, so the question says how many the list shows; with none, it asks whether
@@ -582,7 +591,7 @@ Every file in [`src/`](src/) and what it owns.
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
 | [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, `remembering_probes`, which keeps a host's answer for the length of an interactive shell, and the names messages give each product (`message_name`, `message_subject`, `connection_noun`, `surface_noun`). |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs` with its child `surfaces/features.rs`, `prompts.rs`, `members.rs`, `teams.rs`, `providers.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `connections.rs`, `connection_points.rs`, `mediators.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), `records.rs` for what `members` and `teams` share, and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs` with its child `surfaces/features.rs`, `prompts.rs`, `members.rs`, `teams.rs`, `providers.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `connections.rs`, `connection_points.rs`, `mediators.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `integrations.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), `records.rs` for what `members` and `teams` share, and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |
