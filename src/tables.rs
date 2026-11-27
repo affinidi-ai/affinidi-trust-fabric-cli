@@ -162,6 +162,34 @@ pub static SURFACES: Layout = Layout {
     ],
 };
 
+/// The members of an Agent Stream, as `fabric agent-stream members list`
+/// and the members table of `teams get` show them.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_MEMBERS: Layout = Layout {
+    empty: "No members yet.",
+    columns: &[
+        id(&["id"]),
+        whole("NAME", &["name"]),
+        col("STATUS", &["status"]),
+        wide("IDENTIFIERS", &["identifier_list"]),
+        col("UPDATED", &["updated_at"]),
+    ],
+};
+
+/// The teams of an Agent Stream, as `fabric agent-stream teams list` shows
+/// them.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_TEAMS: Layout = Layout {
+    empty: "No teams yet.",
+    columns: &[
+        id(&["id"]),
+        whole("NAME", &["name"]),
+        col("STATUS", &["status"]),
+        col("MEMBERS", &["member_count"]),
+        col("UPDATED", &["updated_at"]),
+    ],
+};
+
 /// The surfaces of an Agent Stream, as `fabric agent-stream surfaces list`
 /// shows them.
 #[cfg(feature = "agent-stream")]

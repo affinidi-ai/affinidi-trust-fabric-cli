@@ -89,6 +89,8 @@ These exist only in builds with the `agent-stream` feature.
 | --- | --- |
 | **Prompt template** | A saved prompt on an Agent Stream that a model request names by its id, filling `{{name}}` placeholders from the request's variables, instead of sending the prompt text. It holds numbered **versions**, each a list of messages with a role and content. Managed with `fabric agent-stream prompts`. Agent Stream's API calls it a _prompt_ and serves it at `/v1/prompts`. |
 | **Default version** | The version of a prompt template a request gets when it names none: `default_version`, or the highest version when that is unset. Changed with `prompts set-default`, which is how a template is rolled back. |
+| **Member** | A known caller of an Agent Stream, a person, service, or API key, that usage, limits, and spend are counted against. Recognised by its **identifiers**, written `KIND:VALUE` on the command line (`email:`, `subject:`, `api_key:`, or `custom:`). Managed with `fabric agent-stream members`. |
+| **Team** | A group of Members on an Agent Stream with a shared budget. A team holds member ids only; `teams add-member` and `teams remove-member` take a member's id or one of its identifiers. Managed with `fabric agent-stream teams`. |
 
 ## Related
 

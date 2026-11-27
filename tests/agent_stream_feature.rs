@@ -1580,3 +1580,89 @@ fn prompts_create_shows_agent_streams_plain_text_refusal_and_exits_non_zero() {
     assert!(!text.contains(ACCESS_TOKEN), "{text}");
     assert_eq!(request_lines(&requests), [PROBE_REQUEST, "POST /api/v1/prompts HTTP/1.1"]);
 }
+
+/// One member as Agent Stream lists it.
+#[cfg(feature = "agent-stream")]
+const MEMBER_LIST: &str = r#"[{"id":"m-ada","name":"Ada","status":"enabled","monthly_budget_usd":50,
+  "identifiers":[{"kind":"email","email":"ada@example.com"},{"kind":"api_key","key_name":"ada-key"}],
+  "updated_at":"2026-11-02T00:00:00Z"}]"#;
+
+/// One team as Agent Stream lists it.
+#[cfg(feature = "agent-stream")]
+const TEAM_LIST: &str = r#"[{"id":"t-research","name":"Research","status":"enabled","members":["m-ada","m-bob"],
+  "monthly_budget_usd":100,"updated_at":"2026-11-02T00:00:00Z"}]"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn members_list_prints_each_member_with_its_identifiers() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, MEMBER_LIST);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "members", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("IDENTIFIERS"), "{text}");
+    assert!(text.contains("m-ada") && text.contains("email:ada@example.com, api_key:ada-key"), "{text}");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/members HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn teams_list_prints_each_team_with_its_number_of_members() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, TEAM_LIST);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "teams", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("t-research"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        row.contains("Research")
+            && row
+                .split_whitespace()
+                .any(|cell| cell == "2"),
+        "{row}"
+    );
+    assert!(!text.contains("m-bob"), "{text}");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/teams HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn teams_create_dry_run_prints_the_preview_and_needs_no_login() {
+    let output = fabric_in_fresh_home(
+        &[
+            "agent-stream",
+            "teams",
+            "create",
+            "--name",
+            "Research",
+            "--member",
+            "m-ada",
+            "--dry-run",
+            "--output",
+            "json",
+        ],
+        &[],
+        &[UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let preview: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON preview");
+    assert_eq!(preview["dry_run"], serde_json::json!(true));
+    assert_eq!(preview["after"], serde_json::json!({"id": "", "name": "Research", "members": ["m-ada"]}));
+}
