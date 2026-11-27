@@ -129,8 +129,8 @@ pub enum RecordCommand {
     /// Get one governance record, with its prompt content hidden.
     ///
     /// Shows the record's stages, metrics, attribution and hashes. The
-    /// caller's prompt, the model's answer, each stage's input and output, the
-    /// attachments' file names and the signed credential (which holds the
+    /// caller's prompt, the model's answer, each stage's input, output and
+    /// reason, the attachments' file names and the signed credential (which holds the
     /// whole record) are replaced with a placeholder unless --reveal is given.
     #[command(after_long_help = GET_EXAMPLES)]
     Get(RecordGetArgs),
@@ -175,8 +175,8 @@ pub struct RecordGetArgs {
     /// ID of the surface the record belongs to.
     #[arg(long)]
     surface: String,
-    /// Show the prompt, the answer, stage inputs and outputs, attachment file
-    /// names and the signed credential. When there are any, a warning is
+    /// Show the prompt, the answer, stage inputs, outputs and reasons,
+    /// attachment file names and the signed credential. When there are any, a warning is
     /// printed on standard error, since they can hold personal data.
     #[arg(long)]
     reveal: bool,

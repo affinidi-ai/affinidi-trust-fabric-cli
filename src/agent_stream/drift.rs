@@ -105,8 +105,10 @@ pub enum DriftCommand {
     ///
     /// It also refuses while a run that replays or targets the surface (or,
     /// for an experiment, the target) is pending or running, unless --force is
-    /// given. That check reads the runs this login can see, and needs
-    /// `drift.view` as well as the `drift.manage` the run needs.
+    /// given. That check reads the runs of the surface and the target, and
+    /// the 200 most recent runs this login can see for runs from other
+    /// surfaces that target them. It needs `drift.view` as well as the
+    /// `drift.manage` the run needs.
     ///
     /// With --variant, or a --target other than the surface itself, the run
     /// is an experiment: it replays the surface's sessions against another
@@ -208,13 +210,13 @@ pub enum RunsCommand {
     /// Get one drift run, with its replayed prompts and answers hidden.
     ///
     /// Shows the run's status, progress, scores, cost and each dimension's
-    /// verdict. Each sample's input and output are replaced with a
+    /// verdict. Each sample's input, output and error are replaced with a
     /// placeholder unless --reveal is given.
     #[command(after_long_help = RUNS_GET_EXAMPLES)]
     Get {
         /// ID of the run (see `fabric agent-stream drift runs list`).
         run_id: String,
-        /// Show each sample's replayed prompt and answer. When there are any, a
+        /// Show each sample's replayed prompt, answer and error. When there are any, a
         /// warning is printed on standard error, since they can hold personal
         /// data.
         #[arg(long)]
@@ -517,6 +519,21 @@ async fn list_runs(
     limit: u32,
     output: Output,
 ) -> Result<()> {
+    let runs = fetch_runs(client, surface, limit).await?;
+    let scope = if surface.is_some() {
+        Scope::Filtered
+    } else {
+        Scope::All
+    };
+    print_list(&runs, output, &tables::DRIFT_RUNS, scope)
+}
+
+/// The runs `drift runs list` shows, with their replayed content masked.
+async fn fetch_runs(
+    client: &GatewayClient,
+    surface: Option<&str>,
+    limit: u32,
+) -> Result<Value> {
     let mut runs = read_runs(client, surface, limit).await?;
     let Value::Array(items) = &mut runs else {
         bail!("Agent Stream answered the drift runs list with something other than a list");
@@ -524,12 +541,7 @@ async fn list_runs(
     for run in items {
         prompt_content::mask(run, Item::DriftRun, LIST_MASKED_VALUE);
     }
-    let scope = if surface.is_some() {
-        Scope::Filtered
-    } else {
-        Scope::All
-    };
-    print_list(&runs, output, &tables::DRIFT_RUNS, scope)
+    Ok(runs)
 }
 
 async fn read_runs(
@@ -559,14 +571,35 @@ async fn read_run(
 }
 
 /// The first run that is pending or running and replays or targets one of
-/// `surfaces`, as the surface it touches and the run's id. The list without a
-/// surface holds every run in progress this login can see, where a list of
-/// one surface leaves out the runs that only target it.
+/// `surfaces`, as the surface it touches and the run's id.
+///
+/// A surface's own list holds every run in progress that replays it, with no
+/// cap, but leaves out runs from other surfaces that only target it. Those
+/// are looked for in the list without a surface, which keeps only the 200
+/// most recent runs by `ran_at`: a run in progress counts from its start, so
+/// a long one can fall out of it, which is why it is not used for the
+/// surfaces' own runs.
 async fn run_in_progress(
     client: &GatewayClient,
     surfaces: &[&str],
 ) -> Result<Option<(String, String)>> {
+    for surface in surfaces {
+        let runs = read_runs(client, Some(surface), MAX_RUNS_LIMIT).await?;
+        if let Some(found) = first_in_progress(&runs, "surface_id", surfaces)? {
+            return Ok(Some(found));
+        }
+    }
     let runs = read_runs(client, None, MAX_RUNS_LIMIT).await?;
+    first_in_progress(&runs, "target_surface_id", surfaces)
+}
+
+/// The first pending or running run in `runs` whose `field` is one of
+/// `surfaces`, as that surface and the run's id.
+fn first_in_progress(
+    runs: &Value,
+    field: &str,
+    surfaces: &[&str],
+) -> Result<Option<(String, String)>> {
     let Some(runs) = runs.as_array() else {
         bail!("Agent Stream answered the drift runs list with something other than a list");
     };
@@ -581,14 +614,11 @@ async fn run_in_progress(
             let id = run
                 .get("id")
                 .and_then(Value::as_str)?;
-            let touched = ["surface_id", "target_surface_id"]
-                .iter()
-                .filter_map(|field| {
-                    run.get(*field)
-                        .and_then(Value::as_str)
-                })
-                .find(|surface| surfaces.contains(surface))?;
-            Some((touched.to_owned(), id.to_owned()))
+            let surface = run
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|surface| surfaces.contains(surface))?;
+            Some((surface.to_owned(), id.to_owned()))
         }))
 }
 
@@ -895,10 +925,11 @@ mod tests {
         let (result, requests) = run_with(
             vec![
                 (
-                    "GET /api/v1/drift/runs?limit=200",
+                    "GET /api/v1/drift/runs?surface_id=s1",
                     "HTTP/1.1 200 OK",
                     r#"[{"id":"old","surface_id":"s1","status":"completed"}]"#,
                 ),
+                ("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", "[]"),
                 (
                     "POST /api/v1/drift/eval/run?surface_id=s1",
                     "HTTP/1.1 200 OK",
@@ -911,18 +942,27 @@ mod tests {
         result.expect("run");
         assert_eq!(
             requests,
-            ["GET /api/v1/drift/runs?limit=200 HTTP/1.1", "POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1"]
+            [
+                "GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1",
+                "GET /api/v1/drift/runs?limit=200 HTTP/1.1",
+                "POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1"
+            ]
         );
     }
 
     #[tokio::test]
     async fn test_run_refuses_while_a_run_is_in_progress() {
+        // The run is only in the surface's own list, as a long run that has
+        // fallen out of the 200 most recent would be.
         let (result, requests) = run_with(
-            vec![(
-                "GET /api/v1/drift/runs?limit=200",
-                "HTTP/1.1 200 OK",
-                r#"[{"id":"busy-1","surface_id":"s1","status":"running"}]"#,
-            )],
+            vec![
+                (
+                    "GET /api/v1/drift/runs?surface_id=s1",
+                    "HTTP/1.1 200 OK",
+                    r#"[{"id":"busy-1","surface_id":"s1","status":"running"}]"#,
+                ),
+                ("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", "[]"),
+            ],
             &["run", "--surface", "s1", "--yes"],
         )
         .await;
@@ -930,18 +970,26 @@ mod tests {
             .expect_err("busy")
             .to_string();
         assert!(error.contains("drift run 'busy-1' on surface 's1' is in progress"), "{error}");
-        assert_eq!(requests, ["GET /api/v1/drift/runs?limit=200 HTTP/1.1"]);
+        assert_eq!(requests, ["GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1"]);
     }
 
     #[tokio::test]
     async fn test_run_refuses_while_another_run_targets_the_surface() {
         let (result, requests) = run_with(
-            vec![(
-                "GET /api/v1/drift/runs?limit=200",
-                "HTTP/1.1 200 OK",
-                r#"[{"id":"done","surface_id":"s1","status":"completed"},
-                    {"id":"other","surface_id":"s9","target_surface_id":"s2","status":"pending"}]"#,
-            )],
+            vec![
+                (
+                    "GET /api/v1/drift/runs?surface_id=s1",
+                    "HTTP/1.1 200 OK",
+                    r#"[{"id":"done","surface_id":"s1","status":"completed"}]"#,
+                ),
+                ("GET /api/v1/drift/runs?surface_id=s2", "HTTP/1.1 200 OK", "[]"),
+                (
+                    "GET /api/v1/drift/runs?limit=200",
+                    "HTTP/1.1 200 OK",
+                    r#"[{"id":"own","surface_id":"s2","status":"completed"},
+                        {"id":"other","surface_id":"s9","target_surface_id":"s2","status":"pending"}]"#,
+                ),
+            ],
             &["run", "--surface", "s1", "--target", "s2", "--yes"],
         )
         .await;
@@ -949,13 +997,21 @@ mod tests {
             .expect_err("busy target")
             .to_string();
         assert!(error.contains("drift run 'other' on surface 's2' is in progress"), "{error}");
-        assert_eq!(requests, ["GET /api/v1/drift/runs?limit=200 HTTP/1.1"]);
+        assert_eq!(
+            requests,
+            [
+                "GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1",
+                "GET /api/v1/drift/runs?surface_id=s2 HTTP/1.1",
+                "GET /api/v1/drift/runs?limit=200 HTTP/1.1"
+            ]
+        );
     }
 
     #[tokio::test]
     async fn test_run_with_the_surface_as_target_is_a_plain_run() {
         let (result, requests) = run_with(
             vec![
+                ("GET /api/v1/drift/runs?surface_id=s1", "HTTP/1.1 200 OK", "[]"),
                 ("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", "[]"),
                 (
                     "POST /api/v1/drift/eval/run?surface_id=s1",
@@ -969,7 +1025,11 @@ mod tests {
         result.expect("plain run");
         assert_eq!(
             requests,
-            ["GET /api/v1/drift/runs?limit=200 HTTP/1.1", "POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1"]
+            [
+                "GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1",
+                "GET /api/v1/drift/runs?limit=200 HTTP/1.1",
+                "POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1"
+            ]
         );
     }
 
@@ -992,6 +1052,8 @@ mod tests {
     async fn test_experiment_checks_the_target_and_sends_it() {
         let (result, requests) = run_with(
             vec![
+                ("GET /api/v1/drift/runs?surface_id=s1", "HTTP/1.1 200 OK", "[]"),
+                ("GET /api/v1/drift/runs?surface_id=s2", "HTTP/1.1 200 OK", "[]"),
                 ("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", "[]"),
                 (
                     "POST /api/v1/drift/eval/run?surface_id=s1&target_surface_id=s2&variant=cheap",
@@ -1006,6 +1068,8 @@ mod tests {
         assert_eq!(
             requests,
             [
+                "GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1",
+                "GET /api/v1/drift/runs?surface_id=s2 HTTP/1.1",
                 "GET /api/v1/drift/runs?limit=200 HTTP/1.1",
                 "POST /api/v1/drift/eval/run?surface_id=s1&target_surface_id=s2&variant=cheap HTTP/1.1",
             ]
@@ -1100,7 +1164,7 @@ mod tests {
                 .contains("something other than a list")
         );
         let (result, requests) = run_with(
-            vec![("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", r#"{"runs":[]}"#)],
+            vec![("GET /api/v1/drift/runs?surface_id=s1", "HTTP/1.1 200 OK", r#"{"runs":[]}"#)],
             &["run", "--surface", "s1", "--yes"],
         )
         .await;
@@ -1110,7 +1174,7 @@ mod tests {
                 .to_string()
                 .contains("something other than a list")
         );
-        assert_eq!(requests, ["GET /api/v1/drift/runs?limit=200 HTTP/1.1"]);
+        assert_eq!(requests, ["GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -1307,17 +1371,12 @@ mod tests {
             r#"[{"id":"r1","samples":[{"input":"secret prompt","output":"answer","error":"echoed secret"}]}]"#,
         )])
         .await;
-        let mut runs = read_runs(&client_for(host).await, None, 25)
+        let runs = fetch_runs(&client_for(host).await, None, 25)
             .await
             .expect("runs");
-        for run in runs
-            .as_array_mut()
-            .expect("list")
-        {
-            prompt_content::mask(run, Item::DriftRun, LIST_MASKED_VALUE);
-        }
         let text = runs.to_string();
         assert!(!text.contains("secret"), "{text}");
+        assert_eq!(runs[0]["samples"][0]["error"], Value::from(LIST_MASKED_VALUE));
     }
 
     #[test]

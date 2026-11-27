@@ -136,7 +136,7 @@ security finding: the governance record chain of surface 'support-bot' is broken
 
 `truncated` means the newest records are missing from the log. For `index_mismatch`, Agent Stream rebuilds the record index during the same check, so the next `verify` shows the surface as valid: only the output of the run that found it records the finding, so keep it.
 
-With `--surface`, an error checking that surface, such as a refusal, is shown as it is. A surface with no records, a mistyped ID included, verifies as valid with 0 records. If the list of surfaces can't be read, the command fails without checking any. It exits 1 when any chain is not valid or not checked, so a script can rely on the exit status. The error counts both, such as `error: 1 of 4 governance record chains are not valid and 1 could not be checked`. With `--output json`, standard output is the list of Agent Stream's verdicts, one per surface, even for a single `--surface`.
+With `--surface`, an error checking that surface, such as a refusal, is shown as it is. A surface with no records, a mistyped ID included, verifies as valid with 0 records. If the list of surfaces can't be read, the command fails without checking any. It exits 1 when any chain is not valid or not checked, so a script can rely on the exit status. The error counts both, such as `error: 1 of 4 governance record chains are not valid and 1 could not be checked`. With `--output json`, standard output is the list of Agent Stream's verdicts, one per surface, even for a single `--surface`, unless the check of that one surface fails: then standard output is empty and the error is on standard error.
 
 ### See which surfaces record
 
@@ -203,7 +203,7 @@ With `--surface`, `runs list` shows every run of that surface: runs in progress 
 | `PASSED` / `TOTAL` | Sessions that passed, and sessions replayed |
 | `COST USD` | `cost_usd`, what the replay cost |
 
-`runs get` prints one run: status, progress, scores, cost and each dimension's verdict, with each sample's input and output replaced unless `--reveal` is given.
+`runs get` prints one run: status, progress, scores, cost and each dimension's verdict, with each sample's input, output and error replaced unless `--reveal` is given.
 
 ### Start a replay run
 
@@ -213,7 +213,7 @@ fabric agent-stream drift run --surface support-bot --wait
 
 A replay sends the surface's captured sessions to a model again and scores the answers. The calls are real and billed, so before starting:
 
-1. Unless `--force` is given, the CLI reads the runs this login can see and refuses if one that replays or targets the surface, or the target for an experiment, is `pending` or `running`. Agent Stream itself would start runs side by side.
+1. Unless `--force` is given, the CLI reads the runs of the surface, and of the target for an experiment, and refuses if one is `pending` or `running`. It also looks among the 200 most recent runs this login can see for one from another surface that targets them. Agent Stream itself would start runs side by side.
 2. Unless `--yes` is given, the CLI reads the surface whose sessions are replayed and shows its session cap (`drift.eval.max_sessions`, 50 when unset; Agent Stream replays at least 1 and at most 200 sessions whatever the surface sets, and the CLI shows the number it applies) and cost cap (`drift.eval.max_run_cost_usd`). Agent Stream takes both caps from that surface even for an experiment against another surface. When the CLI can't read the surface, both show `unknown`. Then it asks you to confirm; only `y` or `yes` starts the run.
 
 Without a terminal and without `--yes`, the command refuses before sending anything.
