@@ -14,7 +14,7 @@ use tokio::{
 
 use super::{AgentStreamArgs, dispatch_with};
 use crate::{
-    commands::Cli,
+    commands::{Cli, Prompter},
     config::{Config, Connection},
     credentials::CredentialStore,
     product::Product,
@@ -347,4 +347,44 @@ pub fn json_file(contents: &str) -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().expect("temp file");
     std::fs::write(file.path(), contents).expect("write JSON file");
     file
+}
+
+/// A [`Prompter`] that answers every question with one answer and records
+/// each question and each `Aborted.` line, so a test needs no terminal.
+pub struct ScriptedPrompter {
+    answer: bool,
+    pub questions: Vec<String>,
+    pub aborted: Vec<String>,
+}
+
+impl ScriptedPrompter {
+    /// A prompter whose answer to every question is `answer`, yes or no.
+    pub fn answering(answer: bool) -> Self {
+        Self {
+            answer,
+            questions: Vec::new(),
+            aborted: Vec::new(),
+        }
+    }
+}
+
+impl Prompter for ScriptedPrompter {
+    async fn ask(
+        &mut self,
+        _verb: &str,
+        _id: &str,
+        question: impl std::future::Future<Output = String>,
+    ) -> Result<bool> {
+        self.questions
+            .push(question.await);
+        Ok(self.answer)
+    }
+
+    fn aborted(
+        &mut self,
+        line: &str,
+    ) {
+        self.aborted
+            .push(line.to_owned());
+    }
 }
