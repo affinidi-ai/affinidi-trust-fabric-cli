@@ -152,6 +152,44 @@ pub type Route = (&'static str, &'static str, &'static str);
 /// request after that. Records each whole request, headers and body included.
 /// Returns its base URL and the recording.
 pub async fn scripted_agent_stream(routes: Vec<Route>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let mut answered: HashMap<&'static str, usize> = HashMap::new();
+    serve(move |request| {
+        let matching: Vec<&Route> = routes
+            .iter()
+            .filter(|(start, _, _)| request.starts_with(&format!("{start} ")))
+            .collect();
+        let (start, _, _) = matching.first()?;
+        let count = answered
+            .entry(start)
+            .or_default();
+        let (_, status_line, body) = matching[(*count).min(matching.len() - 1)];
+        *count += 1;
+        Some((*status_line, *body))
+    })
+    .await
+}
+
+/// Like [`scripted_agent_stream`], but each route answers once: a request
+/// gets the first unused route it begins with, which is then used up, so the
+/// same request can get a different answer each time it is sent.
+pub async fn scripted_agent_stream_in_order(routes: Vec<Route>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let mut remaining = routes;
+    serve(move |request| {
+        let index = remaining
+            .iter()
+            .position(|(start, _, _)| request.starts_with(&format!("{start} ")))?;
+        let (_, status_line, body) = remaining.remove(index);
+        Some((status_line, body))
+    })
+    .await
+}
+
+/// Answers each request with the status line and body `answer` picks for it,
+/// or `404 Not Found` with an empty body when it picks none, until the test
+/// ends, recording each whole request.
+async fn serve(
+    mut answer: impl FnMut(&str) -> Option<(&'static str, &'static str)> + Send + 'static
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -161,24 +199,9 @@ pub async fn scripted_agent_stream(routes: Vec<Route>) -> (String, Arc<Mutex<Vec
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
     tokio::spawn(async move {
-        let mut answered: HashMap<&'static str, usize> = HashMap::new();
         while let Ok((mut socket, _)) = listener.accept().await {
             let request = read_request(&mut socket).await;
-            let matching: Vec<&Route> = routes
-                .iter()
-                .filter(|(start, _, _)| request.starts_with(&format!("{start} ")))
-                .collect();
-            let (status_line, body) = match matching.first() {
-                Some((start, _, _)) => {
-                    let count = answered
-                        .entry(start)
-                        .or_default();
-                    let (_, status_line, body) = matching[(*count).min(matching.len() - 1)];
-                    *count += 1;
-                    (*status_line, *body)
-                }
-                None => ("HTTP/1.1 404 Not Found", ""),
-            };
+            let (status_line, body) = answer(&request).unwrap_or(("HTTP/1.1 404 Not Found", ""));
             recorded
                 .lock()
                 .unwrap()

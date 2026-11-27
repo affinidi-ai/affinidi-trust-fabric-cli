@@ -847,3 +847,161 @@ fn audit_list_reports_an_audit_log_agent_stream_has_not_started_instead_of_an_em
         "error: audit log temporarily unavailable: Audit logger not initialized\n"
     );
 }
+
+/// Runs `fabric agent-stream <args>` against a saved Agent Stream at `host`
+/// with an access token from the environment, which is sent without the
+/// product probe, and nothing on standard input, which is not a terminal.
+#[cfg(feature = "agent-stream")]
+fn agent_stream_command(
+    host: &str,
+    args: &[&str],
+) -> Output {
+    let config = format!("current = \"test\"\n\n[connections.test]\nhost = \"{host}\"\n");
+    let mut argv = vec!["agent-stream"];
+    argv.extend_from_slice(args);
+    fabric_in_fresh_home(
+        &argv,
+        &[("agent-stream.toml", &config)],
+        &[("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    )
+}
+
+/// A governance record whose surface stores bodies.
+#[cfg(feature = "agent-stream")]
+const GOVERNANCE_RECORD: &str = r#"{"record":{"record_id":"r1","prompt":"my card is 4111-1111","completion":"noted","stages":[{"stage":"llm","outcome":"allow"}]},"signed_vc":{"credentialSubject":{"prompt":"my card is 4111-1111"}},"seq":3}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn governance_verify_exits_1_and_reports_a_security_finding_for_a_broken_chain() {
+    let (host, requests) = host_answering(
+        AGENT_STREAM_PERMISSIONS,
+        r#"{"surface_id":"s2","valid":false,"count":0,"problem":"broken","error":"hash mismatch at seq 2"}"#,
+    );
+
+    let output = agent_stream_command(&host, &["governance", "verify", "--surface", "s2"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stdout(&output).contains("broken"), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("security finding: the governance record chain of surface 's2' is broken"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("1 of 1 governance record chains did not verify"), "{}", stderr(&output));
+    assert_eq!(request_lines(&requests), ["GET /api/v1/governance/verify?surface_id=s2 HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn governance_verify_exits_0_for_an_intact_chain() {
+    let (host, _) = host_answering(AGENT_STREAM_PERMISSIONS, r#"{"surface_id":"s1","valid":true,"count":12}"#);
+
+    let output = agent_stream_command(&host, &["governance", "verify", "--surface", "s1"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("12"), "{}", stdout(&output));
+    assert!(!stderr(&output).contains("security finding"), "{}", stderr(&output));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn governance_records_get_hides_prompt_content_without_reveal() {
+    let (host, _) = host_answering(AGENT_STREAM_PERMISSIONS, GOVERNANCE_RECORD);
+
+    let output = agent_stream_command(&host, &["governance", "records", "get", "r1", "--surface", "s1"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("4111"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("noted"), "{}", stdout(&output));
+    assert!(stdout(&output).contains("pass --reveal to show"), "{}", stdout(&output));
+    assert!(!stderr(&output).contains("warning"), "{}", stderr(&output));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn governance_records_get_with_reveal_shows_prompt_content_and_warns() {
+    let (host, _) = host_answering(AGENT_STREAM_PERMISSIONS, GOVERNANCE_RECORD);
+
+    let output = agent_stream_command(&host, &["governance", "records", "get", "r1", "--surface", "s1", "--reveal"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("my card is 4111-1111"), "{}", stdout(&output));
+    assert!(stderr(&output).contains("warning: this output contains prompt content"), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("warning"), "{}", stdout(&output));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn governance_records_list_never_shows_prompt_content_and_has_no_all_option() {
+    let page: &'static str = Box::leak(format!("[{GOVERNANCE_RECORD}]").into_boxed_str());
+    let (host, _) = host_answering(AGENT_STREAM_PERMISSIONS, page);
+
+    let output = agent_stream_command(&host, &["--output", "json", "governance", "records", "list", "--surface", "s1"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(value["next_cursor"], serde_json::Value::Null);
+    assert!(!stdout(&output).contains("4111"), "{}", stdout(&output));
+    let all = fabric(&["agent-stream", "governance", "records", "list", "--surface", "s1", "--all"], &[]);
+    assert_eq!(all.status.code(), Some(2), "{}", stderr(&all));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn drift_run_and_baseline_set_refuse_without_a_terminal_and_send_nothing() {
+    let (host, requests) = agent_stream_host();
+
+    for args in [
+        &["drift", "run", "--surface", "s1"][..],
+        &["drift", "baseline", "set", "--surface", "s1", "--window", "7d"][..],
+    ] {
+        let output = agent_stream_command(&host, args);
+
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("without confirmation in a non-interactive session; pass --yes"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert!(request_lines(&requests).is_empty(), "{:?}", request_lines(&requests));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn drift_run_wait_exits_1_when_the_run_is_cancelled() {
+    let (host, requests) = host_answering(
+        AGENT_STREAM_PERMISSIONS,
+        r#"{"id":"run-1","status":"cancelled","samples":[{"input":"secret prompt","output":"answer"}]}"#,
+    );
+
+    let output = agent_stream_command(&host, &["drift", "run", "--surface", "s1", "--yes", "--force", "--wait"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("drift run 'run-1' ended cancelled"), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("secret prompt"), "{}", stdout(&output));
+    assert_eq!(
+        request_lines(&requests),
+        ["POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1", "GET /api/v1/drift/runs/run-1 HTTP/1.1"]
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn drift_runs_get_hides_samples_unless_reveal_and_then_warns() {
+    let (host, _) = host_answering(
+        AGENT_STREAM_PERMISSIONS,
+        r#"{"id":"run-1","status":"completed","samples":[{"input":"replayed secret prompt","output":"answer","passed":true}]}"#,
+    );
+
+    let hidden = agent_stream_command(&host, &["drift", "runs", "get", "run-1"]);
+    let shown = agent_stream_command(&host, &["drift", "runs", "get", "run-1", "--reveal"]);
+
+    assert!(hidden.status.success(), "{}", stderr(&hidden));
+    assert!(!stdout(&hidden).contains("replayed secret prompt"), "{}", stdout(&hidden));
+    assert!(!stderr(&hidden).contains("warning"), "{}", stderr(&hidden));
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert!(stdout(&shown).contains("replayed secret prompt"), "{}", stdout(&shown));
+    assert!(stderr(&shown).contains("warning: this output contains prompt content"), "{}", stderr(&shown));
+}
