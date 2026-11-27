@@ -1082,6 +1082,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_create_a_proxy_answers_with_504_says_the_team_may_exist() {
+        let (result, requests) = run_teams(
+            &["teams", "create", "--name", "Research", "--member", "m-ada"],
+            vec![("POST /api/v1/teams", "HTTP/1.1 504 Gateway Timeout", "<html>504 Gateway Time-out</html>")],
+        )
+        .await;
+        let text = error_text(result);
+        assert!(text.starts_with("Agent Stream gave no answer, so the team may have been created anyway"), "{text}");
+        assert_eq!(start_lines(&requests), ["POST /api/v1/teams HTTP/1.1"]);
+    }
+
+    #[tokio::test]
     async fn a_create_agent_stream_never_answers_says_the_team_may_exist_and_what_to_check() {
         let (host, requests) = super::super::records::tests::answering_reads_dropping_writes("[]").await;
         let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);

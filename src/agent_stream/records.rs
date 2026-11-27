@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -383,18 +383,26 @@ pub async fn save_text(
     }
 }
 
-/// A failed write, with `advice` added when Agent Stream never answered it,
-/// such as a timeout or a dropped connection: the write may then have been
-/// applied anyway, and running the command again could repeat it. An answer
-/// from Agent Stream, such as a refusal, is returned as it is.
+/// A failed write, with `advice` added when Agent Stream's answer was lost,
+/// such as after a timeout, a dropped connection, or a proxy's 502 or 504:
+/// the write may then have been applied anyway, and running the command again
+/// could repeat it. An answer from Agent Stream, such as a refusal, is
+/// returned as it is.
 pub fn unanswered_write(
     error: anyhow::Error,
     advice: impl FnOnce() -> String,
 ) -> anyhow::Error {
-    if response_status(&error).is_some() {
+    if !answer_lost(&error) {
         return error;
     }
     error.context(advice())
+}
+
+/// Whether Agent Stream's answer to a write was lost: no HTTP answer came
+/// back, or a proxy in front of Agent Stream answered 502 or 504, which
+/// Agent Stream's own routes never do. The write may have been applied.
+fn answer_lost(error: &anyhow::Error) -> bool {
+    matches!(response_status(error), None | Some(StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT))
 }
 
 /// What a dry run prints: the changes, or with --output json the changes and
@@ -547,5 +555,14 @@ pub(super) mod tests {
 
         let dropped = unanswered_write(anyhow::anyhow!("operation timed out"), || "check first".to_owned());
         assert_eq!(format!("{dropped:#}"), "check first: operation timed out");
+
+        for status in [StatusCode::BAD_GATEWAY, StatusCode::GATEWAY_TIMEOUT] {
+            let proxy = crate::client::gateway_error(status, b"<html>Gateway Time-out</html>", &[]);
+            let text = format!("{:#}", unanswered_write(proxy, || "check first".to_owned()));
+            assert!(text.starts_with("check first: "), "{status}: {text}");
+        }
+        let server = crate::client::gateway_error(StatusCode::INTERNAL_SERVER_ERROR, b"store failed", &[]);
+        let text = format!("{:#}", unanswered_write(server, || "check first".to_owned()));
+        assert!(!text.contains("check first"), "{text}");
     }
 }
