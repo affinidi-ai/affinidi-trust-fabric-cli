@@ -7,7 +7,7 @@
 //! hold the replayed prompts and answers, which are hidden unless one run is
 //! asked for with `--reveal` (see [`prompt_content`]).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
@@ -107,8 +107,11 @@ pub enum DriftCommand {
     /// for an experiment, the target) is pending or running, unless --force is
     /// given. That check reads the runs of the surface and the target, and
     /// the 200 most recent runs this login can see for runs from other
-    /// surfaces that target them. It needs `drift.view` as well as the
-    /// `drift.manage` the run needs.
+    /// surfaces that target them. When the command asked you to confirm, it
+    /// checks again after you answer. It needs `drift.view` as well as the
+    /// `drift.manage` the run needs. Agent Stream itself doesn't stop two
+    /// runs at once, so the check narrows the window for one but can't close
+    /// it.
     ///
     /// With --variant, or a --target other than the surface itself, the run
     /// is an experiment: it replays the surface's sessions against another
@@ -120,8 +123,10 @@ pub enum DriftCommand {
     /// the run failed, was cancelled, or was stopped. A read of the run that
     /// fails with a server error or no answer is tried again, up to 5 times in
     /// a row; then the command stops waiting and says how to check or cancel
-    /// the run. Ctrl-C stops waiting without cancelling the run; the command
-    /// to cancel it is printed when the waiting starts.
+    /// the run. With --timeout, it also stops waiting when the run is still
+    /// in progress after that long, and exits 1 with the same advice. Ctrl-C
+    /// stops waiting without cancelling the run; the command to cancel it is
+    /// printed when the waiting starts.
     #[command(after_long_help = RUN_EXAMPLES)]
     Run(RunArgs),
     /// Cancel a drift run in progress.
@@ -246,6 +251,11 @@ pub struct RunArgs {
     /// Start even though a run of the surface is already in progress.
     #[arg(long)]
     force: bool,
+    /// With --wait, stop waiting when the run is still in progress after this
+    /// long, such as 30m or 2h. The run goes on. Without it, the command
+    /// waits until the run ends.
+    #[arg(long, requires = "wait")]
+    timeout: Option<String>,
 }
 
 /// Examples shown at the bottom of `drift status --help`.
@@ -293,9 +303,10 @@ const RUN_EXAMPLES: &str = r#"Examples:
   Start a replay after confirming, and wait for it:
     fabric agent-stream drift run --surface support-bot --wait
 
-  Try the surface's sessions against a variant, from a script:
+  Try the surface's sessions against a variant, from a script, waiting at most
+  two hours:
     fabric agent-stream drift run --surface support-bot --variant cheaper-model \
-      --yes --wait --output json"#;
+      --yes --wait --timeout 2h --output json"#;
 
 impl DriftCommand {
     /// Fails, before anything is sent, for a command that would ask for a
@@ -697,19 +708,15 @@ async fn start_run(
         args.target = None;
     }
     let experiment = args.target.is_some() || args.variant.is_some();
+    let timeout = args
+        .timeout
+        .as_deref()
+        .map(|timeout| parse_duration("--timeout", timeout))
+        .transpose()?
+        .map(Duration::from_secs);
 
     if !args.force {
-        let mut checked = vec![args.surface.as_str()];
-        checked.extend(args.target.as_deref());
-        if let Some((surface, run_id)) = run_in_progress(client, &checked).await? {
-            bail!(
-                "drift run '{}' on surface '{}' is in progress; wait for it, cancel it with `fabric agent-stream \
-                 drift cancel {}`, or pass --force to start another",
-                flatten(&run_id),
-                flatten(&surface),
-                flatten(&run_id)
-            );
-        }
+        refuse_if_busy(client, &args).await?;
     }
 
     if !args.yes {
@@ -734,6 +741,11 @@ async fn start_run(
         );
         if !confirm_action("start a drift run on", &args.surface, async { prompt }).await? {
             bail!("drift run not started");
+        }
+        // The prompt can stay open for minutes, long enough for someone else
+        // to start a run, so the check is made again before starting.
+        if !args.force {
+            refuse_if_busy(client, &args).await?;
         }
     }
 
@@ -766,7 +778,7 @@ async fn start_run(
     if !args.wait {
         return match output {
             Output::Json => {
-                prompt_content::mask(&mut started, Item::DriftRun, MASKED_VALUE);
+                prompt_content::mask(&mut started, Item::DriftRun, LIST_MASKED_VALUE);
                 print_value(&started, output)
             }
             Output::Table => {
@@ -782,9 +794,9 @@ async fn start_run(
          with `fabric agent-stream drift cancel {id}`.",
         id = flatten(&run_id)
     );
-    let finished = wait_for(client, &run_id).await?;
+    let finished = wait_for(client, &run_id, timeout).await?;
     let mut shown = finished.clone();
-    prompt_content::mask(&mut shown, Item::DriftRun, MASKED_VALUE);
+    prompt_content::mask(&mut shown, Item::DriftRun, LIST_MASKED_VALUE);
     print_value(&shown, output)?;
     let status = finished
         .get("status")
@@ -801,12 +813,44 @@ async fn start_run(
     Ok(())
 }
 
+/// Refuses when a run that replays or targets the surface, or the target,
+/// is pending or running.
+async fn refuse_if_busy(
+    client: &GatewayClient,
+    args: &RunArgs,
+) -> Result<()> {
+    let mut checked = vec![args.surface.as_str()];
+    checked.extend(args.target.as_deref());
+    if let Some((surface, run_id)) = run_in_progress(client, &checked).await? {
+        bail!(
+            "drift run '{}' on surface '{}' is in progress; wait for it, cancel it with `fabric agent-stream drift \
+             cancel {}`, or pass --force to start another",
+            flatten(&run_id),
+            flatten(&surface),
+            flatten(&run_id)
+        );
+    }
+    Ok(())
+}
+
+/// How to check or cancel a run the CLI stopped waiting for.
+fn still_going(run_id: &str) -> String {
+    let id = flatten(run_id);
+    format!(
+        "drift run '{id}' may still be going: check it with `fabric agent-stream drift runs get {id}` or cancel it \
+         with `fabric agent-stream drift cancel {id}`"
+    )
+}
+
 /// Reads the run until it is neither pending nor running, printing its
-/// progress on standard error whenever it changes.
+/// progress on standard error whenever it changes. With `timeout`, stops
+/// waiting once the run is still in progress after that long.
 async fn wait_for(
     client: &GatewayClient,
     run_id: &str,
+    timeout: Option<Duration>,
 ) -> Result<Value> {
+    let deadline = timeout.map(|timeout| (Instant::now() + timeout, timeout));
     let mut last = None;
     loop {
         let run = read_run_retrying(client, run_id).await?;
@@ -817,6 +861,9 @@ async fn wait_for(
             .to_owned();
         if !IN_PROGRESS.contains(&status.as_str()) {
             return Ok(run);
+        }
+        if let Some((_, timeout)) = deadline.filter(|(deadline, _)| Instant::now() >= *deadline) {
+            bail!("stopped waiting after {} (--timeout); {}", describe_seconds(timeout.as_secs()), still_going(run_id));
         }
         let done = run
             .get("progress_done")
@@ -855,11 +902,7 @@ async fn read_run_retrying(
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
-                let id = flatten(run_id);
-                bail!(
-                    "{error}; stopped waiting for drift run '{id}', which may still be going: check it with `fabric \
-                     agent-stream drift runs get {id}` or cancel it with `fabric agent-stream drift cancel {id}`"
-                );
+                bail!("{error}; stopped waiting: {}", still_going(run_id));
             }
         }
     }
@@ -1298,7 +1341,7 @@ mod tests {
             .await
             .expect_err("gave up")
             .to_string();
-        assert!(error.contains("stopped waiting for drift run 'run-7', which may still be going"), "{error}");
+        assert!(error.contains("stopped waiting: drift run 'run-7' may still be going"), "{error}");
         assert!(error.contains("`fabric agent-stream drift runs get run-7`"), "{error}");
         assert!(error.contains("`fabric agent-stream drift cancel run-7`"), "{error}");
         assert_eq!(start_lines(&requests).len(), 1 + WAIT_ATTEMPTS as usize);
@@ -1346,6 +1389,42 @@ mod tests {
             caps_for("HTTP/1.1 403 Forbidden", "Insufficient permissions").await,
             ("unknown".to_owned(), "unknown".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_wait_stops_at_the_timeout_saying_the_run_may_still_be_going() {
+        let (host, _) = scripted_agent_stream(vec![(
+            "GET /api/v1/drift/runs/run-9",
+            "HTTP/1.1 200 OK",
+            r#"{"id":"run-9","status":"running","progress_done":1,"total":3}"#,
+        )])
+        .await;
+        let error = wait_for(&client_for(host).await, "run-9", Some(Duration::from_millis(20)))
+            .await
+            .expect_err("timed out")
+            .to_string();
+        assert!(
+            error.starts_with("stopped waiting after 0s (--timeout); drift run 'run-9' may still be going"),
+            "{error}"
+        );
+        assert!(error.contains("`fabric agent-stream drift cancel run-9`"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_run_refuses_a_bad_timeout_before_starting() {
+        let (result, requests) =
+            run_with(vec![], &["run", "--surface", "s1", "--yes", "--force", "--wait", "--timeout", "soon"]).await;
+        let error = result
+            .expect_err("bad timeout")
+            .to_string();
+        assert!(error.contains("--timeout 'soon' is not a duration"), "{error}");
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn test_run_timeout_needs_wait() {
+        let parsed = Drift::try_parse_from(["drift", "run", "--surface", "s1", "--timeout", "30m"]);
+        assert!(parsed.is_err());
     }
 
     #[test]

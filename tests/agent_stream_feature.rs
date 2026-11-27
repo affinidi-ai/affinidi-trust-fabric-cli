@@ -981,6 +981,8 @@ fn drift_run_wait_exits_1_when_the_run_is_cancelled() {
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(stderr(&output).contains("drift run 'run-1' ended cancelled"), "{}", stderr(&output));
     assert!(!stdout(&output).contains("secret prompt"), "{}", stdout(&output));
+    // drift run has no --reveal, so its placeholder points to runs get.
+    assert!(stdout(&output).contains("shown only by `get --reveal`"), "{}", stdout(&output));
     assert_eq!(
         request_lines(&requests),
         ["POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1", "GET /api/v1/drift/runs/run-1 HTTP/1.1"]
