@@ -105,7 +105,7 @@ Agent Stream replaces the whole template on every save and has no version check.
 
 When step 3 stops, run a flag change or a version command again to apply it to the template as it is now. For `update --file`, get a fresh copy with `prompts get`, make the change to it again, and update again.
 
-If the connection fails after a save or a `create` was sent, with no answer from Agent Stream, the change may have been saved. Check with `prompts get <id>` before running the command again.
+If Agent Stream's answer to a save or a `create` is lost, after a timeout, a dropped connection, or a 502 or 504 from a proxy in front of it, the change may have been saved, and the error says so. Pressing Ctrl-C while a save is running prints nothing, and the change may have been saved too. Check with `prompts get <id>` before running the command again.
 
 `--file` replaces the whole template, versions included, so a version left out of the file is removed. The CLI refuses a file with no versions, since Agent Stream would save it but could not render it; to remove every version, delete the template. The file must carry the template's current `updated_at`, so start from a fresh `prompts get`. A copy read before another save is refused. Its `created_at`, `updated_at`, and `tenant_id` are replaced with the stored ones.
 
@@ -125,7 +125,7 @@ fabric agent-stream prompts add-version support-greeter --file v3.json --make-de
 ```
 
 - The new version's number is `--version`, else the file's `version`, else one more than the highest version. A number the template already has is refused, so an existing version is never overwritten.
-- In a script, give `--version N`. If the connection fails after the request was sent, the version may have been added, and running the command again with the same `--version` is refused instead of adding a second copy.
+- In a script, give `--version N`. If the answer is lost, after a timeout, a 502 or 504, or Ctrl-C, the version may have been added, and running the command again with the same `--version` is refused instead of adding a second copy.
 - `--file` holds one version: `{"messages": [...], "label": "...", "version": 3}`, with `label` and `version` optional.
 - Without `--make-default`, callers who name no version keep the version they get now. When the template has no `default_version`, which means callers get the highest version, the CLI sets `default_version` to that version and prints a note saying so (on a dry run too, as part of the change it shows), so the new version doesn't reach them.
 

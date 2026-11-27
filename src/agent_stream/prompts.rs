@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -1051,19 +1051,20 @@ async fn save(
     Ok(())
 }
 
-/// `error` from a save request, with a warning added when no HTTP answer came
-/// back: a connection that failed after the request was sent may have failed
-/// after Agent Stream saved it. A refusal from Agent Stream is left as it is.
+/// `error` from a save request, with a warning added when Agent Stream's
+/// answer was lost: no HTTP answer came back, or a proxy in front of Agent
+/// Stream answered 502 or 504. Either can come after Agent Stream saved the
+/// change. A refusal from Agent Stream is left as it is.
 fn unanswered_save(
     error: anyhow::Error,
     id: &str,
 ) -> anyhow::Error {
-    if response_status(&error).is_some() {
+    if !matches!(response_status(&error), None | Some(StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT)) {
         return error;
     }
     error.context(format!(
-        "no answer came back, so prompt template '{id}' may have been saved before the connection failed; check with \
-         `fabric agent-stream prompts get {id}` before running the command again"
+        "no answer came back from Agent Stream, so prompt template '{id}' may have been saved; check with `fabric \
+         agent-stream prompts get {id}` before running the command again"
     ))
 }
 
@@ -1633,8 +1634,8 @@ mod tests {
             let text = error_text(run_stream(&words, saved, &credentials).await);
             assert!(
                 text.starts_with(
-                    "no answer came back, so prompt template 'greeter' may have been saved before the connection \
-                     failed; check with `fabric agent-stream prompts get greeter` before running the command again"
+                    "no answer came back from Agent Stream, so prompt template 'greeter' may have been saved; check \
+                     with `fabric agent-stream prompts get greeter` before running the command again"
                 ),
                 "{words:?}: {text}"
             );
@@ -1648,6 +1649,19 @@ mod tests {
                 Some(sent),
                 "{words:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_save_a_proxy_answers_with_502_or_504_says_to_check_before_running_again() {
+        for status in ["HTTP/1.1 502 Bad Gateway", "HTTP/1.1 504 Gateway Timeout"] {
+            let (result, _) = run_prompts(
+                &["prompts", "update", "greeter", "--name", "New"],
+                vec![GET_STORED, ("PUT /api/v1/prompts/greeter", status, "<html>Gateway Time-out</html>")],
+            )
+            .await;
+            let text = error_text(result);
+            assert!(text.contains("prompt template 'greeter' may have been saved"), "{status}: {text}");
         }
     }
 
