@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -591,14 +591,24 @@ impl Catalog {
         bail!("the Model catalog has no provider '{id}'; see `fabric agent-stream providers list`")
     }
 
-    /// Whether a provider, built-in or custom, has exactly the id `id`.
-    fn has_exact_id(
+    /// Whether a custom provider has exactly the id `id`, as one an earlier
+    /// `create` added would.
+    fn has_exact_custom_id(
+        &self,
+        id: &str,
+    ) -> bool {
+        custom_providers(&self.custom)
+            .iter()
+            .any(|provider| enum_value(provider) == id)
+    }
+
+    /// Whether a built-in provider has exactly the id `id`.
+    fn has_exact_built_in_id(
         &self,
         id: &str,
     ) -> bool {
         self.built_in
             .iter()
-            .chain(custom_providers(&self.custom))
             .any(|provider| enum_value(provider) == id)
     }
 
@@ -709,7 +719,12 @@ async fn create(
     check_provider(&provider)?;
     let id = enum_value(&provider).to_owned();
     let catalog = Catalog::read(client).await?;
-    if catalog.has_exact_id(&id) {
+    if catalog.has_exact_built_in_id(&id) {
+        bail!(
+            "'{id}' is a built-in provider; choose another id, or change the built-in one with `fabric agent-stream providers update {id}`"
+        );
+    }
+    if catalog.has_exact_custom_id(&id) {
         bail!(
             "provider '{id}' already exists, perhaps from an earlier run of this command whose save reached Agent \
              Stream; see it with `fabric agent-stream providers get {id}`"
@@ -1116,19 +1131,20 @@ async fn save_custom(
 
 /// `error` from sending a change for the provider `id`. A refusal from Agent
 /// Stream, which carries an HTTP status, saved nothing and is returned as it
-/// is. Any other failure, such as a timeout or a dropped connection, came
-/// after the change was sent, so it may have been saved: the error says so,
-/// and how to check before the command is run again.
+/// is. When Agent Stream's answer was lost instead, after a timeout, a dropped
+/// connection, or a 502 or 504 from a proxy in front of it, the change may
+/// have been saved: the error says so, and how to check before the command is
+/// run again.
 fn may_have_saved(
     error: anyhow::Error,
     id: &str,
 ) -> anyhow::Error {
-    if response_status(&error).is_some() {
+    if !matches!(response_status(&error), None | Some(StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT)) {
         return error;
     }
     error.context(format!(
-        "the connection failed after the change was sent, so Agent Stream may have saved it; check with `fabric \
-         agent-stream providers get {id}` before running this command again"
+        "no answer came back from Agent Stream after the change was sent, so it may have saved it; check with \
+         `fabric agent-stream providers get {id}` before running this command again"
     ))
 }
 
@@ -1537,7 +1553,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_refuses_an_id_that_exists_exactly_and_says_how_to_see_it() {
-        for id in ["acme", "openai"] {
+        for id in ["acme"] {
             let (result, requests) = run_providers(
                 &["providers", "create", "--id", id, "--name", "Again"],
                 vec![GET_BUILT_IN, GET_CUSTOM, PUT_CUSTOM],
@@ -1548,6 +1564,32 @@ mod tests {
             assert!(text.contains(&format!("`fabric agent-stream providers get {id}`")), "{text}");
             assert!(!text.contains("choose another id"), "{text}");
             assert_eq!(sent_writes(&requests), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_with_a_built_in_id_says_it_is_built_in_not_from_an_earlier_run() {
+        let (result, requests) = run_providers(
+            &["providers", "create", "--id", "openai", "--name", "Again"],
+            vec![GET_BUILT_IN, GET_CUSTOM, PUT_CUSTOM],
+        )
+        .await;
+        let text = error_text(result);
+        assert!(text.contains("'openai' is a built-in provider; choose another id"), "{text}");
+        assert!(!text.contains("earlier run"), "{text}");
+        assert_eq!(sent_writes(&requests), 0);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_502_or_504_after_a_change_is_said_to_have_maybe_saved() {
+        for status in ["HTTP/1.1 502 Bad Gateway", "HTTP/1.1 504 Gateway Timeout"] {
+            let (result, _) = run_providers(
+                &["providers", "delete", "openai"],
+                vec![GET_BUILT_IN, GET_CUSTOM, ("DELETE /api/v1/llm-providers/openai", status, "<html>timeout</html>")],
+            )
+            .await;
+            let text = error_text(result);
+            assert!(text.contains("may have saved it"), "{status}: {text}");
         }
     }
 

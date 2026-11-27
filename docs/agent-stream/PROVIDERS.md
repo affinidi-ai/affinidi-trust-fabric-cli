@@ -69,6 +69,7 @@ fabric agent-stream providers create --file provider.json --dry-run
 - A new provider always goes into the custom catalog, so a refresh doesn't remove it.
 - The provider is saved with `enabled` true unless `--disabled` is given or a `--file` document sets `enabled` itself. Agent Stream treats a provider with no `enabled` as on, but the dashboard's provider list shows it as disabled, so the CLI always writes it. `list` shows ENABLED `no` only for a provider whose `enabled` is false.
 - Its id can't be one another provider, built-in or custom, already has, whatever its case.
+- If an id is already a custom provider's, an earlier `create` may have saved it, for example one whose answer was lost after a timeout or a 502 or 504 from a proxy; see it with `providers get <id>`. Pressing Ctrl-C while a save is running prints nothing, and the change may have been saved too.
 - Before anything is sent, the CLI checks the provider the way Agent Stream would: an id and a name; `api_key_validation`, when set, of `mandatory`, `optional`, or `none`; a name and a path on each endpoint; a name and a value on each model; and prices from 0 to 100 USD per 1,000 tokens. Agent Stream also requires a base URL that resolves to a public address.
 - Agent Stream keeps fields it doesn't know, so the CLI doesn't refuse them.
 
