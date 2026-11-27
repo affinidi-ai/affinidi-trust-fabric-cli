@@ -335,7 +335,7 @@ pub fn flag_paths<'a>(
 /// Split an `--add` or `--remove` flag at its first `=` outside square
 /// brackets, so an item named as `gates[g=1]` keeps its `=`. A bracket that is
 /// never closed splits at the first `=`, and the path is refused later.
-fn split_flag(given: &str) -> Option<(&str, &str)> {
+pub fn split_flag(given: &str) -> Option<(&str, &str)> {
     let mut inside = false;
     for (index, c) in given.char_indices() {
         match c {
