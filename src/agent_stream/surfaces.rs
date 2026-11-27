@@ -2558,6 +2558,24 @@ mod tests {
         assert!(Cli::try_parse_from(["fabric", "agent-stream", "surfaces", "list"]).is_ok());
     }
 
+    #[tokio::test]
+    async fn a_terms_gate_failure_on_a_surface_route_gets_the_terms_hint_once() {
+        let body = r#"{"code":"TERMS_OPERATIONAL_FAILURE"}"#;
+        let (host, _) =
+            scripted_agent_stream(vec![("GET /api/v1/pipes", "HTTP/1.1 503 Service Unavailable", body)]).await;
+
+        let error = run_surfaces(&host, &["surfaces", "list"])
+            .await
+            .expect_err("the Terms gate refuses the list");
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "the upstream terms provider is unavailable; check `fabric agent-stream terms provider-health`: {body}"
+            )
+        );
+    }
+
     #[test]
     fn ids_follow_the_agent_stream_rules() {
         assert!(check_id(&"a".repeat(MAX_ID_LEN)).is_ok());
