@@ -231,10 +231,10 @@ enum AgentStreamCommand {
     /// Manage connection points, the DIDComm invitations other appliances use
     /// to connect to this Agent Stream.
     ///
-    /// Each one holds a secret that a peer must know to accept it. Keep it
-    /// from the document you create the connection point with: only the
-    /// create answer carries it, and that one may show it encrypted when
-    /// Agent Stream encrypts stored fields.
+    /// Each one holds a secret that a peer must know to accept it. Keep your
+    /// own copy of the secret, the one in the document you create the
+    /// connection point with: only the create answer carries it, and that one
+    /// may show it encrypted when Agent Stream encrypts stored fields.
     #[command(name = "connection-points")]
     ConnectionPoints {
         #[command(subcommand)]

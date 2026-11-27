@@ -9,7 +9,7 @@ use crate::commands::{self, JsonFileArgs};
 
 #[derive(Debug, Subcommand)]
 pub enum ConnectionCommand {
-    /// List connections.
+    /// List Trust Fabric connections.
     ///
     /// Each record's type is `self` for this Agent Stream or `remote` for a
     /// peer. Its status is `active`, `pending`, `awaiting-approval`,
@@ -19,17 +19,17 @@ pub enum ConnectionCommand {
     /// can read connections; an access token with its own scope list needs
     /// gateways.view.
     List,
-    /// Get a connection by ID.
+    /// Get a Trust Fabric connection by ID.
     ///
     /// The ID is the ID column of `fabric agent-stream connections list`. It
     /// is sent as given: a name is not looked up. Any signed-in user can read
     /// connections; an access token with its own scope list needs
     /// gateways.view.
     Get {
-        /// Connection ID, as `list` prints it.
+        /// Trust Fabric connection ID, as `list` prints it.
         id: String,
     },
-    /// Create a connection record from a JSON document.
+    /// Create a Trust Fabric connection from a JSON document.
     ///
     /// The document carries `name`, `description`, and `did`, the peer's
     /// DID. The record is created with the type `remote`. Table output prints
@@ -37,7 +37,7 @@ pub enum ConnectionCommand {
     /// gateways.edit permission.
     #[command(after_long_help = CREATE_EXAMPLES)]
     Create(JsonFileArgs),
-    /// Update a connection from a JSON document.
+    /// Update a Trust Fabric connection from a JSON document.
     ///
     /// Agent Stream changes only `name`, `description`, and `status`, and
     /// ignores other fields, so the DID cannot change. `status` is one of
@@ -45,14 +45,14 @@ pub enum ConnectionCommand {
     /// Needs the gateways.edit permission.
     #[command(after_long_help = UPDATE_EXAMPLES)]
     Update {
-        /// Connection ID, as `list` prints it.
+        /// Trust Fabric connection ID, as `list` prints it.
         id: String,
         /// JSON document carrying any of `name`, `description`, `status`. Use
         /// '-' to read from standard input.
         #[arg(short, long)]
         file: PathBuf,
     },
-    /// Delete a connection by ID.
+    /// Delete a Trust Fabric connection by ID.
     ///
     /// It runs at once, with no confirmation prompt. Agent Stream refuses to
     /// delete the `self` record. Deleting a `remote` record stops the
@@ -60,7 +60,7 @@ pub enum ConnectionCommand {
     /// Agent Stream created for it; the ones a user created are kept. Needs
     /// the gateways.delete permission.
     Delete {
-        /// Connection ID, as `list` prints it.
+        /// Trust Fabric connection ID, as `list` prints it.
         id: String,
     },
 }
@@ -74,7 +74,7 @@ const CREATE_EXAMPLES: &str = r#"Examples:
 
 /// Examples shown at the bottom of `connections update --help`.
 const UPDATE_EXAMPLES: &str = r#"Examples:
-  Disable a connection:
+  Disable a Trust Fabric connection:
     echo '{"status": "disabled"}' | fabric agent-stream connections update \
       <id> --file -"#;
 

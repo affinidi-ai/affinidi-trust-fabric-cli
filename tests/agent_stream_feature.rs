@@ -1010,12 +1010,12 @@ fn drift_runs_get_hides_samples_unless_reveal_and_then_warns() {
 
 #[cfg(feature = "agent-stream")]
 #[test]
-fn connections_connection_points_and_mediators_lists_print_the_agent_gateway_tables() {
+fn connections_connection_points_and_mediators_lists_print_the_agent_gateway_tables_and_runtime_status_json() {
     let (host, _) = agent_stream_stand_in(vec![
         (
             "GET /api/v1/gateways",
             "200 OK",
-            r#"[{"id":"g-1","name":"Partner","description":"","did":"did:web:partner.example","gateway_type":"remote","status":"active","creation_type":"user","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-02T00:00:00Z","exposed_channels":[]}]"#,
+            r#"[{"id":"g-1","name":"Partner","description":"","did":"did:web:partner.example","gateway_type":"remote","status":"active","creation_type":"user","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-02T00:00:00Z","exposed_channels":[],"runtime_status":{"status":"connected","last_active_at":"2026-11-02T00:00:00Z"}}]"#,
         ),
         (
             "GET /api/v1/connection-points",
@@ -1030,6 +1030,7 @@ fn connections_connection_points_and_mediators_lists_print_the_agent_gateway_tab
     ]);
 
     let connections = fabric_on_stream(&host, &["connections", "list"], "");
+    let connections_json = fabric_on_stream(&host, &["--output", "json", "connections", "list"], "");
     let points = fabric_on_stream(&host, &["connection-points", "list"], "");
     let mediators = fabric_on_stream(&host, &["mediators", "list"], "");
 
@@ -1040,6 +1041,8 @@ fn connections_connection_points_and_mediators_lists_print_the_agent_gateway_tab
         "{}",
         stderr(&connections)
     );
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&connections_json)).expect("JSON");
+    assert_eq!(listed[0]["runtime_status"]["status"], "connected", "{}", stderr(&connections_json));
     assert_eq!(
         stdout(&points),
         "NAME        ID    CONNECTION  ENABLED  USES  EXPIRES\n\

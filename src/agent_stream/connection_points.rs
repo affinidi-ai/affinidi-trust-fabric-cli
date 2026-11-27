@@ -40,10 +40,10 @@ pub enum ConnectionPointCommand {
     /// permission.
     ///
     /// Table output prints only the new connection point's ID. With --output
-    /// json the answer is printed as Agent Stream sent it. Keep the secret
-    /// from your own document: the answer's `secret` may show it encrypted
-    /// when Agent Stream encrypts stored fields, and no other answer carries
-    /// it.
+    /// json the answer is printed as Agent Stream sent it. Keep your own copy
+    /// of the secret, the one in the document you created the connection
+    /// point with: the answer's `secret` may show it encrypted when Agent
+    /// Stream encrypts stored fields, and no other answer carries it.
     #[command(after_long_help = CREATE_EXAMPLES)]
     Create(JsonFileArgs),
     /// Update a connection point from a JSON document.
