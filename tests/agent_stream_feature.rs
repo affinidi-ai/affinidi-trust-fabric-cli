@@ -1940,3 +1940,208 @@ fn providers_list_refused_by_agent_stream_prints_its_reason_and_exits_non_zero()
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
     assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/llm-providers HTTP/1.1"]);
 }
+
+/// What Agent Stream answers to `GET /v1/pipes/s-1/budget`.
+#[cfg(feature = "agent-stream")]
+const BUDGET: &str = r#"{"pipe_id":"s-1","month":"2026-11","total_spent":12.5,"budget_limit":100.0,"usage_percentage":12.5,"remaining_budget":87.5,"alert_threshold_percent":80,"budget_exceeded":false,"last_updated":"2026-11-20T10:00:00+00:00"}"#;
+
+/// A surface with a rate limit and one usage limit set.
+#[cfg(feature = "agent-stream")]
+const SURFACE_WITH_FEATURES: &str = r#"{"id":"s-1","name":"Sales","pipe_type":{"type":"webhook"},"status":"enabled","rate_limit":{"enabled":false,"requests_per_minute":60},"usage_limits":[{"id":"tokens","monthly_token_cap":1000}],"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-20T10:00:00Z"}"#;
+
+/// Runs `fabric agent-stream <words>` against an Agent Stream at a host that
+/// answers every request but the probe with `body`, with the host and an
+/// access token from the environment. Returns the run and the request lines.
+#[cfg(feature = "agent-stream")]
+fn surfaces_against(
+    words: &[&str],
+    body: &'static str,
+) -> (Output, Vec<String>) {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, body);
+    let args: Vec<&str> = ["agent-stream"]
+        .into_iter()
+        .chain(words.iter().copied())
+        .collect();
+    let output = fabric_in_fresh_home(
+        &args,
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+    (output, request_lines(&requests))
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn surfaces_features_lists_the_agent_stream_features_without_a_connection() {
+    let output = fabric(&["agent-stream", "surfaces", "features"], &[]);
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.starts_with("FEATURE"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("prompt-guard") && line.contains(" pii ") && line.contains("prompt_guard")),
+        "{text}"
+    );
+    assert!(!text.contains("tool-gating"), "{text}");
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn surfaces_features_of_a_surface_shows_each_set_feature_and_its_remove_command() {
+    let (output, requests) = surfaces_against(&["surfaces", "features", "s-1"], SURFACE_WITH_FEATURES);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output)
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "FEATURE       FIELD         STATE   VARIANTS  REMOVE WITH",
+            "rate-limit    rate_limit    off     -         fabric agent-stream surfaces remove-feature s-1 rate-limit",
+            "usage-limits  usage_limits  1 item  -         fabric agent-stream surfaces remove-feature s-1 usage-limits (--item <id> | --all)",
+        ]
+    );
+    assert_eq!(requests, [PROBE_REQUEST, "GET /api/v1/pipes/s-1 HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn surfaces_budget_prints_the_spend_as_a_table_or_as_json() {
+    let (table, requests) = surfaces_against(&["surfaces", "budget", "s-1"], BUDGET);
+    let (json, _) = surfaces_against(&["surfaces", "budget", "s-1", "--output", "json"], BUDGET);
+
+    assert!(table.status.success(), "{}", stderr(&table));
+    assert_eq!(
+        stdout(&table)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["MONTH    SPENT   LIMIT    USED   REMAINING  EXCEEDED", "2026-11  $12.50  $100.00  12.5%  $87.50     no"]
+    );
+    assert_eq!(requests, [PROBE_REQUEST, "GET /api/v1/pipes/s-1/budget HTTP/1.1"]);
+    assert!(json.status.success(), "{}", stderr(&json));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&json)).expect("JSON"),
+        serde_json::from_str::<serde_json::Value>(BUDGET).unwrap()
+    );
+    assert!(!stderr(&table).contains(ACCESS_TOKEN), "{}", stderr(&table));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn an_unknown_surface_feature_is_refused_with_a_suggestion_and_nothing_sent() {
+    let (output, requests) = surfaces_against(&["surfaces", "add-feature", "s-1", "rate-limt", "--json", "{}"], "{}");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).ends_with("error: unknown feature `rate-limt`; did you mean `rate-limit`?\n"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(requests.is_empty(), "{requests:?}");
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn surfaces_add_feature_reads_the_surface_twice_saves_it_and_lists_the_change() {
+    let (output, requests) = surfaces_against(
+        &["surfaces", "add-feature", "s-1", "rate-limit", "--json", r#"{"enabled":true,"requests_per_minute":60}"#],
+        SURFACE_WITH_FEATURES,
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Changes:\n  rate_limit.enabled: false -> true\nUpdated surface 's-1'\n");
+    assert_eq!(
+        requests,
+        [
+            PROBE_REQUEST,
+            "GET /api/v1/pipes/s-1 HTTP/1.1",
+            "GET /api/v1/pipes/s-1 HTTP/1.1",
+            "PUT /api/v1/pipes/s-1 HTTP/1.1"
+        ]
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn surfaces_remove_feature_on_a_list_without_item_or_all_is_refused_and_nothing_sent() {
+    let (output, requests) =
+        surfaces_against(&["surfaces", "remove-feature", "s-1", "usage-limits"], SURFACE_WITH_FEATURES);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).ends_with(
+            "error: usage-limits is a list: give --item <id> to remove one item, or --all to remove the whole list\n"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(requests.is_empty(), "{requests:?}");
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn surfaces_add_feature_with_output_json_prints_one_json_value_and_its_notes_on_standard_error() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/pipes/s-1", "200 OK", SURFACE_WITH_FEATURES),
+        ("PUT /api/v1/pipes/s-1", "200 OK", SURFACE_WITH_FEATURES),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["surfaces", "add-feature", "s-1", "retry", "--json", r#"{"max_retries":2}"#, "--output", "json"],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&output)).expect("one JSON value on standard output"),
+        serde_json::from_str::<serde_json::Value>(SURFACE_WITH_FEATURES).unwrap()
+    );
+    assert!(
+        stderr(&output).contains(
+            "note: surface 's-1' is a `webhook` surface, and Agent Stream serves calls only on `llm` surfaces, so \
+             retry takes effect only through a variant whose `pipe_type` is `llm`\n"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        request_lines(&requests),
+        [
+            PROBE_REQUEST,
+            "GET /api/v1/pipes/s-1 HTTP/1.1",
+            "GET /api/v1/pipes/s-1 HTTP/1.1",
+            "PUT /api/v1/pipes/s-1 HTTP/1.1",
+            "GET /api/v1/pipes/s-1 HTTP/1.1"
+        ]
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn a_surface_save_agent_stream_refuses_shows_its_reason_and_fails() {
+    const REFUSAL: &str = "Invalid LLM configuration: canary weights must add up to 100";
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/pipes/s-1", "200 OK", SURFACE_WITH_FEATURES),
+        ("PUT /api/v1/pipes/s-1", "400 Bad Request", REFUSAL),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["surfaces", "add-feature", "s-1", "rate-limit", "--json", r#"{"enabled":true,"requests_per_minute":60}"#],
+        "",
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert!(stderr(&output).contains(REFUSAL), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("may have been saved"), "{}", stderr(&output));
+    assert_eq!(
+        request_lines(&requests)
+            .last()
+            .map(String::as_str),
+        Some("PUT /api/v1/pipes/s-1 HTTP/1.1")
+    );
+}

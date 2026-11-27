@@ -522,6 +522,38 @@ Agent Stream assigns member and team ids, so `create` sends an empty `id`. A tea
 `GET /v1/members`, and `add-member` and `remove-member` use the team's own member routes,
 which change the stored team without a full replace.
 
+`surfaces features`, `add-feature`, `remove-feature`, and `budget` live in
+[`agent_stream/surfaces/features.rs`](src/agent_stream/surfaces/features.rs), a child of
+`surfaces.rs` so it shares that file's private checks without changing `mod.rs`. On Agent
+Stream a feature is one field of the surface, so `FEATURES` maps each feature name to its
+`PipeConfig` field and says whether it is one object or a list; it is not the Agent Gateway
+feature table in `features.rs`, which is built around edges and placements. `add-feature`
+replaces an object field whole and appends one item to a list through
+`surface_patch::build_patch`'s `--add`, so an item already in the list is refused the same
+way. Adding the first item to `usage_alerts` or `routing_rules` sets `usage_alerts_enabled`
+or `routing_enabled` to true when it is false, since Agent Stream ignores the items while
+it is; adding to a list whose switch is false leaves it false and prints a note, and a
+missing switch is left out, since Agent Stream reads it as true. `cost_tracking`
+also holds the surface's prices, so `add-feature` keeps the stored `enabled` and prices the
+settings leave out. `remove-feature` removes the field, or one item through `--remove`, and
+a list needs `--item` or `--all`. Notes, printed to standard error, name the variants that
+override the feature (`VARIANT_FIELDS`), and say when a feature does nothing on a `webhook`
+or `ide_catalog` surface. Both then go through `update`'s own `save`: the stale check, the
+dry run, the no-change case, and the output. Names inside an object the surface already
+has are checked as `update` checks them, `--allow-new-field` included. The feature name,
+the surface id, the shape of the settings, and the `--item` or `--all` flags are checked
+once, before a connection is resolved, by `AddFeatureArgs::checked` and
+`RemoveFeatureArgs::checked`, which return the `FeatureAddition` or `FeatureRemoval` that
+`add` and `remove` take, and `features` with no id needs no connection. When the send of a
+save fails, `SaveFailure` in `surfaces.rs` sorts the error: never sent (a connect
+`reqwest::Error`) and refused (a status below 500) print as they are, a
+success answer that is not JSON says it could not be read, a server error says the surface
+may have been saved anyway, and anything else, a 502 or 504 included, says no answer came
+back, so the surface may have been saved anyway. `budget`
+reads `/v1/pipes/{id}/budget`, which Agent Stream gates on `metrics.view`, so a 403 that
+gives no reason of its own (`client::is_unexplained_agent_stream_forbidden`) names that
+permission.
+
 ## Invariants
 
 Breaking one of these is a correctness bug, not a style question.
@@ -550,7 +582,7 @@ Every file in [`src/`](src/) and what it owns.
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
 | [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, `remembering_probes`, which keeps a host's answer for the length of an interactive shell, and the names messages give each product (`message_name`, `message_subject`, `connection_noun`, `surface_noun`). |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, `prompts.rs`, `members.rs`, `teams.rs`, `providers.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `connections.rs`, `connection_points.rs`, `mediators.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), `records.rs` for what `members` and `teams` share, and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs` with its child `surfaces/features.rs`, `prompts.rs`, `members.rs`, `teams.rs`, `providers.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `connections.rs`, `connection_points.rs`, `mediators.rs`, `settings.rs`, `user_settings.rs`, `terms.rs`, `notifications.rs`, `tenant_ownership.rs`, `certificates.rs`, `credential_providers.rs`, `jwt_verification_strategies.rs`, `delegation_vault.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared commands through `run_shared`: the Agent Gateway enums, or `OwnershipChange`, which both products' `tenant-ownership` map onto, and `governance.rs` and `drift.rs`), the helpers those last two share (`prompt_content.rs` hides prompt content, `request.rs` builds query strings and names the permission a 403 lacked, and `when.rs` reads `--since`, `--until` and `--window`), `records.rs` for what `members` and `teams` share, and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |
