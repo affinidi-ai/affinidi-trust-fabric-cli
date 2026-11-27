@@ -33,6 +33,7 @@ Every command also documents its options in its help text: `fabric agent-gateway
 | Document | Command groups |
 | --- | --- |
 | [Governance and drift](agent-stream/GOVERNANCE_AND_DRIFT.md) | `governance` and `drift`: governance records, chain checks, drift verdicts, baselines, and replay runs |
+| [Surface features](agent-stream/SURFACE_FEATURES.md) | `surfaces features`, `add-feature`, `remove-feature`, and `budget`: rate limits, cost tracking and budgets, usage limits and alerts, guardrails, routing, and failover on a surface |
 
 ## Development
 

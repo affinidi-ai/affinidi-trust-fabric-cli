@@ -721,14 +721,7 @@ fn product_error(
             return status_error(status, AGENT_STREAM_TERMS_REQUIRED.to_owned());
         }
         if !server_said && credential != Credential::Basic {
-            return status_error(
-                status,
-                format!(
-                    "Agent Stream answered {status}, so your role or the scopes of the access token in use do not \
-                     allow this request, or the access token is limited to a resource and the request lacks a \
-                     header it requires; `fabric agent-stream tokens scopes` lists the scopes this login holds"
-                ),
-            );
+            return status_error(status, AGENT_STREAM_FORBIDDEN.to_owned());
         }
     }
     // A real server message (JSON `message`/`error`/`details`, or a
@@ -739,6 +732,21 @@ fn product_error(
         return status_error(status, detail);
     }
     status_error(status, format!("{} returned {status}: {detail}", product.message_name()))
+}
+
+/// What a 403 from Agent Stream with an empty body means.
+const AGENT_STREAM_FORBIDDEN: &str = "Agent Stream answered 403 Forbidden, so your role or the scopes of the access \
+                                      token in use do not allow this request, or the access token is limited to a \
+                                      resource and the request lacks a header it requires; `fabric agent-stream \
+                                      tokens scopes` lists the scopes this login holds";
+
+/// Whether `error` is a 403 from Agent Stream that gave no reason of its
+/// own, so a command may add the permission its route needs.
+#[cfg(feature = "agent-stream")]
+pub fn is_unexplained_agent_stream_forbidden(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<GatewayStatusError>()
+        .is_some_and(|error| error.status == StatusCode::FORBIDDEN && error.message == AGENT_STREAM_FORBIDDEN)
 }
 
 /// The `code` Agent Stream answers with when the signed-in user has not
@@ -2339,6 +2347,20 @@ mod tests {
              allow this request, or the access token is limited to a resource and the request lacks a header it \
              requires; `fabric agent-stream tokens scopes` lists the scopes this login holds"
         );
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[test]
+    fn only_an_agent_stream_403_with_an_empty_body_counts_as_unexplained() {
+        let unexplained = |product, status, body: &[u8]| {
+            is_unexplained_agent_stream_forbidden(&product_error(product, Credential::AccessToken, status, body, &[]))
+        };
+
+        assert!(unexplained(Product::AgentStream, StatusCode::FORBIDDEN, b""));
+        assert!(!unexplained(Product::AgentStream, StatusCode::FORBIDDEN, br#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#));
+        assert!(!unexplained(Product::AgentStream, StatusCode::FORBIDDEN, br#"{"message":"no"}"#));
+        assert!(!unexplained(Product::AgentStream, StatusCode::NOT_FOUND, b""));
+        assert!(!unexplained(Product::AgentGateway, StatusCode::FORBIDDEN, b""));
     }
 
     #[test]

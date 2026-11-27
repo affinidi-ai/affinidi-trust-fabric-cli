@@ -1,6 +1,7 @@
 //! `fabric agent-stream surfaces`: list, read, create, change, and delete the
 //! surfaces of an Agent Stream, which its API calls pipes and serves at
-//! `/v1/pipes`.
+//! `/v1/pipes`. Adding and removing a surface's features, and reading its
+//! budget, live in [`features`].
 //!
 //! Agent Stream drops a surface field it does not know without an error, and
 //! a save replaces the whole surface with no version check. So the field names
@@ -23,6 +24,8 @@ use crate::{
     tables::{self, Scope},
 };
 
+mod features;
+
 /// Where Agent Stream serves its surfaces.
 const SURFACES_PATH: &str = "/v1/pipes";
 
@@ -40,19 +43,24 @@ const CREATE_PIPE_TYPE_HINT: &str =
 /// How to keep a `pipe_type` on `update`.
 const UPDATE_PIPE_TYPE_HINT: &str = "keep the `pipe_type` from `surfaces get`, or --set pipe_type.type to one of these";
 
-/// The end of the table-mode dry run of `update`, after a blank line.
+/// The end of the table-mode dry run of `update`, `add-feature`, and
+/// `remove-feature`, after a blank line.
 const DRY_RUN_UPDATE_NOTE: &str = "\nDry run: nothing was saved. Agent Stream's own checks, such as a route another \
-                                   surface uses or the drift block, only run on a real save.";
+                                   surface uses, the drift block, or the checks on failover targets, canary splits, \
+                                   and usage limits, only run on a real save.";
 
 /// The top-level fields of an Agent Stream surface: the fields of `PipeConfig`
 /// in Agent Stream's `src/pipes/config.rs`, which renames and flattens none of
 /// them. Agent Stream drops a field it does not know without an error, so this
 /// list must follow that struct whenever Agent Stream adds or removes a field.
 ///
-/// The credential fields (`source_auth`, `upstream_headers`, and the
-/// `api_key_secret` of the judge, jury, guardrail, and cache settings) hold
-/// secret ids, never the secrets, and Agent Stream returns the surface as
-/// stored, so the commands print and send them back as they are.
+/// The credential fields hold secret ids, never the secrets: `source_auth`,
+/// the `api_key_secret` of the `pipe_type` provider, of the guardrail and
+/// cache settings, and of every model target (the judge, jury, and decider
+/// ones, and the targets of failover, load balancing, and routing rules), and
+/// the `secret_id` of each header in `upstream_headers` and in a target's
+/// `headers`. Agent Stream returns the surface as stored, so the commands
+/// print and send them back as they are.
 const SURFACE_FIELDS: [&str; 61] = [
     "id",
     "name",
@@ -232,6 +240,95 @@ pub enum SurfaceCommand {
         /// ID of the surface (see `fabric agent-stream surfaces list`).
         id: String,
     },
+    /// List the features a surface can have, or the ones a given surface has.
+    ///
+    /// Each feature is one field of the surface, such as `rate_limit` or
+    /// `failover`. Without an id, the table lists every feature with its
+    /// alias, its field, and what it does, and needs no saved connection.
+    /// With an id, it lists each feature the surface has set, whether it is
+    /// on, the variants that use their own value of it, and the
+    /// `remove-feature` command for it; a feature only variants set shows as
+    /// `not set`. The names shown are the ones `add-feature` and
+    /// `remove-feature` take, in any case. --output json prints the same list,
+    /// or for a surface each feature with its field, state, base value, and
+    /// `overridden_by` variants.
+    #[command(after_long_help = FEATURES_EXAMPLES)]
+    Features {
+        /// ID of the surface (see `fabric agent-stream surfaces list`).
+        id: Option<String>,
+    },
+    /// Add a feature to a surface, or replace its settings.
+    ///
+    /// The settings come from --json or --file, in the shape of the surface
+    /// field the feature names (see `surfaces features`). A one-setting
+    /// feature, such as rate-limit or failover, replaces the whole field with
+    /// the JSON given, so running add-feature again changes it; to change a
+    /// single setting, use `surfaces update --set <field>.<name>=<value>`.
+    /// cost-tracking (alias budget) also holds the surface's own model prices,
+    /// which Agent Stream uses whether or not `enabled` is true, so the
+    /// stored `enabled`, `input_price_per_1k`, and `output_price_per_1k` are
+    /// kept, with a note, when the JSON leaves them out; with no `enabled`
+    /// given or stored it is refused, since Agent Stream needs one.
+    ///
+    /// A list feature, such as usage-limits or routing-rules, gets the JSON
+    /// appended as one item, and an item already in the list, by its `id` or
+    /// by the same fields, is refused. A new routing rule goes last, and
+    /// Agent Stream uses the first rule that matches. Agent Stream ignores
+    /// every usage alert while `usage_alerts_enabled` is false, and every
+    /// routing rule while `routing_enabled` is false. Adding the first item
+    /// sets that switch to true; adding to a list whose switch is false
+    /// leaves it false, with a note on how to turn the list on.
+    ///
+    /// Only the base surface is read and changed. A note names any variant
+    /// that uses its own value of the feature, and so does not see the
+    /// change. Agent Stream serves calls only on `llm` surfaces, so a note
+    /// says when a feature does nothing on a `webhook` or `ide_catalog`
+    /// surface.
+    ///
+    /// The save works as `surfaces update` does: the CLI reads the surface,
+    /// checks the field names, reads it again and stops if it was saved
+    /// meanwhile, then sends the whole surface. Agent Stream has no version
+    /// check, so a save that lands in the short gap between that last read
+    /// and the send is still overwritten. A name inside the JSON must be one
+    /// the surface's field already has, unless --allow-new-field is given;
+    /// nothing is checked inside a field the surface does not have yet, or
+    /// inside a list item. Table output lists the changes, and --output json
+    /// prints the surface read back after the save. --dry-run shows the
+    /// changes and saves nothing. Agent Stream has no dry run, so its own
+    /// checks, such as those on failover targets, canary splits, and usage
+    /// limits, only run on a real save.
+    #[command(after_long_help = ADD_FEATURE_EXAMPLES)]
+    AddFeature(features::AddFeatureArgs),
+    /// Remove a feature from a surface.
+    ///
+    /// A one-setting feature is removed whole. Removing cost-tracking removes
+    /// the surface's own model prices too, with a note; to stop only the
+    /// budget, set `cost_tracking.enabled` to false with `surfaces update`. A
+    /// list feature needs --item to remove one item or --all to remove the
+    /// whole list, and neither is refused before anything is sent. --item
+    /// takes the item's `id`; routing rules and usage alerts have no id, so
+    /// give some of the item's fields as JSON instead, which must match
+    /// exactly one item. A list's switch, such as `routing_enabled`, is left
+    /// as it is. A feature the surface does not have set is refused. Only the
+    /// base surface is changed, as for `add-feature`, and the save, the
+    /// output, and --dry-run work as for `add-feature` too.
+    #[command(after_long_help = REMOVE_FEATURE_EXAMPLES)]
+    RemoveFeature(features::RemoveFeatureArgs),
+    /// Show this month's spend of a surface against its monthly budget.
+    ///
+    /// The budget is the `monthly_budget_usd` of the cost-tracking feature
+    /// (`cost_tracking`). Agent Stream counts the spend only while
+    /// `cost_tracking` has `enabled` set to true, a `monthly_budget_usd`
+    /// above 0, and an `alert_threshold_percent`, and it counts only the
+    /// surface's own model calls, not those of the judge or jury. It takes a
+    /// changed budget into its count at the next model call, so until then
+    /// LIMIT shows the old one. Reading it needs the `metrics.view`
+    /// permission. --output json prints Agent Stream's answer.
+    #[command(after_long_help = BUDGET_EXAMPLES)]
+    Budget {
+        /// ID of the surface (see `fabric agent-stream surfaces list`).
+        id: String,
+    },
 }
 
 /// Examples shown at the bottom of `surfaces create --help`.
@@ -244,6 +341,68 @@ const CREATE_EXAMPLES: &str = r#"Examples:
   Check a document first, then create it:
     fabric agent-stream surfaces create --file surface.json --dry-run
     fabric agent-stream surfaces create --file surface.json"#;
+
+/// Examples shown at the bottom of `surfaces features --help`.
+const FEATURES_EXAMPLES: &str = r#"Examples:
+  List every feature a surface can have:
+    fabric agent-stream surfaces features
+
+  Show which features a surface has, and how to remove each one:
+    fabric agent-stream surfaces features s-1a2b3c4d5e6f"#;
+
+/// Examples shown at the bottom of `surfaces add-feature --help`.
+const ADD_FEATURE_EXAMPLES: &str = r#"Examples:
+  Limit a surface to 60 requests a minute, previewing first:
+    fabric agent-stream surfaces add-feature s-1a2b3c4d5e6f rate-limit \
+      --json '{"enabled":true,"requests_per_minute":60}' --dry-run
+    fabric agent-stream surfaces add-feature s-1a2b3c4d5e6f rate-limit \
+      --json '{"enabled":true,"requests_per_minute":60}'
+
+  Set a monthly budget of 100 USD, with an alert at 80%, keeping the
+  surface's own prices:
+    fabric agent-stream surfaces add-feature s-1a2b3c4d5e6f cost-tracking \
+      --json '{"enabled":true,"monthly_budget_usd":100,"alert_threshold_percent":80}'
+
+  Add a monthly token cap as one usage limit:
+    fabric agent-stream surfaces add-feature s-1a2b3c4d5e6f usage-limits \
+      --json '{"id":"tokens","monthly_token_cap":1000000}'
+
+  Fail over to backup providers described in a file:
+    fabric agent-stream surfaces add-feature s-1a2b3c4d5e6f failover \
+      --file failover.json
+
+  Change one setting of a feature the surface already has:
+    fabric agent-stream surfaces update s-1a2b3c4d5e6f \
+      --set rate_limit.requests_per_minute=120
+
+  Turn on routing rules that were left off:
+    fabric agent-stream surfaces update s-1a2b3c4d5e6f \
+      --set routing_enabled=true"#;
+
+/// Examples shown at the bottom of `surfaces remove-feature --help`.
+const REMOVE_FEATURE_EXAMPLES: &str = r#"Examples:
+  Remove the rate limit:
+    fabric agent-stream surfaces remove-feature s-1a2b3c4d5e6f rate-limit
+
+  Remove one usage limit by its id, previewing first:
+    fabric agent-stream surfaces remove-feature s-1a2b3c4d5e6f usage-limits \
+      --item tokens --dry-run
+
+  Remove the usage alert on cost, by its fields:
+    fabric agent-stream surfaces remove-feature s-1a2b3c4d5e6f usage-alerts \
+      --item '{"alert_type":"cost_threshold"}'
+
+  Remove every usage limit:
+    fabric agent-stream surfaces remove-feature s-1a2b3c4d5e6f usage-limits --all"#;
+
+/// Examples shown at the bottom of `surfaces budget --help`.
+const BUDGET_EXAMPLES: &str = r#"Examples:
+  Show this month's spend against the budget:
+    fabric agent-stream surfaces budget s-1a2b3c4d5e6f
+
+  Fail a script step once the budget is used up:
+    fabric agent-stream surfaces budget s-1a2b3c4d5e6f --output json \
+      | jq -e '.budget_exceeded | not'"#;
 
 /// Examples shown at the bottom of `surfaces update --help`.
 const UPDATE_EXAMPLES: &str = r#"Examples:
@@ -341,6 +500,20 @@ pub async fn run(
             }
             return Ok(());
         }
+        SurfaceCommand::Features { id: None } => {
+            println!("{}", features::catalog(output)?);
+            return Ok(());
+        }
+        SurfaceCommand::AddFeature(args) => SurfaceCommand::AddFeature(args.checked()?),
+        SurfaceCommand::RemoveFeature(args) => SurfaceCommand::RemoveFeature(args.checked()?),
+        SurfaceCommand::Features { id: Some(id) } => {
+            check_id(&id)?;
+            SurfaceCommand::Features { id: Some(id) }
+        }
+        SurfaceCommand::Budget { id } => {
+            check_id(&id)?;
+            SurfaceCommand::Budget { id }
+        }
         command => command,
     };
     let client = connect().await?;
@@ -367,6 +540,29 @@ pub async fn run(
                 .request(Method::DELETE, &surface_path(&id)?, None)
                 .await?;
             print_outcome(&answer, output, &confirmation_line("Deleted", "surface", &id))
+        }
+        SurfaceCommand::Features { id: Some(id) } => {
+            println!("{}", features::on_surface(&client, &id, output).await?);
+            Ok(())
+        }
+        SurfaceCommand::Features { id: None } => {
+            unreachable!("the feature list is printed before a connection is made")
+        }
+        SurfaceCommand::AddFeature(args) => {
+            if let Some(printed) = features::add(&client, args, output).await? {
+                println!("{printed}");
+            }
+            Ok(())
+        }
+        SurfaceCommand::RemoveFeature(args) => {
+            if let Some(printed) = features::remove(&client, args, output).await? {
+                println!("{printed}");
+            }
+            Ok(())
+        }
+        SurfaceCommand::Budget { id } => {
+            println!("{}", features::budget(&client, &id, output).await?);
+            Ok(())
         }
     }
 }
@@ -581,42 +777,79 @@ async fn update(
         }
     };
     check_pipe_type(&after, pipe_type_of(&before), UPDATE_PIPE_TYPE_HINT)?;
-    let changes = surface_validate::changes(&before, &after);
-    if args.dry_run {
+    save(
+        client,
+        &Edit {
+            path: &path,
+            id: &args.id,
+            before: &before,
+            dry_run: args.dry_run,
+        },
+        after,
+        output,
+    )
+    .await
+}
+
+/// A surface read for a change, and how the change is to be saved.
+struct Edit<'a> {
+    /// The API path of the surface.
+    path: &'a str,
+    id: &'a str,
+    /// The surface as read, before the change.
+    before: &'a Value,
+    /// Show the change and save nothing.
+    dry_run: bool,
+}
+
+/// Saves `after` in place of the surface `edit` read, and returns the text to
+/// print, if any. A dry run returns [`preview_update`] and sends nothing. A
+/// change that leaves the surface as it is sends nothing either. Otherwise
+/// the surface is read again, the save stops if its `updated_at` moved, and
+/// the whole surface is sent; table output then lists the changes, and
+/// --output json reads the saved surface back.
+async fn save(
+    client: &GatewayClient,
+    edit: &Edit<'_>,
+    after: Value,
+    output: Output,
+) -> Result<Option<String>> {
+    let Edit { path, id, before, dry_run } = *edit;
+    let changes = surface_validate::changes(before, &after);
+    if dry_run {
         return preview_update(&changes, &after, output).map(Some);
     }
     if changes.is_empty() {
-        eprintln!("Surface '{}' already matches, so nothing was sent.", args.id);
+        eprintln!("Surface '{id}' already matches, so nothing was sent.");
         return match output {
             Output::Table => Ok(None),
-            Output::Json => pretty_json_for_terminal(&before).map(Some),
+            Output::Json => pretty_json_for_terminal(before).map(Some),
         };
     }
-    let current = read_live_surface(client, &path, &args.id).await?;
-    if present(&current, "updated_at") != present(&before, "updated_at") {
+    let current = read_live_surface(client, path, id).await?;
+    if present(&current, "updated_at") != present(before, "updated_at") {
         bail!(
-            "surface '{}' was saved by someone else after it was read, so nothing was saved; run the command again \
-             to change the new version",
-            args.id
+            "surface '{id}' was saved by someone else after it was read, so nothing was saved; run the command again \
+             to change the new version"
         );
     }
     client
-        .request(Method::PUT, &path, Some(after))
+        .request(Method::PUT, path, Some(after))
         .await?;
     match output {
         Output::Table => {
             let mut lines = vec!["Changes:".to_owned()];
             lines.extend(change_lines(&changes));
-            lines.push(confirmation_line("Updated", "surface", &args.id));
+            lines.push(confirmation_line("Updated", "surface", id));
             Ok(Some(lines.join("\n")))
         }
         Output::Json => {
             // Agent Stream answers a save with an `updated_at` its store then
             // replaces, so only a fresh read can go back to --file.
             let saved = client
-                .request(Method::GET, &path, None)
+                .request(Method::GET, path, None)
                 .await
-                .with_context(|| format!("surface '{}' was saved, but reading it back failed", args.id))?;
+                .with_context(|| format!("surface '{id}' was saved, but reading it back failed"))?;
             pretty_json_for_terminal(&saved).map(Some)
         }
     }
@@ -857,6 +1090,9 @@ enum Given {
     Flags,
     /// An `update --file` document, where `null` means the field is left out.
     File,
+    /// The settings `add-feature` replaces a field with, where `null` is sent
+    /// as it is.
+    Feature,
 }
 
 /// Checks the field names of a patch from the flags against `stored`: each
@@ -898,7 +1134,7 @@ fn check_nested_fields(
                 check_nested_fields(&child, nested, inner, allow_new_field, source)?;
             }
             (Some(_), _) => {}
-            (None, Value::Null) if source == Given::File => {}
+            (None, Value::Null) if source != Given::Flags => {}
             (None, _) => {
                 let near = || {
                     closest(
@@ -934,6 +1170,7 @@ fn check_nested_fields(
                 let (place, verb) = match source {
                     Given::Flags => ("", "add"),
                     Given::File => (" in --file", "keep"),
+                    Given::Feature => (" in the feature settings", "add"),
                 };
                 bail!(
                     "`{}`{place} is not in the surface as read; pass --allow-new-field to {verb} it as a new field{}",
