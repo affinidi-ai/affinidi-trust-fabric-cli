@@ -1666,3 +1666,27 @@ fn teams_create_dry_run_prints_the_preview_and_needs_no_login() {
     assert_eq!(preview["dry_run"], serde_json::json!(true));
     assert_eq!(preview["after"], serde_json::json!({"id": "", "name": "Research", "members": ["m-ada"]}));
 }
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn members_delete_shows_agent_stream_refusal_and_exits_non_zero() {
+    let (host, requests) = agent_stream_stand_in(vec![(
+        "DELETE /api/v1/members/m-ada",
+        "409 Conflict",
+        "Member belongs to team(s): Research. Remove them first.",
+    )]);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "members", "delete", "m-ada"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("Member belongs to team(s): Research. Remove them first."), "{text}");
+    assert!(!text.contains(ACCESS_TOKEN), "{text}");
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "DELETE /api/v1/members/m-ada HTTP/1.1"]);
+}

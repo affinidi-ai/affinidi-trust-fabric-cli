@@ -108,13 +108,13 @@ pub enum TeamCommand {
     /// --file replaces the whole team, its member list included. It must hold
     /// the `updated_at` the team has now, so start it from `teams get`; a
     /// copy read before another save is refused. Its `created_at`,
-    /// `updated_at`, `tenant_id`, and `system` are replaced with the stored
-    /// ones, with a note for each that differed. Its budget and token cap must
+    /// `updated_at`, `tenant_id`, `system`, and `test_fixture` are replaced
+    /// with the stored ones, with a note for each that differed. Its budget and token cap must
     /// match the stored ones; any it leaves out are kept. A deleted team
     /// can't be changed.
     ///
     /// Table output lists each changed field; --output json prints the team as
-    /// Agent Stream has it after the save. --dry-run shows the changes, or
+    /// Agent Stream answered the save. --dry-run shows the changes, or
     /// with --output json the changes and the whole new team, and saves
     /// nothing.
     #[command(after_long_help = UPDATE_EXAMPLES)]
@@ -633,14 +633,13 @@ mod tests {
 
     use super::{
         super::test_support::{
-            Route, UnusedKeyring, json_file, request_body, run_stream, saved_login, scripted_agent_stream, start_lines,
-            stream_args,
+            Route, TEST_ACCESS_TOKEN, UnusedKeyring, json_file, request_body, run_stream, saved_login,
+            scripted_agent_stream, start_lines, stream_args,
         },
         *,
     };
     use crate::config::Config;
 
-    const ACCESS_TOKEN: &str = "aspat_live-secret";
     const TEAM_ID: &str = "0b7e4a52-0000-4000-8000-000000000001";
 
     const STORED: &str = r#"{"id":"0b7e4a52-0000-4000-8000-000000000001","name":"Research","status":"enabled",
@@ -662,7 +661,7 @@ mod tests {
         routes: Vec<Route>,
     ) -> (Result<()>, Arc<Mutex<Vec<String>>>) {
         let (host, requests) = scripted_agent_stream(routes).await;
-        let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+        let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
         let result = run_stream(words, saved, &credentials).await;
         (result, requests)
     }
@@ -914,5 +913,52 @@ mod tests {
         )
         .await;
         assert!(error_text(result).contains("Disable it instead"));
+    }
+
+    #[tokio::test]
+    async fn update_file_replaces_the_team_and_a_dry_run_sends_nothing() {
+        let mut document: Value = serde_json::from_str(STORED).unwrap();
+        document["description"] = json!("Applied research");
+        let file = json_file(&document.to_string());
+        let (result, requests) =
+            run_teams(&["teams", "update", TEAM_ID, "--file", file.path().to_str().unwrap()], vec![GET_STORED, PUT_OK])
+                .await;
+        result.unwrap();
+        let sent = body_of(&requests, 2);
+        assert_eq!(sent["description"], json!("Applied research"));
+        assert_eq!(sent["members"], json!(["m-ada"]));
+
+        let (result, requests) =
+            run_teams(&["teams", "update", TEAM_ID, "--name", "Applied", "--dry-run"], vec![GET_STORED, PUT_OK]).await;
+        result.unwrap();
+        assert_eq!(start_lines(&requests), ["GET /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn add_member_with_json_output_and_a_successful_delete() {
+        let (result, requests) = run_teams(
+            &["-o", "json", "teams", "add-member", TEAM_ID, "m-bob"],
+            vec![
+                GET_STORED,
+                ("POST /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001/members", "HTTP/1.1 200 OK", STORED),
+            ],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001 HTTP/1.1",
+                "POST /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001/members HTTP/1.1"
+            ]
+        );
+
+        let (result, requests) = run_teams(
+            &["teams", "delete", TEAM_ID],
+            vec![("DELETE /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001", "HTTP/1.1 204 No Content", "")],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(start_lines(&requests), ["DELETE /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001 HTTP/1.1"]);
     }
 }

@@ -38,7 +38,7 @@ A member is recognised by its identifiers. The flags write each one as `KIND:VAL
 | `api_key:KEY_NAME` | The name of the API key the call used |
 | `custom:VALUE` | Any other value a surface reads, such as a header |
 
-Agent Stream compares identifiers without regard to case or surrounding spaces, and refuses an identifier another member already has. An email must have one `@` and a `.` after it. Quote a value that holds a shell character, such as `'subject:auth0|ada'`.
+Agent Stream compares identifiers by value, without regard to case, surrounding spaces, or kind, so `custom:bob-key` and `api_key:bob-key` are the same identifier to it. Agent Stream itself only checks a member's first identifier against the others, so before `members create`, and before an `update` that changes identifiers, the CLI reads the member list and refuses any identifier whose value another member already has. A `create --dry-run` skips that check, since it needs no saved login. An email must have one `@` and a `.` after it. Quote a value that holds a shell character, such as `'subject:auth0|ada'`.
 
 ### Read members
 
@@ -78,7 +78,7 @@ fabric agent-stream members update 6f1c2d3e-0000-4000-8000-000000000001 \
   --remove-identifier email:ada@old.example --add-identifier email:ada@example.com
 ```
 
-- `--add-identifier` refuses one the member already has. `--remove-identifier` refuses one it lacks, and refuses to remove the last one. Removes run before adds.
+- `--add-identifier` refuses one the member already has, and one whose value another member has, of any kind. `--remove-identifier` refuses one it lacks, and refuses to remove the last one. Removes run before adds.
 - A disabled member's calls are refused.
 - A deleted member can't be changed.
 - How the save works, `--file` and `--dry-run` included, is in [How changes are saved](#how-changes-are-saved).
@@ -160,6 +160,6 @@ Agent Stream replaces the whole member or team on every save and has no version 
 3. It reads the record again, and stops with nothing saved if someone else saved it in the meantime. A save that lands in the short gap before the send is still overwritten.
 4. It sends the whole record. A change that leaves the record as it was sends nothing.
 
-`--file` replaces the whole record. It must carry the record's current `updated_at`, so start from a fresh `get`; a copy read before another save is refused. Its `created_at`, `updated_at`, `tenant_id`, and `system` are replaced with the stored ones, with a note for each that differed. Its budgets and limits must match the stored ones, and any it leaves out are kept. A deleted record can't be changed.
+`--file` replaces the whole record. It must carry the record's current `updated_at`, so start from a fresh `get`; a copy read before another save is refused. Its `created_at`, `updated_at`, `tenant_id`, `system`, `auto_provisioned`, and `test_fixture` are replaced with the stored ones, with a note for each that differed. A member document can't have both `identifiers` and the older `identifier`, which Agent Stream can't read together. Its budgets and limits must match the stored ones, and any it leaves out are kept. A deleted record can't be changed.
 
-After a save, table output lists each changed field with its old and new value, and `--output json` prints the record as Agent Stream has it after the save. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`.
+After a save, table output lists each changed field with its old and new value, and `--output json` prints the record as Agent Stream answered the save, which can go straight back to `--file`. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`.

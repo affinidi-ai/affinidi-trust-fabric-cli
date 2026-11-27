@@ -488,7 +488,11 @@ which holds what they share: `Kind` (a collection's path and how messages name i
 id check before an id goes into a path, the field-name check, the `update --file`
 replacement, and `save`. Agent Stream replaces the whole record on `PUT` and has no
 version check, so `save` sends the record built on this machine only after a second read
-shows `updated_at` unchanged; Agent Stream stamps `updated_at` on every save. A field name
+shows `updated_at` unchanged; Agent Stream stamps `updated_at` on every save and answers
+the save with the record as stored, which `--output json` prints. Agent Stream checks only
+a member's first identifier against the others, so `members create`, and an `update` that
+changes identifiers, read `GET /v1/members` first and refuse any identifier value another
+member has, of any kind. A field name
 the stored record already has counts as known, so a field a newer Agent Stream adds does
 not block a save. Each `Kind` names the fields these commands never change (a member's
 budget and limits, a team's budget and token cap): `update` keeps them, `update --file`

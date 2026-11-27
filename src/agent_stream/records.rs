@@ -20,12 +20,17 @@ use crate::{
     tables,
 };
 
-/// Longest id Agent Stream accepts in a member or team path.
+/// Longest id the CLI puts in a member or team path. Agent Stream sets no
+/// limit of its own on these ids; this one only keeps a mistyped argument out
+/// of the path.
 const MAX_ID_LEN: usize = 128;
 
 /// The fields of an `update --file` document that are replaced with the
-/// stored ones, because Agent Stream keeps its own.
-const KEPT_FROM_STORED: [&str; 4] = ["created_at", "updated_at", "tenant_id", "system"];
+/// stored ones, because Agent Stream sets them and a copy should not change
+/// them: `auto_provisioned` marks a member Agent Stream created itself, and
+/// `test_fixture` marks a record for the test-mode purge.
+const KEPT_FROM_STORED: [&str; 6] =
+    ["created_at", "updated_at", "tenant_id", "system", "auto_provisioned", "test_fixture"];
 
 /// One kind of record: where Agent Stream serves it, and how messages name
 /// it.
@@ -71,8 +76,9 @@ impl Kind {
 }
 
 /// Refuses an id that is empty, longer than [`MAX_ID_LEN`], or holds anything
-/// but ASCII letters, digits, `-` and `_`, before it is put in a path. Agent
-/// Stream's own ids (UUIDs, and names such as `anonymous`) all pass.
+/// but ASCII letters, digits, `-` and `_`, before it is put in a path. These
+/// are the CLI's own rules; Agent Stream's ids (UUIDs, and names such as
+/// `anonymous`) all pass them.
 fn check_id(
     kind: Kind,
     id: &str,
@@ -307,7 +313,9 @@ pub fn print_create_preview(
 /// Saves `after` in place of the record `before`, read as `id`. On a dry run
 /// it prints the changes and sends nothing. With no change it sends nothing.
 /// Otherwise it reads the record again and stops if it was saved by someone
-/// else since `before` was read, then sends the whole record.
+/// else since `before` was read, then sends the whole record. Agent Stream
+/// answers the save with the record as stored, `updated_at` included, so
+/// --output json prints that answer.
 pub async fn save(
     client: &GatewayClient,
     kind: Kind,
@@ -338,20 +346,12 @@ pub async fn save(
         );
     }
     let path = kind.record_path(id)?;
-    client
+    let saved = client
         .request(Method::PUT, &path, Some(after))
         .await?;
     match output {
         Output::Table => println!("{}\n{}", change_summary(&changes), confirmation_line("Updated", kind.noun, id)),
-        Output::Json => {
-            // Agent Stream stamps `updated_at` as it stores the record, so
-            // only a fresh read can go back to --file.
-            let saved = client
-                .request(Method::GET, &path, None)
-                .await
-                .with_context(|| format!("{} '{id}' was saved, but reading it back failed", kind.noun))?;
-            println!("{}", pretty_json_for_terminal(&saved)?);
-        }
+        Output::Json => println!("{}", pretty_json_for_terminal(&saved)?),
     }
     Ok(())
 }

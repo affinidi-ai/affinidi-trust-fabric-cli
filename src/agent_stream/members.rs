@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
 use reqwest::Method;
 use serde_json::{Map, Value, json};
@@ -92,20 +92,29 @@ pub enum MemberCommand {
     /// would: at least one identifier, each with a kind it knows and a value
     /// that is not blank, an email that looks like one, and only field names
     /// Agent Stream knows. A budget, token cap, rate limit, or allowed models
-    /// in --file is refused: these commands don't set them. An identifier
-    /// another member already has is refused by Agent Stream.
+    /// in --file is refused: these commands don't set them. A document with
+    /// both `identifier` and `identifiers` is refused too.
+    ///
+    /// The CLI then reads the member list and refuses an identifier whose
+    /// value another member already has, of any kind: Agent Stream matches a
+    /// call by value whatever the kind, so `custom:bob-key` and
+    /// `api_key:bob-key` clash, and it checks only a member's first
+    /// identifier itself.
     ///
     /// --dry-run prints the member and sends nothing, so it needs no saved
-    /// login; with --output json it prints the same preview as `update
-    /// --dry-run`. Table output prints the new member's id; --output json
-    /// prints the member Agent Stream answered with.
+    /// login, and skips that check against other members; with --output json
+    /// it prints the same preview as `update --dry-run`. Table output prints
+    /// the new member's id; --output json prints the member Agent Stream
+    /// answered with.
     #[command(after_long_help = CREATE_EXAMPLES)]
     Create(CreateArgs),
     /// Change a member's name, description, status, or identifiers, or replace
     /// it with a JSON document.
     ///
     /// The CLI reads the member, applies the change on this machine, and
-    /// checks it as `create` does. It then reads the member again, stops if
+    /// checks it as `create` does; when the identifiers change, an identifier
+    /// value another member already has is refused. It then reads the member
+    /// again, stops if
     /// it was saved meanwhile, and otherwise sends the whole member, so its
     /// budget, token cap, rate limits, and allowed models stay as they are.
     /// Agent Stream has no version check, so a save that lands in the short
@@ -115,13 +124,13 @@ pub enum MemberCommand {
     /// --file replaces the whole member. It must hold the `updated_at` the
     /// member has now, so start it from `members get`; a copy read before
     /// another save is refused. Its `created_at`, `updated_at`, `tenant_id`,
-    /// and `system` are replaced with the stored ones, with a note for each
-    /// that differed. Its budget, token cap, budget period, rate limits, and
+    /// `system`, `auto_provisioned`, and `test_fixture` are replaced with the
+    /// stored ones, with a note for each that differed. Its budget, token cap, budget period, rate limits, and
     /// allowed models must match the stored ones; any it leaves out are kept.
     /// A deleted member can't be changed.
     ///
     /// Table output lists each changed field; --output json prints the member
-    /// as Agent Stream has it after the save. --dry-run shows the changes, or
+    /// as Agent Stream answered the save. --dry-run shows the changes, or
     /// with --output json the changes and the whole new member, and saves
     /// nothing.
     #[command(after_long_help = UPDATE_EXAMPLES)]
@@ -226,7 +235,8 @@ pub struct UpdateArgs {
     #[arg(long, value_enum)]
     status: Option<Status>,
     /// Add an identifier, written as for `members create`. One the member
-    /// already has is refused. Repeatable.
+    /// already has is refused, and so is a value another member has, of any
+    /// kind. Repeatable.
     #[arg(long, value_name = "KIND:VALUE")]
     add_identifier: Vec<String>,
     /// Remove an identifier, written as for `members create`. One the member
@@ -283,6 +293,7 @@ pub async fn run(
         }
         MemberCommand::Create(args) => {
             let member = create_body(args)?;
+            refuse_identifiers_in_use(&client, &member, None, &[]).await?;
             let answer = client
                 .request(Method::POST, MEMBERS.path, Some(member))
                 .await?;
@@ -296,6 +307,7 @@ pub async fn run(
             records::refuse_deleted(MEMBERS, &before, &args.id)?;
             let after = updated(&before, &args)?;
             check_member(&after, Some(&before))?;
+            refuse_identifiers_in_use(&client, &after, Some(&args.id), &identifier_values(&before)).await?;
             records::save(&client, MEMBERS, &args.id, &before, after, args.dry_run, output).await
         }
         MemberCommand::Delete { id } => {
@@ -450,6 +462,67 @@ fn plausible_email(email: &str) -> bool {
     parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() && parts[1].contains('.')
 }
 
+/// The values of `member`'s identifiers as Agent Stream compares them:
+/// trimmed and in lower case, whatever their kind.
+fn identifier_values(member: &Value) -> Vec<String> {
+    identifiers_of(member)
+        .iter()
+        .filter_map(|identifier| {
+            let kind = text_field(identifier, "kind");
+            IDENTIFIER_KINDS
+                .iter()
+                .find(|(name, _)| *name == kind)
+                .map(|(_, field)| normalised(text_field(identifier, field)))
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// Refuses `member` when one of its identifier values, other than those in
+/// `already` (the ones it had before), is an identifier value of another
+/// member, whatever the kind. Agent Stream matches a call to a member by value
+/// and checks only a member's first identifier when it saves, so a second
+/// identifier that clashes would be saved and attribute another member's
+/// calls to this one. `own_id` is the member's own id on an update. The
+/// member list must be read, so a failure to read it stops the command.
+async fn refuse_identifiers_in_use(
+    client: &GatewayClient,
+    member: &Value,
+    own_id: Option<&str>,
+    already: &[String],
+) -> Result<()> {
+    let new: Vec<String> = identifier_values(member)
+        .into_iter()
+        .filter(|value| !already.contains(value))
+        .collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let answer = client
+        .request(Method::GET, MEMBERS.path, None)
+        .await
+        .context("read the member list to check that no other member has these identifiers")?;
+    for other in listed(MEMBERS, &answer)? {
+        let other_id = text_field(other, "id");
+        if Some(other_id) == own_id {
+            continue;
+        }
+        let theirs = identifier_values(other);
+        if let Some(value) = new
+            .iter()
+            .find(|value| theirs.contains(value))
+        {
+            bail!(
+                "member '{}' already has an identifier with the value '{}'; Agent Stream matches identifiers by \
+                 value whatever their kind, so each value can belong to one member only",
+                sanitize_for_terminal(other_id),
+                sanitize_for_terminal(value)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The identifiers of `member`, under either spelling Agent Stream reads.
 pub fn identifiers_of(member: &Value) -> &[Value] {
     match present(member.get("identifiers")).or_else(|| present(member.get("identifier"))) {
@@ -498,6 +571,12 @@ fn check_member(
     };
     check_fields(fields, &known_names(&MEMBER_FIELDS, stored.into_iter()), "the member")?;
     records::check_status(MEMBERS, fields)?;
+    if present(fields.get("identifiers")).is_some() && present(fields.get("identifier")).is_some() {
+        bail!(
+            "the member has both `identifiers` and `identifier`, which Agent Stream can't read; keep `identifiers` \
+             only"
+        );
+    }
     if present(fields.get("identifiers")).is_some_and(|identifiers| !identifiers.is_array()) {
         bail!("the member's `identifiers` must be a list");
     }
@@ -543,8 +622,8 @@ mod tests {
 
     use super::{
         super::test_support::{
-            Route, UnusedKeyring, json_file, request_body, run_stream, saved_login, scripted_agent_stream,
-            sends_bearer, start_lines, stream_args,
+            Route, TEST_ACCESS_TOKEN, UnusedKeyring, json_file, request_body, run_stream, saved_login,
+            scripted_agent_stream, sends_bearer, start_lines, stream_args,
         },
         *,
     };
@@ -552,7 +631,6 @@ mod tests {
 
     use crate::{commands::Cli, config::Config};
 
-    const ACCESS_TOKEN: &str = "aspat_live-secret";
     const MEMBER_ID: &str = "6f1c2d3e-0000-4000-8000-000000000001";
 
     /// A stored member with two identifiers and limits the CLI must keep.
@@ -570,12 +648,18 @@ mod tests {
     const GET_STORED: Route = ("GET /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001", "HTTP/1.1 200 OK", STORED);
     const PUT_OK: Route = ("PUT /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001", "HTTP/1.1 200 OK", STORED);
 
+    /// The member list: this member and Bob, known by the name of his API key.
+    const MEMBER_LIST: &str = r#"[
+        {"id":"6f1c2d3e-0000-4000-8000-000000000001","identifiers":[{"kind":"email","email":"ada@example.com"},{"kind":"api_key","key_name":"ada-key"}]},
+        {"id":"m-bob","identifiers":[{"kind":"api_key","key_name":"bob-key"}]}]"#;
+    const LIST_OK: Route = ("GET /api/v1/members", "HTTP/1.1 200 OK", MEMBER_LIST);
+
     async fn run_members(
         words: &[&str],
         routes: Vec<Route>,
     ) -> (Result<()>, Arc<Mutex<Vec<String>>>) {
         let (host, requests) = scripted_agent_stream(routes).await;
-        let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+        let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
         let result = run_stream(words, saved, &credentials).await;
         (result, requests)
     }
@@ -601,7 +685,7 @@ mod tests {
             run_members(&["members", "list"], vec![("GET /api/v1/members", "HTTP/1.1 200 OK", "[]")]).await;
         result.unwrap();
         assert_eq!(start_lines(&requests), ["GET /api/v1/members HTTP/1.1"]);
-        assert!(sends_bearer(&requests.lock().unwrap()[0], ACCESS_TOKEN));
+        assert!(sends_bearer(&requests.lock().unwrap()[0], TEST_ACCESS_TOKEN));
     }
 
     #[test]
@@ -631,13 +715,13 @@ mod tests {
                 "--identifier",
                 "custom:team:x",
             ],
-            vec![("POST /api/v1/members", "HTTP/1.1 200 OK", STORED)],
+            vec![("GET /api/v1/members", "HTTP/1.1 200 OK", "[]"), ("POST /api/v1/members", "HTTP/1.1 200 OK", STORED)],
         )
         .await;
         result.unwrap();
-        assert_eq!(start_lines(&requests), ["POST /api/v1/members HTTP/1.1"]);
+        assert_eq!(start_lines(&requests), ["GET /api/v1/members HTTP/1.1", "POST /api/v1/members HTTP/1.1"]);
         assert_eq!(
-            body_of(&requests, 0),
+            body_of(&requests, 1),
             json!({"id":"","name":"Ada","identifiers":[
                 {"kind":"email","email":"Ada@Example.com"},{"kind":"subject","subject":"auth0|ada"},
                 {"kind":"api_key","key_name":"ada-key"},{"kind":"custom","value":"team:x"}]})
@@ -649,11 +733,11 @@ mod tests {
         let file = json_file(r#"{"id":"mine","name":"Job","identifiers":[{"kind":"custom","value":"x"}]}"#);
         let (result, requests) = run_members(
             &["members", "create", "--file", file.path().to_str().unwrap()],
-            vec![("POST /api/v1/members", "HTTP/1.1 200 OK", STORED)],
+            vec![LIST_OK, ("POST /api/v1/members", "HTTP/1.1 200 OK", STORED)],
         )
         .await;
         result.unwrap();
-        assert_eq!(body_of(&requests, 0), json!({"id":"","name":"Job","identifiers":[{"kind":"custom","value":"x"}]}));
+        assert_eq!(body_of(&requests, 1), json!({"id":"","name":"Job","identifiers":[{"kind":"custom","value":"x"}]}));
     }
 
     #[tokio::test]
@@ -717,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn the_built_in_member_can_be_disabled_and_a_deleted_member_is_not_changed() {
         let anonymous = r#"{"id":"anonymous","name":"Anonymous","status":"enabled","system":true,
-            "identifier":{"kind":"custom","value":"anonymous"},"updated_at":"2026-11-02T00:00:00Z"}"#;
+            "identifiers":[{"kind":"custom","value":"anonymous"}],"updated_at":"2026-11-02T00:00:00Z"}"#;
         let (result, requests) = run_members(
             &["members", "update", "anonymous", "--status", "disabled"],
             vec![
@@ -752,7 +836,7 @@ mod tests {
             let mut words = vec!["members", "create"];
             words.extend_from_slice(flags);
             let (host, requests) = scripted_agent_stream(vec![]).await;
-            let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+            let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
             let result = match Cli::try_parse_from(
                 ["fabric", "agent-stream"]
                     .into_iter()
@@ -809,7 +893,7 @@ mod tests {
                 "--add-identifier",
                 "email:ada@new.example",
             ],
-            vec![GET_STORED, PUT_OK],
+            vec![GET_STORED, LIST_OK, PUT_OK],
         )
         .await;
         result.unwrap();
@@ -817,11 +901,12 @@ mod tests {
             start_lines(&requests),
             [
                 "GET /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1",
+                "GET /api/v1/members HTTP/1.1",
                 "GET /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1",
                 "PUT /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1"
             ]
         );
-        let sent = body_of(&requests, 2);
+        let sent = body_of(&requests, 3);
         assert_eq!(
             sent["identifiers"],
             json!([{"kind":"api_key","key_name":"ada-key"},{"kind":"email","email":"ada@new.example"}])
@@ -942,11 +1027,133 @@ mod tests {
         .await;
         let text = error_text(result);
         assert!(text.contains("Member belongs to team(s): Research"), "{text}");
-        assert!(!text.contains(ACCESS_TOKEN), "{text}");
+        assert!(!text.contains(TEST_ACCESS_TOKEN), "{text}");
         assert_eq!(start_lines(&requests).len(), 1);
 
         let (result, requests) = run_members(&["members", "delete", "../teams"], vec![]).await;
         assert!(error_text(result).contains("must be 1 to 128"));
         assert!(start_lines(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_value_another_member_has_on_any_identifier_of_any_kind() {
+        let (result, requests) = run_members(
+            &["members", "create", "--identifier", "email:new@example.com", "--identifier", "custom:BOB-KEY "],
+            vec![LIST_OK, ("POST /api/v1/members", "HTTP/1.1 200 OK", STORED)],
+        )
+        .await;
+        let text = error_text(result);
+        assert!(text.contains("member 'm-bob' already has an identifier with the value 'bob-key'"), "{text}");
+        assert_eq!(start_lines(&requests), ["GET /api/v1/members HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn update_refuses_an_added_value_another_member_has_and_ignores_the_member_itself() {
+        let (result, requests) = run_members(
+            &["members", "update", MEMBER_ID, "--add-identifier", "custom:bob-key"],
+            vec![GET_STORED, LIST_OK, PUT_OK],
+        )
+        .await;
+        assert!(error_text(result).contains("member 'm-bob' already has an identifier"));
+        assert!(
+            !start_lines(&requests)
+                .iter()
+                .any(|line| line.starts_with("PUT"))
+        );
+
+        // The member's own identifiers are not a clash, and its unchanged ones are not checked again.
+        let (result, requests) = run_members(
+            &["members", "update", MEMBER_ID, "--add-identifier", "custom:ada-key"],
+            vec![GET_STORED, LIST_OK, PUT_OK],
+        )
+        .await;
+        result.unwrap();
+        assert!(
+            start_lines(&requests)
+                .iter()
+                .any(|line| line.starts_with("PUT"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_list_that_can_not_be_read_stops_the_create() {
+        let (result, requests) = run_members(
+            &["members", "create", "--identifier", "custom:x"],
+            vec![("GET /api/v1/members", "HTTP/1.1 403 Forbidden", "")],
+        )
+        .await;
+        assert!(error_text(result).contains("read the member list to check"));
+        assert_eq!(start_lines(&requests), ["GET /api/v1/members HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn a_document_with_both_identifier_spellings_is_refused_before_sending() {
+        let file =
+            json_file(r#"{"identifiers":[{"kind":"custom","value":"x"}],"identifier":{"kind":"custom","value":"y"}}"#);
+        let (result, requests) =
+            run_members(&["members", "create", "--file", file.path().to_str().unwrap()], vec![LIST_OK]).await;
+        assert!(error_text(result).contains("both `identifiers` and `identifier`"));
+        assert!(start_lines(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_with_json_output_prints_the_save_answer_without_reading_again() {
+        let (result, requests) =
+            run_members(&["-o", "json", "members", "update", MEMBER_ID, "--name", "New"], vec![GET_STORED, PUT_OK])
+                .await;
+        result.unwrap();
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1",
+                "GET /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1",
+                "PUT /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1"
+            ]
+        );
+
+        let (result, requests) =
+            run_members(&["-o", "json", "members", "update", MEMBER_ID, "--name", "Ada"], vec![GET_STORED, PUT_OK])
+                .await;
+        result.unwrap();
+        assert_eq!(start_lines(&requests).len(), 1, "a no-op with --output json sends nothing");
+    }
+
+    #[tokio::test]
+    async fn an_update_file_keeps_the_stored_auto_provisioned_and_test_fixture() {
+        let stored = r#"{"id":"6f1c2d3e-0000-4000-8000-000000000001","name":"Ada","auto_provisioned":true,
+            "identifiers":[{"kind":"email","email":"ada@example.com"}],"updated_at":"2026-11-02T00:00:00Z"}"#;
+        let file = json_file(
+            r#"{"id":"6f1c2d3e-0000-4000-8000-000000000001","name":"Ada L","test_fixture":true,
+            "identifiers":[{"kind":"email","email":"ada@example.com"}],"updated_at":"2026-11-02T00:00:00Z"}"#,
+        );
+        let (result, requests) = run_members(
+            &["members", "update", MEMBER_ID, "--file", file.path().to_str().unwrap()],
+            vec![("GET /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001", "HTTP/1.1 200 OK", stored), PUT_OK],
+        )
+        .await;
+        result.unwrap();
+        let sent = body_of(&requests, 2);
+        assert_eq!(sent["auto_provisioned"], json!(true));
+        assert!(
+            sent.get("test_fixture")
+                .is_none(),
+            "{sent}"
+        );
+        assert_eq!(sent["name"], json!("Ada L"));
+    }
+
+    #[tokio::test]
+    async fn get_reads_the_member_and_delete_sends_one_delete() {
+        let (result, requests) = run_members(&["members", "get", MEMBER_ID], vec![GET_STORED]).await;
+        result.unwrap();
+        assert_eq!(start_lines(&requests), ["GET /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1"]);
+
+        let (result, requests) = run_members(
+            &["members", "delete", MEMBER_ID],
+            vec![("DELETE /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001", "HTTP/1.1 204 No Content", "")],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(start_lines(&requests), ["DELETE /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1"]);
     }
 }
