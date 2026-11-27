@@ -492,7 +492,8 @@ shows `updated_at` unchanged; Agent Stream stamps `updated_at` on every save and
 the save with the record as stored, which `--output json` prints. Agent Stream checks only
 a member's first identifier against the others, so `members create`, and an `update` that
 changes identifiers, read `GET /v1/members` first and refuse any identifier value another
-member has, of any kind. A field name
+member has, of any kind. Agent Stream filters that list by the login's tenant and scope, so
+the check covers only the members the login can see. A field name
 the stored record already has counts as known, so a field a newer Agent Stream adds does
 not block a save. Each `Kind` names the fields these commands never change (a member's
 budget and limits, a team's budget and token cap): `update` keeps them, `update --file`

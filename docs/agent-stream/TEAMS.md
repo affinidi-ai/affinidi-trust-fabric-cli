@@ -21,7 +21,7 @@ Register the callers of an Agent Stream as members, and group them into teams. A
 | [`teams remove-member <team> <member>`](#add-and-remove-members) | Remove a member from a team |
 | [`teams delete <id>`](#delete-a-team) | Delete a team |
 
-All commands start with `fabric agent-stream`. Reading members needs the `members.view` permission, creating and changing them `members.edit`, and deleting them `members.delete`. Teams work the same way with `teams.view`, `teams.edit` (adding and removing members included), and `teams.delete`. By default only administrators have any of them. `members update`, `teams update`, `teams add-member`, and `teams remove-member` read the record first, so they need the view permission too. Naming a member by identifier in a `teams` command, and the members table of `teams get`, need `members.view`.
+All commands start with `fabric agent-stream`. Reading members needs the `members.view` permission, creating and changing them `members.edit`, and deleting them `members.delete`. Teams work the same way with `teams.view`, `teams.edit` (adding and removing members included), and `teams.delete`. By default only administrators have any of them. `members create` reads the member list to check identifiers, and `members update`, `teams update`, `teams add-member`, and `teams remove-member` read the record first, so they need the view permission too. Naming a member by identifier in a `teams` command, and the members table of `teams get`, need `members.view`.
 
 Budgets, token caps, rate limits, and allowed models are not set by these commands. `update` keeps them as they are, `update --file` refuses a document that changes them, and `create` refuses a document that sets them.
 
@@ -38,7 +38,7 @@ A member is recognised by its identifiers. The flags write each one as `KIND:VAL
 | `api_key:KEY_NAME` | The name of the API key the call used |
 | `custom:VALUE` | Any other value a surface reads, such as a header |
 
-Agent Stream compares identifiers by value, without regard to case, surrounding spaces, or kind, so `custom:bob-key` and `api_key:bob-key` are the same identifier to it. Agent Stream itself only checks a member's first identifier against the others, so before `members create`, and before an `update` that changes identifiers, the CLI reads the member list and refuses any identifier whose value another member already has. A `create --dry-run` skips that check, since it needs no saved login. An email must have one `@` and a `.` after it. Quote a value that holds a shell character, such as `'subject:auth0|ada'`.
+Agent Stream compares identifiers by value, without regard to case, surrounding spaces, or kind, so `custom:bob-key` and `api_key:bob-key` are the same identifier to it. Agent Stream itself only checks a member's first identifier against the others, so before `members create`, and before an `update` that changes identifiers, the CLI reads the member list and refuses any identifier whose value another member already has. That list holds only the members this login can see: a member in another tenant, or outside a scoped access token's reach, isn't checked, and Agent Stream may still accept a clash with it. A `create --dry-run` skips that check, since it needs no saved login. An email must have one `@` and a `.` after it. Quote a value that holds a shell character, such as `'subject:auth0|ada'`.
 
 ### Read members
 
@@ -78,7 +78,7 @@ fabric agent-stream members update 6f1c2d3e-0000-4000-8000-000000000001 \
   --remove-identifier email:ada@old.example --add-identifier email:ada@example.com
 ```
 
-- `--add-identifier` refuses one the member already has, and one whose value another member has, of any kind. `--remove-identifier` refuses one it lacks, and refuses to remove the last one. Removes run before adds.
+- `--add-identifier` refuses one the member already has, and one whose value another member this login can see has, of any kind. `--remove-identifier` refuses one it lacks, and refuses to remove the last one. Removes run before adds.
 - A disabled member's calls are refused.
 - A deleted member can't be changed.
 - How the save works, `--file` and `--dry-run` included, is in [How changes are saved](#how-changes-are-saved).

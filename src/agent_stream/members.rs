@@ -99,7 +99,10 @@ pub enum MemberCommand {
     /// value another member already has, of any kind: Agent Stream matches a
     /// call by value whatever the kind, so `custom:bob-key` and
     /// `api_key:bob-key` clash, and it checks only a member's first
-    /// identifier itself.
+    /// identifier itself. The list holds only the members this login can see,
+    /// so a member in another tenant, or outside a scoped access token's
+    /// reach, isn't checked, and Agent Stream may still accept a clash with
+    /// it. Reading the list needs `members.view` as well as `members.edit`.
     ///
     /// --dry-run prints the member and sends nothing, so it needs no saved
     /// login, and skips that check against other members; with --output json
@@ -113,7 +116,8 @@ pub enum MemberCommand {
     ///
     /// The CLI reads the member, applies the change on this machine, and
     /// checks it as `create` does; when the identifiers change, an identifier
-    /// value another member already has is refused. It then reads the member
+    /// value another member this login can see already has is refused. It
+    /// then reads the member
     /// again, stops if
     /// it was saved meanwhile, and otherwise sends the whole member, so its
     /// budget, token cap, rate limits, and allowed models stay as they are.
@@ -235,8 +239,8 @@ pub struct UpdateArgs {
     #[arg(long, value_enum)]
     status: Option<Status>,
     /// Add an identifier, written as for `members create`. One the member
-    /// already has is refused, and so is a value another member has, of any
-    /// kind. Repeatable.
+    /// already has is refused, and so is a value another member this login
+    /// can see has, of any kind. Repeatable.
     #[arg(long, value_name = "KIND:VALUE")]
     add_identifier: Vec<String>,
     /// Remove an identifier, written as for `members create`. One the member
@@ -484,7 +488,9 @@ fn identifier_values(member: &Value) -> Vec<String> {
 /// and checks only a member's first identifier when it saves, so a second
 /// identifier that clashes would be saved and attribute another member's
 /// calls to this one. `own_id` is the member's own id on an update. The
-/// member list must be read, so a failure to read it stops the command.
+/// member list must be read, so a failure to read it stops the command. Agent
+/// Stream lists only the members the login can see, so a member in another
+/// tenant or outside a scoped token's reach is not checked.
 async fn refuse_identifiers_in_use(
     client: &GatewayClient,
     member: &Value,
@@ -1155,5 +1161,71 @@ mod tests {
         .await;
         result.unwrap();
         assert_eq!(start_lines(&requests), ["DELETE /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn json_output_after_an_update_is_agent_streams_answer_to_the_save_not_the_earlier_read() {
+        let answer = r#"{"id":"6f1c2d3e-0000-4000-8000-000000000001","name":"Ada","status":"disabled",
+            "identifiers":[{"kind":"email","email":"ada@example.com"}],"updated_at":"2026-11-09T09:09:09Z"}"#;
+        let (host, requests) = scripted_agent_stream(vec![
+            GET_STORED,
+            ("PUT /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001", "HTTP/1.1 200 OK", answer),
+        ])
+        .await;
+        let client = GatewayClient::for_agent_stream(host, TEST_ACCESS_TOKEN).unwrap();
+        let before: Value = serde_json::from_str(STORED).unwrap();
+        let mut after = before.clone();
+        after["status"] = json!("disabled");
+        let text = records::save_text(&client, MEMBERS, MEMBER_ID, &before, after, false, Output::Json)
+            .await
+            .unwrap()
+            .expect("--output json prints the saved member");
+        let printed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(printed["updated_at"], json!("2026-11-09T09:09:09Z"), "{text}");
+        assert_eq!(printed["status"], json!("disabled"), "{text}");
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1",
+                "PUT /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn table_output_after_an_update_lists_each_change_then_names_the_member() {
+        let (host, _) = scripted_agent_stream(vec![GET_STORED, PUT_OK]).await;
+        let client = GatewayClient::for_agent_stream(host, TEST_ACCESS_TOKEN).unwrap();
+        let before: Value = serde_json::from_str(STORED).unwrap();
+        let mut after = before.clone();
+        after["status"] = json!("disabled");
+        after["name"] = json!("Ada L");
+        let text = records::save_text(&client, MEMBERS, MEMBER_ID, &before, after, false, Output::Table)
+            .await
+            .unwrap()
+            .expect("table output prints the changes");
+        assert_eq!(
+            text,
+            format!(
+                "Changes:\n  name: \"Ada\" -> \"Ada L\"\n  status: \"enabled\" -> \"disabled\"\nUpdated member '{MEMBER_ID}'"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_op_prints_nothing_in_table_output_and_the_stored_member_in_json() {
+        let before: Value = serde_json::from_str(STORED).unwrap();
+        let (host, requests) = scripted_agent_stream(vec![]).await;
+        let client = GatewayClient::for_agent_stream(host, TEST_ACCESS_TOKEN).unwrap();
+        let table = records::save_text(&client, MEMBERS, MEMBER_ID, &before, before.clone(), false, Output::Table)
+            .await
+            .unwrap();
+        assert_eq!(table, None);
+        let json_text = records::save_text(&client, MEMBERS, MEMBER_ID, &before, before.clone(), false, Output::Json)
+            .await
+            .unwrap()
+            .expect("--output json prints the member as it is");
+        assert_eq!(serde_json::from_str::<Value>(&json_text).unwrap(), before);
+        assert!(start_lines(&requests).is_empty());
     }
 }

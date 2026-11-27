@@ -325,17 +325,33 @@ pub async fn save(
     dry_run: bool,
     output: Output,
 ) -> Result<()> {
+    if let Some(text) = save_text(client, kind, id, before, after, dry_run, output).await? {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// [`save`] without the printing: the text it puts on standard output, or
+/// `None` when it prints nothing there. Notes still go to standard error.
+pub async fn save_text(
+    client: &GatewayClient,
+    kind: Kind,
+    id: &str,
+    before: &Value,
+    after: Value,
+    dry_run: bool,
+    output: Output,
+) -> Result<Option<String>> {
     let changes = surface_validate::changes(before, &after);
     if dry_run {
-        println!("{}", preview(&changes, &after, output)?);
-        return Ok(());
+        return preview(&changes, &after, output).map(Some);
     }
     if changes.is_empty() {
         eprintln!("{} '{id}' already matches, so nothing was sent.", capitalised(kind.noun));
-        if let Output::Json = output {
-            println!("{}", pretty_json_for_terminal(before)?);
-        }
-        return Ok(());
+        return match output {
+            Output::Json => pretty_json_for_terminal(before).map(Some),
+            Output::Table => Ok(None),
+        };
     }
     let current = kind.read(client, id).await?;
     if present(current.get("updated_at")) != present(before.get("updated_at")) {
@@ -350,10 +366,11 @@ pub async fn save(
         .request(Method::PUT, &path, Some(after))
         .await?;
     match output {
-        Output::Table => println!("{}\n{}", change_summary(&changes), confirmation_line("Updated", kind.noun, id)),
-        Output::Json => println!("{}", pretty_json_for_terminal(&saved)?),
+        Output::Table => {
+            Ok(Some(format!("{}\n{}", change_summary(&changes), confirmation_line("Updated", kind.noun, id))))
+        }
+        Output::Json => pretty_json_for_terminal(&saved).map(Some),
     }
-    Ok(())
 }
 
 /// What a dry run prints: the changes, or with --output json the changes and

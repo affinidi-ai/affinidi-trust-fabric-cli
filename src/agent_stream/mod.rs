@@ -179,8 +179,8 @@ enum AgentStreamCommand {
     ///
     /// Reading members needs the `members.view` permission, creating and
     /// changing them `members.edit`, and deleting them `members.delete`; by
-    /// default only administrators have them. `update` also reads the member
-    /// first, so it needs `members.view` too.
+    /// default only administrators have them. `create` and `update` also read
+    /// the member list or the member first, so they need `members.view` too.
     Members {
         #[command(subcommand)]
         command: members::MemberCommand,

@@ -339,32 +339,55 @@ async fn get(
     id: &str,
     output: Output,
 ) -> Result<()> {
+    let report = get_report(client, id, output).await?;
+    if let Some(warning) = &report.warning {
+        eprintln!("{warning}");
+    }
+    println!("{}", report.stdout);
+    Ok(())
+}
+
+/// What `teams get` prints: the text for standard output and, when the
+/// members can't be read, the warning for standard error.
+#[derive(Debug)]
+struct GetReport {
+    stdout: String,
+    warning: Option<String>,
+}
+
+/// [`get`] without the printing.
+async fn get_report(
+    client: &GatewayClient,
+    id: &str,
+    output: Output,
+) -> Result<GetReport> {
     let team = TEAMS.read(client, id).await?;
-    println!("{}", pretty_json_for_terminal(&team)?);
+    let document = pretty_json_for_terminal(&team)?;
     if let Output::Json = output {
-        return Ok(());
+        return Ok(GetReport {
+            stdout: document,
+            warning: None,
+        });
     }
     let ids = member_ids(&team);
-    println!("\nMembers:");
-    let members = match client
+    let (members, warning) = match client
         .request(Method::GET, MEMBERS.path, None)
         .await
         .and_then(|answer| listed(MEMBERS, &answer).map(<[Value]>::to_vec))
     {
-        Ok(members) => Some(members),
+        Ok(members) => (Some(members), None),
+        // The team was read, so show it with the ids it holds rather than
+        // fail: reading members needs its own permission.
         Err(error) => {
-            // The team was read, so print it with the ids it holds rather than
-            // fail: reading members needs its own permission.
-            eprintln!("warning: could not read the members, so only their ids are shown: {error:#}");
-            None
+            (None, Some(format!("warning: could not read the members, so only their ids are shown: {error:#}")))
         }
     };
-    print_list(
-        &Value::Array(member_rows(&ids, members.as_deref())),
-        Output::Table,
-        &tables::AGENT_STREAM_MEMBERS,
-        Scope::All,
-    )
+    let table =
+        tables::render_scoped(&tables::AGENT_STREAM_MEMBERS, &member_rows(&ids, members.as_deref()), Scope::All);
+    Ok(GetReport {
+        stdout: format!("{document}\n\nMembers:\n{}", table.join("\n")),
+        warning,
+    })
 }
 
 /// The rows of the members table of `teams get`: each id of the team with the
@@ -960,5 +983,77 @@ mod tests {
         .await;
         result.unwrap();
         assert_eq!(start_lines(&requests), ["DELETE /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn get_prints_the_team_then_a_table_of_its_members_with_their_identifiers() {
+        let (host, _) = scripted_agent_stream(vec![GET_STORED, MEMBERS_OK]).await;
+        let client = GatewayClient::for_agent_stream(host, TEST_ACCESS_TOKEN).unwrap();
+        let report = get_report(&client, TEAM_ID, Output::Table)
+            .await
+            .unwrap();
+        assert_eq!(report.warning, None);
+        assert!(
+            report
+                .stdout
+                .contains("\"name\": \"Research\""),
+            "{}",
+            report.stdout
+        );
+        let table = report
+            .stdout
+            .split("\n\nMembers:\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no members table:\n{}", report.stdout));
+        assert!(table.starts_with("ID") && table.contains("IDENTIFIERS"), "{table}");
+        let row = table
+            .lines()
+            .find(|line| line.starts_with("m-ada"))
+            .unwrap_or_else(|| panic!("no m-ada row:\n{table}"));
+        assert!(row.contains("Ada") && row.contains("email:ada@example.com") && row.contains("enabled"), "{row}");
+        assert!(!table.contains("m-bob"), "a member of no team is shown:\n{table}");
+    }
+
+    #[tokio::test]
+    async fn get_warns_and_shows_only_member_ids_when_the_member_list_is_refused() {
+        let (host, _) = scripted_agent_stream(vec![
+            GET_STORED,
+            ("GET /api/v1/members", "HTTP/1.1 403 Forbidden", "Insufficient permissions"),
+        ])
+        .await;
+        let client = GatewayClient::for_agent_stream(host, TEST_ACCESS_TOKEN).unwrap();
+        let report = get_report(&client, TEAM_ID, Output::Table)
+            .await
+            .unwrap();
+        let warning = report
+            .warning
+            .expect("a warning on standard error");
+        assert!(warning.starts_with("warning: could not read the members, so only their ids are shown: "), "{warning}");
+        assert!(warning.contains("Insufficient permissions"), "{warning}");
+        assert!(!warning.contains(TEST_ACCESS_TOKEN), "{warning}");
+        let table = report
+            .stdout
+            .split("\n\nMembers:\n")
+            .nth(1)
+            .unwrap();
+        let row = table
+            .lines()
+            .find(|line| line.starts_with("m-ada"))
+            .unwrap_or_else(|| panic!("{table}"));
+        assert!(!row.contains("(not listed)") && !row.contains("email:"), "{row}");
+    }
+
+    #[tokio::test]
+    async fn get_with_json_output_prints_the_team_only_and_reads_no_members() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED, MEMBERS_OK]).await;
+        let client = GatewayClient::for_agent_stream(host, TEST_ACCESS_TOKEN).unwrap();
+        let report = get_report(&client, TEAM_ID, Output::Json)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&report.stdout).unwrap(),
+            serde_json::from_str::<Value>(STORED).unwrap()
+        );
+        assert_eq!(start_lines(&requests), ["GET /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001 HTTP/1.1"]);
     }
 }
