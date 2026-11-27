@@ -388,3 +388,7 @@ impl Prompter for ScriptedPrompter {
             .push(line.to_owned());
     }
 }
+
+/// The access token tests save and send: plainly fake, so no secret scanner
+/// takes it for a real one.
+pub const TEST_ACCESS_TOKEN: &str = "test-access-token";

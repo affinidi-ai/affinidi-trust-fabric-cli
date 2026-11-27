@@ -74,7 +74,7 @@ fabric agent-stream prompts create --file template.json
 | `--message ROLE=FILE` | One message of version 1: its role and a text file holding its content. Required with flags; repeat for each message, in order |
 | `--description` | What the template is for |
 | `--label` | Label of version 1 |
-| `--file` | A complete template document (`-` reads standard input). Can't be combined with the flags above |
+| `--file` | A complete template document (`-` reads standard input). Can't be combined with the flags above. A file copied from `prompts get` carries `tenant_id`, `created_at` and `updated_at`: drop them, since Agent Stream sets them itself and refuses `tenant_id` from an access token that belongs to no tenant |
 | `--dry-run` | Print the template and send nothing. Needs no saved login |
 
 Good to know:
@@ -104,7 +104,7 @@ Agent Stream replaces the whole template on every save and has no version check.
 
 `--file` replaces the whole template, versions included, so a version left out of the file is removed, and a file with no versions is refused. The file must carry the template's current `updated_at`, so start from a fresh `prompts get`. A copy read before another save is refused. Its `created_at`, `updated_at`, and `tenant_id` are replaced with the stored ones.
 
-After a save, table output lists each change. A version shows as added, removed, or changed by its number, never by its messages. `--output json` prints the template as Agent Stream has it after the save.
+After a save, table output lists each change. A version shows as added, removed, or changed by its number, never by its messages. `--output json` prints the template Agent Stream answered the save with, which can go straight back to `--file`.
 
 `--dry-run` shows the changes and saves nothing. With `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`, where `after` is the whole template that would be sent. Agent Stream has no dry run of its own, so its own checks run only on a real save.
 

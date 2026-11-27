@@ -111,7 +111,7 @@ pub enum PromptCommand {
     /// replaced with the stored ones.
     ///
     /// Table output lists each changed field; --output json prints the
-    /// template as Agent Stream has it after the save. --dry-run shows the
+    /// template Agent Stream answered the save with. --dry-run shows the
     /// changes, or with --output json the changes and the whole new template,
     /// and saves nothing.
     #[command(after_long_help = UPDATE_EXAMPLES)]
@@ -267,7 +267,10 @@ pub struct CreateArgs {
     /// Label of version 1.
     #[arg(long, conflicts_with = "file")]
     label: Option<String>,
-    /// JSON document of the template, or - for standard input.
+    /// JSON document of the template, or - for standard input. A file copied
+    /// from `prompts get` carries `tenant_id`, `created_at`, and `updated_at`:
+    /// drop them, since Agent Stream sets them itself and refuses `tenant_id`
+    /// from an access token that belongs to no tenant.
     #[arg(short, long)]
     file: Option<PathBuf>,
     /// Print the template that would be sent, or with --output json the
@@ -664,7 +667,7 @@ fn with_version(
         Some(value) => as_version_number(value).context("the new version's `version` must be a whole number")?,
     };
     if numbers.contains(&number) {
-        bail!("template already has version {number}; give another --version, or remove that version first");
+        bail!("template already has version {number}; give another --version, or leave it out to use the next number");
     }
     let current_default = effective_default(before)?;
     let mut after = before.clone();
@@ -717,14 +720,14 @@ fn without_version(
     if !numbers.contains(&number) {
         bail!("template has no version {number}");
     }
+    if numbers.len() == 1 {
+        bail!("version {number} is the template's last version; delete the template instead");
+    }
     if effective_default(before)? == Some(number) {
         bail!(
             "version {number} is the one callers get when they name no version; set another with `prompts \
              set-default` first"
         );
-    }
-    if numbers.len() == 1 {
-        bail!("version {number} is the template's last version; delete the template instead");
     }
     let mut after = before.clone();
     if let Some(versions) = after
@@ -997,19 +1000,14 @@ async fn save(
              command again to change the new version"
         );
     }
-    let path = template_path(id)?;
-    client
-        .request(Method::PUT, &path, Some(after))
+    // Agent Stream answers a save with the template as it stored it,
+    // `updated_at` included, so the answer can go straight back to --file.
+    let saved = client
+        .request(Method::PUT, &template_path(id)?, Some(after))
         .await?;
     match output {
         Output::Table => println!("{}", changes_table(&changes, &confirmation_line("Updated", "prompt template", id))),
-        Output::Json => {
-            let saved = client
-                .request(Method::GET, &path, None)
-                .await
-                .with_context(|| format!("prompt template '{id}' was saved, but reading it back failed"))?;
-            println!("{}", pretty_json_for_terminal(&saved)?);
-        }
+        Output::Json => println!("{}", pretty_json_for_terminal(&saved)?),
     }
     Ok(())
 }
@@ -1242,14 +1240,12 @@ mod tests {
 
     use super::{
         super::test_support::{
-            Route, UnusedKeyring, json_file, request_body, run_stream, saved_login, scripted_agent_stream,
-            sends_bearer, start_lines,
+            Route, TEST_ACCESS_TOKEN as ACCESS_TOKEN, UnusedKeyring, json_file, request_body, run_stream, saved_login,
+            scripted_agent_stream, sends_bearer, start_lines,
         },
         *,
     };
     use crate::config::Config;
-
-    const ACCESS_TOKEN: &str = "aspat_live-secret";
 
     /// A stored template with versions 1 and 2, the default 1.
     const STORED: &str = r#"{"id":"greeter","name":"Greeter","status":"enabled","default_version":1,
@@ -1498,7 +1494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_with_json_output_reads_the_template_back_after_the_save() {
+    async fn update_with_json_output_prints_the_save_answer_without_reading_again() {
         let (result, requests) =
             run_prompts(&["-o", "json", "prompts", "update", "greeter", "--name", "New"], vec![GET_STORED, PUT_OK])
                 .await;
@@ -1508,8 +1504,7 @@ mod tests {
             [
                 "GET /api/v1/prompts/greeter HTTP/1.1",
                 "GET /api/v1/prompts/greeter HTTP/1.1",
-                "PUT /api/v1/prompts/greeter HTTP/1.1",
-                "GET /api/v1/prompts/greeter HTTP/1.1"
+                "PUT /api/v1/prompts/greeter HTTP/1.1"
             ]
         );
     }
@@ -1695,7 +1690,30 @@ mod tests {
         let before: Value = serde_json::from_str(STORED_NO_DEFAULT).unwrap();
         assert!(without_version(&before, 2).is_err(), "the highest is the default without default_version");
         let single = json!({"id":"g","name":"G","versions":[{"version":1,"messages":[]}],"default_version":null});
-        assert!(format!("{:#}", without_version(&single, 1).unwrap_err()).contains("set-default"));
+        assert!(format!("{:#}", without_version(&single, 1).unwrap_err()).contains("delete the template instead"));
+    }
+
+    #[tokio::test]
+    async fn add_version_on_a_template_without_a_default_pins_it_and_a_dry_run_sends_only_the_read() {
+        const GET_NO_DEFAULT: Route = ("GET /api/v1/prompts/greeter", "HTTP/1.1 200 OK", STORED_NO_DEFAULT);
+        let file = json_file("Hello again");
+        let message = format!("user={}", file.path().display());
+        let (result, requests) =
+            run_prompts(&["prompts", "add-version", "greeter", "--message", &message], vec![GET_NO_DEFAULT, PUT_OK])
+                .await;
+        result.unwrap();
+        assert_eq!(start_lines(&requests).len(), 3);
+        let sent = body_of(&requests, 2);
+        assert_eq!(sent["default_version"], json!(2));
+        assert_eq!(sent["versions"][2], json!({"version":3,"messages":[{"role":"user","content":"Hello again"}]}));
+
+        let (result, requests) = run_prompts(
+            &["prompts", "add-version", "greeter", "--message", &message, "--dry-run"],
+            vec![GET_NO_DEFAULT, PUT_OK],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(start_lines(&requests), ["GET /api/v1/prompts/greeter HTTP/1.1"]);
     }
 
     #[tokio::test]

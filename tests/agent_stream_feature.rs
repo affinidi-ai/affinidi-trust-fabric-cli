@@ -24,7 +24,10 @@ use fresh_home::fabric_in_fresh_home;
 #[cfg(feature = "agent-stream")]
 use fresh_home::fabric_in_home;
 #[cfg(feature = "agent-stream")]
-use recording_host::{PROBE_REQUEST, Reply, Requests, host_answering, host_replying, request_lines, request_lowercase};
+use recording_host::{
+    PROBE_REQUEST, Reply, Requests, host_answering, host_answering_with_status, host_replying, request_lines,
+    request_lowercase,
+};
 
 /// Exit status clap uses for a command line it cannot parse.
 #[cfg(not(feature = "agent-stream"))]
@@ -1518,4 +1521,66 @@ fn prompts_create_dry_run_prints_the_preview_and_needs_no_login() {
             .contains(&serde_json::json!({"version": 1, "change": "added"})),
         "{preview}"
     );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_list_as_json_keeps_each_template_but_never_its_messages() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, PROMPT_TEMPLATES);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "prompts", "list", "--output", "json"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(!text.contains("SECRET-PROMPT-TEXT"), "{text}");
+    let listed: serde_json::Value = serde_json::from_str(&text).expect("JSON list");
+    assert_eq!(listed[0]["id"], serde_json::json!("greeter"));
+    assert_eq!(listed[0]["versions"], serde_json::json!([{"version": 1}, {"version": 2}]));
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/prompts HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_create_shows_agent_streams_plain_text_refusal_and_exits_non_zero() {
+    let (host, requests) = host_answering_with_status(
+        AGENT_STREAM_PERMISSIONS,
+        "409 Conflict",
+        "A prompt with id 'greeter' already exists",
+    );
+    let home = tempfile::TempDir::new().expect("temp dir");
+    let template = home
+        .path()
+        .join("template.json");
+    std::fs::write(
+        &template,
+        r#"{"id":"greeter","name":"Greeter","versions":[{"version":1,"messages":[{"role":"user","content":"Hi"}]}]}"#,
+    )
+    .expect("template file");
+
+    let output = fabric_in_home(
+        home.path(),
+        &[
+            "agent-stream",
+            "prompts",
+            "create",
+            "--file",
+            template
+                .to_str()
+                .expect("path"),
+        ],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("A prompt with id 'greeter' already exists"), "{text}");
+    assert!(!text.contains(ACCESS_TOKEN), "{text}");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "POST /api/v1/prompts HTTP/1.1"]);
 }

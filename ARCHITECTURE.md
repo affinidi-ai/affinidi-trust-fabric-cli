@@ -472,8 +472,10 @@ dry run's `--output json`, are listed per field outside `versions` and per versi
 number, and `prompts list` leaves out every version's messages in both outputs. Messages
 print only where a whole template or a render is shown: `get`, `render`, `create`'s
 `--dry-run` and `--output json`, the `after` of a dry run's `--output json`, and the
-`--output json` of a save or of a change that sends nothing. A template with no versions
-is refused.
+`--output json` of a save or of a change that sends nothing. A save's `--output json` is
+Agent Stream's answer to the `PUT`, which is the template as stored, `updated_at` included,
+so it can go straight back to `--file` without another read. A template with no versions
+is refused, and so is removing the last version.
 `add-version` on a template with no `default_version` sets it to the highest existing
 version unless `--make-default` is given, so callers who name no version keep the version
 they had. `create --dry-run` runs before any connection is resolved.
