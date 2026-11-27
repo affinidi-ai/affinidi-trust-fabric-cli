@@ -65,8 +65,8 @@ Only in builds with the `agent-stream` feature. See [Governance and drift](docs/
 | **Chain verification** | `governance verify`: Agent Stream checks that a surface's governance records are each unchanged and each linked to the one before. A `broken` or `index_mismatch` chain is a security finding, and the command exits 1 when any chain is not valid. |
 | **Drift baseline** | A surface's pinned mean of each drift dimension over a window, which its drift is measured against. A surface has at most one; `drift baseline set` replaces it. |
 | **Drift verdict** | How far each dimension's recent mean has moved from the baseline: `stable`, `warn`, `drift`, or `unknown`. Shown by `drift status`. |
-| **Drift run** | One replay of a surface's captured sessions, which sends real, billed model calls and scores the answers. Started with `drift run`, which asks first and refuses while another run of the surface is in progress. |
-| **Experiment** | A drift run against another surface (`--target`) or a variant (`--variant`). It never feeds the surface's drift series or verdict. |
+| **Drift run** | One replay of a surface's captured sessions, which sends real, billed model calls and scores the answers. Started with `drift run`, which asks first and refuses while another run that replays or targets the surface is in progress. |
+| **Experiment** | A drift run against another surface (a `--target` other than the surface itself) or a variant (`--variant`). It never feeds the surface's drift series or verdict. |
 
 ## Output
 

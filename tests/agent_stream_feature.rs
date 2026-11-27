@@ -888,7 +888,7 @@ fn governance_verify_exits_1_and_reports_a_security_finding_for_a_broken_chain()
         "{}",
         stderr(&output)
     );
-    assert!(stderr(&output).contains("1 of 1 governance record chains did not verify"), "{}", stderr(&output));
+    assert!(stderr(&output).contains("1 of 1 governance record chains are not valid"), "{}", stderr(&output));
     assert_eq!(request_lines(&requests), ["GET /api/v1/governance/verify?surface_id=s2 HTTP/1.1"]);
 }
 

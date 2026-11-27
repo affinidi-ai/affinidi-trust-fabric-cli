@@ -38,8 +38,8 @@ Governance records hold the caller's prompt and the model's answer. Drift runs h
 
 | Item | Hidden fields |
 | --- | --- |
-| Governance record | `record.prompt`, `record.completion`, each stage's `input` and `output`, each attachment's `filename`, and `signed_vc` (the signed credential, which holds the whole record) |
-| Drift run | each sample's `input` and `output` |
+| Governance record | `record.prompt`, `record.completion`, each stage's `input`, `output` and `reason` (a judge's reason can quote the prompt), each attachment's `filename`, and `signed_vc` (the signed credential, which holds the whole record) |
+| Drift run | each sample's `input`, `output` and `error` (a provider's error can echo the prompt) |
 
 Each hidden field is replaced with a placeholder, in table and JSON output alike. A field that is absent or null stays as it is, so a record from a surface that stores no bodies still shows that it has none.
 
@@ -79,7 +79,7 @@ fabric agent-stream governance records list --surface support-bot
 | `--outcome` | Only `ok`, `blocked` or `failed` records, comma-separated |
 | `--stage` | Only records blocked or failed at these stages, comma-separated, such as `judge,jury` |
 | `--since` / `--until` | Only records at or after, or before, a time. See [Times](#times) |
-| `--order` | `desc` (newest first, the default) or `asc` (oldest first) |
+| `--order` | `desc` (newest first, the default) or `asc` (oldest first, starting from the first record) |
 
 There is no way to read every record at once, as in the Agent Stream dashboard, which has no download either. A page has at most 500 records, and the CLI never sends a request without a limit, which Agent Stream would answer with every record.
 
@@ -128,13 +128,15 @@ Agent Stream checks a surface's whole chain: every record's hash and signature, 
 | `PROBLEM` | `none`, or `broken` (a record changed or is missing), `unknown_key` (signed with a key Agent Stream does not know), `truncated`, or `index_mismatch`. `not_checked` when the check could not be run for that surface, such as a refusal or a `404`; the other surfaces are still checked |
 | `ERROR` | Agent Stream's note on the first problem |
 
-A `broken` or `index_mismatch` chain is a security finding. The CLI says so on standard error and repairs nothing:
+A `broken`, `truncated` or `index_mismatch` chain is a security finding. The CLI says so on standard error, with what the problem means, and repairs nothing:
 
 ```text
-security finding: the governance record chain of surface 'support-bot' is broken: a record was changed or removed, or the index no longer matches the log. Do not try to repair it; keep the records as they are and investigate.
+security finding: the governance record chain of surface 'support-bot' is broken: a record was changed or removed. Don't try to repair anything; keep the records as they are and investigate.
 ```
 
-A surface with no records, a mistyped ID included, verifies as valid with 0 records. If the list of surfaces can't be read, the command fails without checking any. It exits 1 when any chain is not valid or not checked, with `error: N of M governance record chains did not verify`, so a script can rely on the exit status. With `--output json`, standard output is the list of Agent Stream's verdicts, one per surface, even for a single `--surface`.
+`truncated` means the newest records are missing from the log. For `index_mismatch`, Agent Stream rebuilds the record index during the same check, so the next `verify` shows the surface as valid: only the output of the run that found it records the finding, so keep it.
+
+With `--surface`, an error checking that surface, such as a refusal, is shown as it is. A surface with no records, a mistyped ID included, verifies as valid with 0 records. If the list of surfaces can't be read, the command fails without checking any. It exits 1 when any chain is not valid or not checked, so a script can rely on the exit status. The error counts both, such as `error: 1 of 4 governance record chains are not valid and 1 could not be checked`. With `--output json`, standard output is the list of Agent Stream's verdicts, one per surface, even for a single `--surface`.
 
 ### See which surfaces record
 
@@ -211,25 +213,25 @@ fabric agent-stream drift run --surface support-bot --wait
 
 A replay sends the surface's captured sessions to a model again and scores the answers. The calls are real and billed, so before starting:
 
-1. Unless `--force` is given, the CLI lists the surface's runs, and the target's for an experiment, and refuses if one is `pending` or `running`. Agent Stream itself would start runs side by side.
-2. Unless `--yes` is given, the CLI reads the surface whose sessions are replayed and shows its session cap (`drift.eval.max_sessions`, 50 when unset) and cost cap (`drift.eval.max_run_cost_usd`). Agent Stream takes both caps from that surface even for an experiment against another surface. When the CLI can't read the surface, both show `unknown`. Then it asks you to confirm; only `y` or `yes` starts the run.
+1. Unless `--force` is given, the CLI reads the runs this login can see and refuses if one that replays or targets the surface, or the target for an experiment, is `pending` or `running`. Agent Stream itself would start runs side by side.
+2. Unless `--yes` is given, the CLI reads the surface whose sessions are replayed and shows its session cap (`drift.eval.max_sessions`, 50 when unset; Agent Stream replays at least 1 and at most 200 sessions whatever the surface sets, and the CLI shows the number it applies) and cost cap (`drift.eval.max_run_cost_usd`). Agent Stream takes both caps from that surface even for an experiment against another surface. When the CLI can't read the surface, both show `unknown`. Then it asks you to confirm; only `y` or `yes` starts the run.
 
 Without a terminal and without `--yes`, the command refuses before sending anything.
 
 | Flag | Meaning |
 | --- | --- |
 | `--surface` | The surface whose captured sessions are replayed. Required |
-| `--target` | Replay against this surface instead |
+| `--target` | Replay against this surface instead. Naming the surface itself is the same as leaving it out |
 | `--variant` | Replay against this variant (by its alias) of the target, or of the surface |
 | `--wait` | Wait until the run ends |
 | `--yes` | Start without asking |
 | `--force` | Start even though a run is already in progress |
 
-With `--target` or `--variant`, the run is an experiment: it never feeds the surface's drift series or verdict.
+With `--variant`, or a `--target` other than the surface itself, the run is an experiment: it never feeds the surface's drift series or verdict.
 
 Without `--wait`, the command prints `Started drift run '<id>' on surface '<id>'.` (with `--output json`, the run as Agent Stream answered, its samples hidden) and exits.
 
-With `--wait`, progress goes to standard error whenever it changes, such as `drift run '<id>': running, 12 of 50 sessions done`. When the run ends, it is printed with its samples hidden, and the command exits 1 if the run did not complete: `error: drift run '<id>' ended cancelled`. When the waiting starts, the `drift cancel` command for the run is printed on standard error; Ctrl-C then stops waiting without cancelling the run.
+With `--wait`, progress goes to standard error whenever it changes, such as `drift run '<id>': running, 12 of 50 sessions done`. When the run ends, it is printed with its samples hidden, and the command exits 1 if the run did not complete: `error: drift run '<id>' ended cancelled`. A read of the run that fails with a server error or no answer is tried again, up to 5 times in a row. After that, or after any other failure such as a refusal, the command stops waiting and says that the run may still be going, with the `drift runs get` and `drift cancel` commands for it. When the waiting starts, the `drift cancel` command for the run is printed on standard error; Ctrl-C then stops waiting without cancelling the run.
 
 ### Cancel a run
 

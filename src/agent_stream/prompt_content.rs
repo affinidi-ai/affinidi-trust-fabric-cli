@@ -15,20 +15,29 @@ pub const REVEAL_WARNING: &str = "warning: this output contains prompt content (
 
 /// Where prompt content sits in a governance record as Agent Stream returns
 /// it, the record under `record` beside its `signed_vc`: the record's prompt
-/// and completion, each stage's input and output, the attachments' file names,
-/// and the signed credential, which wraps the whole record.
+/// and completion, each stage's input, output and reason (free text from a
+/// guard or judge, which can quote what the caller sent, and is kept even when
+/// bodies are not), the attachments' file names, and the signed credential,
+/// which wraps the whole record.
 const RECORD_FIELDS: &[&[&str]] = &[
     &["record", "prompt"],
     &["record", "completion"],
     &["record", "stages", "*", "input"],
     &["record", "stages", "*", "output"],
+    &["record", "stages", "*", "reason"],
     &["record", "attachments", "*", "filename"],
-    &["signed_vc"],
+    &[SIGNED_VC],
 ];
 
+/// The signed credential of a governance record. Agent Stream always sends
+/// it, and it only repeats the record, so it is hidden with the rest but does
+/// not count as prompt content of its own for the `--reveal` warning.
+const SIGNED_VC: &str = "signed_vc";
+
 /// Where prompt content sits in a drift run: each replayed sample's input and
-/// output.
-const RUN_FIELDS: &[&[&str]] = &[&["samples", "*", "input"], &["samples", "*", "output"]];
+/// output, and its error, which carries the pipeline's error text and can
+/// quote the prompt (a guard's rejection, a provider's message).
+const RUN_FIELDS: &[&[&str]] = &[&["samples", "*", "input"], &["samples", "*", "output"], &["samples", "*", "error"]];
 
 /// Which kind of item holds the prompt content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,7 +76,11 @@ pub fn count(
     kind: Item,
 ) -> usize {
     let mut copy = item.clone();
-    mask(&mut copy, kind, MASKED_VALUE)
+    kind.fields()
+        .iter()
+        .filter(|path| **path != [SIGNED_VC])
+        .map(|path| mask_path(&mut copy, path, MASKED_VALUE))
+        .sum()
 }
 
 fn mask_path(
@@ -137,6 +150,26 @@ mod tests {
         assert_eq!(value["record"]["stages"][0]["input_digest"], json!("sha256:aa"));
         assert_eq!(value["record"]["metrics"]["cost"], json!(0.1));
         assert_eq!(value["seq"], json!(7));
+    }
+
+    #[test]
+    fn test_mask_hides_stage_reasons_and_sample_errors() {
+        let mut record = json!({"record": {"stages": [{"stage": "guard", "reason": "rejected: my card is 4111"}]}});
+        assert_eq!(mask(&mut record, Item::GovernanceRecord, MASKED_VALUE), 1);
+        assert_eq!(record["record"]["stages"][0]["reason"], json!(MASKED_VALUE));
+        let mut run =
+            json!({"samples": [{"input": null, "output": null, "error": "Prompt guard rejected: my card is 4111"}]});
+        assert_eq!(mask(&mut run, Item::DriftRun, LIST_MASKED_VALUE), 1);
+        assert_eq!(run["samples"][0]["error"], json!(LIST_MASKED_VALUE));
+    }
+
+    #[test]
+    fn test_count_ignores_the_signed_credential_agent_stream_always_sends() {
+        let record = json!({"record": {"record_id": "r1", "prompt": null, "stages": [{"stage": "llm"}]}, "signed_vc": {"proof": "z..."}});
+        assert_eq!(count(&record, Item::GovernanceRecord), 0);
+        let mut masked = record.clone();
+        assert_eq!(mask(&mut masked, Item::GovernanceRecord, MASKED_VALUE), 1);
+        assert_eq!(masked["signed_vc"], json!(MASKED_VALUE));
     }
 
     #[test]

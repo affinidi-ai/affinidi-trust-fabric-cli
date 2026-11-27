@@ -20,7 +20,7 @@ use super::{
     when::{parse_duration, parse_moment},
 };
 use crate::{
-    client::GatewayClient,
+    client::{GatewayClient, response_status},
     commands::{MASKED_VALUE, Output, confirm_action, print_list, print_value, refuse_without_terminal, unix_now},
     tables::{self, Scope, flatten},
 };
@@ -45,8 +45,11 @@ const DEFAULT_BASELINE_WINDOW: &str = "24h";
 const MIN_BASELINE_WINDOW: u64 = 300;
 const MAX_BASELINE_WINDOW: u64 = 2_592_000;
 
-/// Sessions one replay sends when the surface sets no `drift.eval.max_sessions`.
+/// Sessions one replay sends when the surface sets no `drift.eval.max_sessions`,
+/// and the fewest and most Agent Stream replays whatever the surface sets.
 const DEFAULT_MAX_SESSIONS: u64 = 50;
+const MIN_MAX_SESSIONS: u64 = 1;
+const MAX_MAX_SESSIONS: u64 = 200;
 
 /// Most runs `drift runs list` shows without --surface; Agent Stream clamps
 /// the limit to 1-200.
@@ -61,6 +64,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The run statuses that mean a run has not finished.
 const IN_PROGRESS: &[&str] = &["pending", "running"];
+
+/// Reads of the run in a row that `drift run --wait` lets fail with a server
+/// error or no answer before it stops waiting.
+const WAIT_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Subcommand)]
 pub enum DriftCommand {
@@ -88,26 +95,31 @@ pub enum DriftCommand {
     ///
     /// Replays the surface's captured sessions against a model and scores the
     /// answers. The calls are real and billed. Before starting, the command
-    /// shows the run's session cap (`drift.eval.max_sessions`, 50 when unset)
-    /// and cost cap (`drift.eval.max_run_cost_usd`), which Agent Stream takes
+    /// shows the run's session cap (`drift.eval.max_sessions`, 50 when unset,
+    /// and never fewer than 1 or more than 200 whatever the surface sets) and
+    /// cost cap (`drift.eval.max_run_cost_usd`), which Agent Stream takes
     /// from the surface whose sessions are replayed even for an experiment, or
     /// `unknown` when that surface can't be read. Then it asks you to confirm;
     /// only `y` or `yes` starts the run. Without a terminal it refuses unless
     /// --yes is given.
     ///
-    /// It also refuses while the surface (or, for an experiment, the target)
-    /// already has a run pending or running, unless --force is given. That
-    /// check needs `drift.view` as well as the `drift.manage` the run needs.
+    /// It also refuses while a run that replays or targets the surface (or,
+    /// for an experiment, the target) is pending or running, unless --force is
+    /// given. That check reads the runs this login can see, and needs
+    /// `drift.view` as well as the `drift.manage` the run needs.
     ///
-    /// With --target or --variant the run is an experiment: it replays the
-    /// surface's sessions against another surface or a variant, and never
-    /// feeds the surface's drift series or verdict.
+    /// With --variant, or a --target other than the surface itself, the run
+    /// is an experiment: it replays the surface's sessions against another
+    /// surface or a variant, and never feeds the surface's drift series or
+    /// verdict.
     ///
     /// Prints the new run's id. With --wait, progress goes to standard error
     /// until the run ends, then the run is printed; the command exits 1 when
-    /// the run failed, was cancelled, or was stopped. Ctrl-C stops waiting
-    /// without cancelling the run; the command to cancel it is printed when
-    /// the waiting starts.
+    /// the run failed, was cancelled, or was stopped. A read of the run that
+    /// fails with a server error or no answer is tried again, up to 5 times in
+    /// a row; then the command stops waiting and says how to check or cancel
+    /// the run. Ctrl-C stops waiting without cancelling the run; the command
+    /// to cancel it is printed when the waiting starts.
     #[command(after_long_help = RUN_EXAMPLES)]
     Run(RunArgs),
     /// Cancel a drift run in progress.
@@ -215,7 +227,8 @@ pub struct RunArgs {
     /// ID of the surface whose captured sessions are replayed.
     #[arg(long)]
     surface: String,
-    /// Replay against this surface instead, as an experiment.
+    /// Replay against this surface instead, as an experiment. Naming the
+    /// surface itself is the same as leaving it out.
     #[arg(long)]
     target: Option<String>,
     /// Replay against this variant (by its alias) of the target, or of the
@@ -545,12 +558,15 @@ async fn read_run(
     read(client, &format!("{RUNS_PATH}/{id}")).await
 }
 
-/// The ids of the runs of `surface` that are pending or running.
-async fn runs_in_progress(
+/// The first run that is pending or running and replays or targets one of
+/// `surfaces`, as the surface it touches and the run's id. The list without a
+/// surface holds every run in progress this login can see, where a list of
+/// one surface leaves out the runs that only target it.
+async fn run_in_progress(
     client: &GatewayClient,
-    surface: &str,
-) -> Result<Vec<String>> {
-    let runs = read_runs(client, Some(surface), DEFAULT_RUNS_LIMIT).await?;
+    surfaces: &[&str],
+) -> Result<Option<(String, String)>> {
+    let runs = read_runs(client, None, MAX_RUNS_LIMIT).await?;
     let Some(runs) = runs.as_array() else {
         bail!("Agent Stream answered the drift runs list with something other than a list");
     };
@@ -561,12 +577,37 @@ async fn runs_in_progress(
                 .and_then(Value::as_str)
                 .is_some_and(|status| IN_PROGRESS.contains(&status))
         })
-        .filter_map(|run| {
-            run.get("id")
-                .and_then(Value::as_str)
-        })
-        .map(str::to_owned)
-        .collect())
+        .find_map(|run| {
+            let id = run
+                .get("id")
+                .and_then(Value::as_str)?;
+            let touched = ["surface_id", "target_surface_id"]
+                .iter()
+                .filter_map(|field| {
+                    run.get(*field)
+                        .and_then(Value::as_str)
+                })
+                .find(|surface| surfaces.contains(surface))?;
+            Some((touched.to_owned(), id.to_owned()))
+        }))
+}
+
+/// The session cap Agent Stream applies when the surface sets `max_sessions`
+/// (or nothing), as shown before a run starts.
+fn describe_session_cap(max_sessions: Option<u64>) -> String {
+    match max_sessions {
+        None => format!("{DEFAULT_MAX_SESSIONS} (Agent Stream's default)"),
+        Some(set) => {
+            let applied = set.clamp(MIN_MAX_SESSIONS, MAX_MAX_SESSIONS);
+            if applied == set {
+                set.to_string()
+            } else {
+                format!(
+                    "{applied} (the surface sets {set}; Agent Stream replays {MIN_MAX_SESSIONS} to {MAX_MAX_SESSIONS})"
+                )
+            }
+        }
+    }
 }
 
 /// The session cap and cost cap of a run, as shown before it starts. Agent
@@ -579,22 +620,23 @@ async fn spend_caps(
     client: &GatewayClient,
     surface: &str,
 ) -> (String, String) {
+    let unknown = || ("unknown".to_owned(), "unknown".to_owned());
+    let Ok(surface) = path_id("surface id", surface, MAX_ID) else {
+        return unknown();
+    };
     let Ok(document) = client
         .request(Method::GET, &format!("{SURFACES_PATH}/{surface}"), None)
         .await
     else {
-        return ("unknown".to_owned(), "unknown".to_owned());
+        return unknown();
     };
     let eval = document
         .get("drift")
         .and_then(|drift| drift.get("eval"));
-    let sessions = match eval
-        .and_then(|eval| eval.get("max_sessions"))
-        .and_then(Value::as_u64)
-    {
-        Some(sessions) => sessions.to_string(),
-        None => format!("{DEFAULT_MAX_SESSIONS} (Agent Stream's default)"),
-    };
+    let sessions = describe_session_cap(
+        eval.and_then(|eval| eval.get("max_sessions"))
+            .and_then(Value::as_u64),
+    );
     let cost = match eval
         .and_then(|eval| eval.get("max_run_cost_usd"))
         .and_then(Value::as_f64)
@@ -611,6 +653,7 @@ async fn start_run(
     args: RunArgs,
     output: Output,
 ) -> Result<()> {
+    let mut args = args;
     path_id("surface id", &args.surface, MAX_ID)?;
     if let Some(target) = &args.target {
         path_id("--target", target, MAX_ID)?;
@@ -618,28 +661,24 @@ async fn start_run(
     if let Some(variant) = &args.variant {
         path_id("--variant", variant, MAX_ID)?;
     }
-    let called = args
-        .target
-        .clone()
-        .unwrap_or_else(|| args.surface.clone());
+    // Agent Stream runs a target equal to the surface as a plain run, which
+    // feeds the drift series, so it is not called an experiment.
+    if args.target.as_deref() == Some(args.surface.as_str()) {
+        args.target = None;
+    }
     let experiment = args.target.is_some() || args.variant.is_some();
 
     if !args.force {
-        let mut checked = vec![args.surface.clone()];
-        if called != args.surface {
-            checked.push(called.clone());
-        }
-        for surface in &checked {
-            let busy = name_missing_surface(runs_in_progress(client, surface).await, surface)?;
-            if let Some(run_id) = busy.first() {
-                bail!(
-                    "surface '{}' already has drift run '{}' in progress; wait for it, cancel it with `fabric \
-                     agent-stream drift cancel {}`, or pass --force to start another",
-                    flatten(surface),
-                    flatten(run_id),
-                    flatten(run_id)
-                );
-            }
+        let mut checked = vec![args.surface.as_str()];
+        checked.extend(args.target.as_deref());
+        if let Some((surface, run_id)) = run_in_progress(client, &checked).await? {
+            bail!(
+                "drift run '{}' on surface '{}' is in progress; wait for it, cancel it with `fabric agent-stream \
+                 drift cancel {}`, or pass --force to start another",
+                flatten(&run_id),
+                flatten(&surface),
+                flatten(&run_id)
+            );
         }
     }
 
@@ -740,7 +779,7 @@ async fn wait_for(
 ) -> Result<Value> {
     let mut last = None;
     loop {
-        let run = read_run(client, run_id).await?;
+        let run = read_run_retrying(client, run_id).await?;
         let status = run
             .get("status")
             .and_then(Value::as_str)
@@ -765,6 +804,34 @@ async fn wait_for(
             last = Some(progress);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Reads the run, trying again after a server error or no answer, up to
+/// [`WAIT_ATTEMPTS`] times in a row. Any other failure, or the last one, stops
+/// the waiting with a note that the run may still be going.
+async fn read_run_retrying(
+    client: &GatewayClient,
+    run_id: &str,
+) -> Result<Value> {
+    let mut attempt = 1;
+    loop {
+        match read_run(client, run_id).await {
+            Ok(run) => return Ok(run),
+            Err(error) => {
+                let transient = response_status(&error).is_none_or(|status| status.is_server_error());
+                if transient && attempt < WAIT_ATTEMPTS {
+                    attempt += 1;
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                let id = flatten(run_id);
+                bail!(
+                    "{error}; stopped waiting for drift run '{id}', which may still be going: check it with `fabric \
+                     agent-stream drift runs get {id}` or cancel it with `fabric agent-stream drift cancel {id}`"
+                );
+            }
+        }
     }
 }
 
@@ -827,7 +894,11 @@ mod tests {
     async fn test_run_with_yes_checks_runs_then_starts() {
         let (result, requests) = run_with(
             vec![
-                ("GET /api/v1/drift/runs?surface_id=s1", "HTTP/1.1 200 OK", r#"[{"id":"old","status":"completed"}]"#),
+                (
+                    "GET /api/v1/drift/runs?limit=200",
+                    "HTTP/1.1 200 OK",
+                    r#"[{"id":"old","surface_id":"s1","status":"completed"}]"#,
+                ),
                 (
                     "POST /api/v1/drift/eval/run?surface_id=s1",
                     "HTTP/1.1 200 OK",
@@ -840,7 +911,7 @@ mod tests {
         result.expect("run");
         assert_eq!(
             requests,
-            ["GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1", "POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1"]
+            ["GET /api/v1/drift/runs?limit=200 HTTP/1.1", "POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1"]
         );
     }
 
@@ -848,9 +919,9 @@ mod tests {
     async fn test_run_refuses_while_a_run_is_in_progress() {
         let (result, requests) = run_with(
             vec![(
-                "GET /api/v1/drift/runs?surface_id=s1",
+                "GET /api/v1/drift/runs?limit=200",
                 "HTTP/1.1 200 OK",
-                r#"[{"id":"busy-1","status":"running"}]"#,
+                r#"[{"id":"busy-1","surface_id":"s1","status":"running"}]"#,
             )],
             &["run", "--surface", "s1", "--yes"],
         )
@@ -858,8 +929,48 @@ mod tests {
         let error = result
             .expect_err("busy")
             .to_string();
-        assert!(error.contains("already has drift run 'busy-1' in progress"), "{error}");
-        assert_eq!(requests, ["GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1"]);
+        assert!(error.contains("drift run 'busy-1' on surface 's1' is in progress"), "{error}");
+        assert_eq!(requests, ["GET /api/v1/drift/runs?limit=200 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_run_refuses_while_another_run_targets_the_surface() {
+        let (result, requests) = run_with(
+            vec![(
+                "GET /api/v1/drift/runs?limit=200",
+                "HTTP/1.1 200 OK",
+                r#"[{"id":"done","surface_id":"s1","status":"completed"},
+                    {"id":"other","surface_id":"s9","target_surface_id":"s2","status":"pending"}]"#,
+            )],
+            &["run", "--surface", "s1", "--target", "s2", "--yes"],
+        )
+        .await;
+        let error = result
+            .expect_err("busy target")
+            .to_string();
+        assert!(error.contains("drift run 'other' on surface 's2' is in progress"), "{error}");
+        assert_eq!(requests, ["GET /api/v1/drift/runs?limit=200 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_run_with_the_surface_as_target_is_a_plain_run() {
+        let (result, requests) = run_with(
+            vec![
+                ("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", "[]"),
+                (
+                    "POST /api/v1/drift/eval/run?surface_id=s1",
+                    "HTTP/1.1 200 OK",
+                    r#"{"id":"run-5","status":"running"}"#,
+                ),
+            ],
+            &["run", "--surface", "s1", "--target", "s1", "--yes"],
+        )
+        .await;
+        result.expect("plain run");
+        assert_eq!(
+            requests,
+            ["GET /api/v1/drift/runs?limit=200 HTTP/1.1", "POST /api/v1/drift/eval/run?surface_id=s1 HTTP/1.1"]
+        );
     }
 
     #[tokio::test]
@@ -881,8 +992,7 @@ mod tests {
     async fn test_experiment_checks_the_target_and_sends_it() {
         let (result, requests) = run_with(
             vec![
-                ("GET /api/v1/drift/runs?surface_id=s1", "HTTP/1.1 200 OK", "[]"),
-                ("GET /api/v1/drift/runs?surface_id=s2", "HTTP/1.1 200 OK", "[]"),
+                ("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", "[]"),
                 (
                     "POST /api/v1/drift/eval/run?surface_id=s1&target_surface_id=s2&variant=cheap",
                     "HTTP/1.1 200 OK",
@@ -896,8 +1006,7 @@ mod tests {
         assert_eq!(
             requests,
             [
-                "GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1",
-                "GET /api/v1/drift/runs?surface_id=s2 HTTP/1.1",
+                "GET /api/v1/drift/runs?limit=200 HTTP/1.1",
                 "POST /api/v1/drift/eval/run?surface_id=s1&target_surface_id=s2&variant=cheap HTTP/1.1",
             ]
         );
@@ -991,7 +1100,7 @@ mod tests {
                 .contains("something other than a list")
         );
         let (result, requests) = run_with(
-            vec![("GET /api/v1/drift/runs?surface_id=s1", "HTTP/1.1 200 OK", r#"{"runs":[]}"#)],
+            vec![("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", r#"{"runs":[]}"#)],
             &["run", "--surface", "s1", "--yes"],
         )
         .await;
@@ -1001,7 +1110,7 @@ mod tests {
                 .to_string()
                 .contains("something other than a list")
         );
-        assert_eq!(requests, ["GET /api/v1/drift/runs?surface_id=s1 HTTP/1.1"]);
+        assert_eq!(requests, ["GET /api/v1/drift/runs?limit=200 HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -1070,11 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_refused_start_names_the_drift_manage_permission() {
         let (result, _) = run_with(
-            vec![(
-                "POST /api/v1/drift/eval/run?surface_id=s1",
-                "HTTP/1.1 403 Forbidden",
-                r#"{"error":"Insufficient permissions"}"#,
-            )],
+            vec![("POST /api/v1/drift/eval/run?surface_id=s1", "HTTP/1.1 403 Forbidden", "Insufficient permissions")],
             &["run", "--surface", "s1", "--yes", "--force"],
         )
         .await;
@@ -1082,6 +1187,137 @@ mod tests {
             .expect_err("403")
             .to_string();
         assert!(error.contains("`drift.manage` permission"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_disabled_surface_is_not_called_a_permission_problem() {
+        let (result, _) = run_with(
+            vec![("POST /api/v1/drift/eval/run?surface_id=s1", "HTTP/1.1 403 Forbidden", "Pipe is disabled: s1")],
+            &["run", "--surface", "s1", "--yes", "--force"],
+        )
+        .await;
+        let error = result
+            .expect_err("disabled")
+            .to_string();
+        assert_eq!(error, "Pipe is disabled: s1");
+    }
+
+    #[tokio::test]
+    async fn test_run_wait_reads_again_after_a_server_error() {
+        let (host, requests) = scripted_agent_stream_in_order(vec![
+            ("POST /api/v1/drift/eval/run?surface_id=s1", "HTTP/1.1 200 OK", r#"{"id":"run-6","status":"running"}"#),
+            ("GET /api/v1/drift/runs/run-6", "HTTP/1.1 503 Service Unavailable", "busy"),
+            ("GET /api/v1/drift/runs/run-6", "HTTP/1.1 200 OK", r#"{"id":"run-6","status":"completed"}"#),
+        ])
+        .await;
+        let command = parse(&["run", "--surface", "s1", "--yes", "--force", "--wait"]);
+        run(&client_for(host).await, command, Output::Json)
+            .await
+            .expect("completed after a retry");
+        assert_eq!(start_lines(&requests).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_run_wait_gives_up_saying_the_run_may_still_be_going() {
+        let mut routes: Vec<Route> = vec![(
+            "POST /api/v1/drift/eval/run?surface_id=s1",
+            "HTTP/1.1 200 OK",
+            r#"{"id":"run-7","status":"running"}"#,
+        )];
+        routes.extend(std::iter::repeat_n(
+            ("GET /api/v1/drift/runs/run-7", "HTTP/1.1 502 Bad Gateway", "down"),
+            WAIT_ATTEMPTS as usize,
+        ));
+        let (host, requests) = scripted_agent_stream_in_order(routes).await;
+        let command = parse(&["run", "--surface", "s1", "--yes", "--force", "--wait"]);
+        let error = run(&client_for(host).await, command, Output::Json)
+            .await
+            .expect_err("gave up")
+            .to_string();
+        assert!(error.contains("stopped waiting for drift run 'run-7', which may still be going"), "{error}");
+        assert!(error.contains("`fabric agent-stream drift runs get run-7`"), "{error}");
+        assert!(error.contains("`fabric agent-stream drift cancel run-7`"), "{error}");
+        assert_eq!(start_lines(&requests).len(), 1 + WAIT_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn test_run_wait_does_not_retry_a_refusal() {
+        let (host, requests) = scripted_agent_stream_in_order(vec![
+            ("POST /api/v1/drift/eval/run?surface_id=s1", "HTTP/1.1 200 OK", r#"{"id":"run-8","status":"running"}"#),
+            ("GET /api/v1/drift/runs/run-8", "HTTP/1.1 403 Forbidden", "Insufficient permissions"),
+        ])
+        .await;
+        let command = parse(&["run", "--surface", "s1", "--yes", "--force", "--wait"]);
+        let error = run(&client_for(host).await, command, Output::Json)
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("may still be going"), "{error}");
+        assert_eq!(start_lines(&requests).len(), 2);
+    }
+
+    async fn caps_for(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, String) {
+        let (host, _) = scripted_agent_stream(vec![("GET /api/v1/pipes/s1", status_line, body)]).await;
+        spend_caps(&client_for(host).await, "s1").await
+    }
+
+    #[tokio::test]
+    async fn test_spend_caps_read_the_surface_drift_eval() {
+        assert_eq!(
+            caps_for("HTTP/1.1 200 OK", r#"{"drift":{"eval":{"max_sessions":10,"max_run_cost_usd":2.5}}}"#).await,
+            ("10".to_owned(), "USD 2.50".to_owned())
+        );
+        assert_eq!(
+            caps_for("HTTP/1.1 200 OK", r#"{"drift":{"eval":{"max_run_cost_usd":0}}}"#).await,
+            ("50 (Agent Stream's default)".to_owned(), "none (turned off for this surface)".to_owned())
+        );
+        assert_eq!(
+            caps_for("HTTP/1.1 200 OK", "{}").await,
+            ("50 (Agent Stream's default)".to_owned(), "the Agent Stream default, if one is set".to_owned())
+        );
+        assert_eq!(
+            caps_for("HTTP/1.1 403 Forbidden", "Insufficient permissions").await,
+            ("unknown".to_owned(), "unknown".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_session_cap_shows_what_agent_stream_applies() {
+        assert_eq!(describe_session_cap(Some(500)), "200 (the surface sets 500; Agent Stream replays 1 to 200)");
+        assert_eq!(describe_session_cap(Some(0)), "1 (the surface sets 0; Agent Stream replays 1 to 200)");
+        assert_eq!(describe_session_cap(Some(200)), "200");
+    }
+
+    #[tokio::test]
+    async fn test_spend_caps_refuse_an_unsafe_surface_id_without_a_request() {
+        let (host, requests) = scripted_agent_stream(vec![]).await;
+        let caps = spend_caps(&client_for(host).await, "../admin").await;
+        assert_eq!(caps, ("unknown".to_owned(), "unknown".to_owned()));
+        assert!(start_lines(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_runs_list_json_hides_replayed_content() {
+        let (host, _) = scripted_agent_stream(vec![(
+            "GET /api/v1/drift/runs?limit=25",
+            "HTTP/1.1 200 OK",
+            r#"[{"id":"r1","samples":[{"input":"secret prompt","output":"answer","error":"echoed secret"}]}]"#,
+        )])
+        .await;
+        let mut runs = read_runs(&client_for(host).await, None, 25)
+            .await
+            .expect("runs");
+        for run in runs
+            .as_array_mut()
+            .expect("list")
+        {
+            prompt_content::mask(run, Item::DriftRun, LIST_MASKED_VALUE);
+        }
+        let text = runs.to_string();
+        assert!(!text.contains("secret"), "{text}");
     }
 
     #[test]

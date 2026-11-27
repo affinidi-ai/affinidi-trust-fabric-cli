@@ -67,14 +67,22 @@ impl Permission {
     }
 }
 
-/// Adds the permission the request needed to a 403 from Agent Stream, keeping
-/// its status. Any other error is returned as it is.
+/// Adds the permission the request needed to a 403 from Agent Stream that is
+/// a permission refusal, keeping its status: Agent Stream's `Insufficient
+/// permissions`, or a 403 with no body. A 403 with another reason, such as
+/// `Pipe is disabled: <id>`, is about something else and is returned as it is,
+/// so an administrator isn't sent to fix a permission they already have.
 pub fn name_permission<T>(
     result: Result<T>,
     permission: Permission,
 ) -> Result<T> {
     result.map_err(|error| {
-        if response_status(&error) == Some(StatusCode::FORBIDDEN) {
+        let message = error.to_string();
+        let refusal = message
+            .to_ascii_lowercase()
+            .contains("insufficient permissions")
+            || message.contains("your role or the scopes of the access token");
+        if response_status(&error) == Some(StatusCode::FORBIDDEN) && refusal {
             status_error(
                 StatusCode::FORBIDDEN,
                 format!(
@@ -160,6 +168,10 @@ mod tests {
         let missing: Result<()> = Err(status_error(StatusCode::NOT_FOUND, "Not found".to_owned()));
         let error = name_permission(missing, Permission::DriftView).expect_err("404");
         assert_eq!(error.to_string(), "Not found");
+
+        let disabled: Result<()> = Err(status_error(StatusCode::FORBIDDEN, "Pipe is disabled: s1".to_owned()));
+        let error = name_permission(disabled, Permission::DriftManage).expect_err("disabled");
+        assert_eq!(error.to_string(), "Pipe is disabled: s1");
     }
 
     #[test]

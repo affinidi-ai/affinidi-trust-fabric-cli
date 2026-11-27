@@ -40,9 +40,19 @@ pub const MAX_LIMIT: u32 = 500;
 /// Longest record id Agent Stream accepts.
 const MAX_RECORD_ID: usize = 64;
 
-/// The chain problems that mean a record was changed or removed, which is a
-/// security finding rather than a fault to repair.
-const SECURITY_PROBLEMS: &[&str] = &["broken", "index_mismatch"];
+/// The chain problems that are security findings rather than faults to
+/// repair, each with what it means. `index_mismatch` is also one Agent Stream
+/// repairs during the same check, by rebuilding the index, so the next
+/// `verify` shows the surface as valid and only this run shows the finding.
+const SECURITY_PROBLEMS: &[(&str, &str)] = &[
+    ("broken", "a record was changed or removed"),
+    ("truncated", "the newest records are missing from the log"),
+    (
+        "index_mismatch",
+        "the record index no longer matched the log. Agent Stream rebuilt the index during this check, so the next \
+         verify will show the surface as valid and only this output records the finding",
+    ),
+];
 
 /// The problem shown for a surface whose chain check could not be run, such
 /// as one Agent Stream refused or could not find.
@@ -65,16 +75,21 @@ pub enum GovernanceCommand {
     /// its last record. Without --surface, every surface in `governance
     /// surfaces` is checked. Prints, for each surface, whether its chain is
     /// valid, how many records were checked, and the problem found: `broken` (a
-    /// record changed or is missing), `unknown_key`, `truncated`, or
-    /// `index_mismatch`, or `not_checked` when the check could not be run for
-    /// that surface (its error is shown, and the other surfaces are still
-    /// checked). A `broken` or `index_mismatch` chain is reported as a
-    /// security finding on standard error; nothing is repaired.
+    /// record changed or is missing), `unknown_key`, `truncated` (the newest
+    /// records are missing), or `index_mismatch`, or `not_checked` when the
+    /// check could not be run for that surface (its error is shown, and the
+    /// other surfaces are still checked). A `broken`, `truncated` or
+    /// `index_mismatch` chain is reported as a security finding on standard
+    /// error. The CLI repairs nothing, but Agent Stream rebuilds the index
+    /// during a check that finds `index_mismatch`, so only that run shows it:
+    /// keep its output.
     ///
-    /// A surface with no records, a mistyped ID included, verifies as valid
-    /// with 0 records, since Agent Stream does not check that it exists.
+    /// With --surface, an error checking that surface, such as a refusal, is
+    /// shown as it is. A surface with no records, a mistyped ID included,
+    /// verifies as valid with 0 records, since Agent Stream does not check that
+    /// it exists.
     ///
-    /// The command exits 1 when any chain is not valid.
+    /// The command exits 1 when any chain is not valid or not checked.
     #[command(after_long_help = VERIFY_EXAMPLES)]
     Verify(VerifyArgs),
     /// Show which LLM Surfaces record governance records and export them.
@@ -327,9 +342,13 @@ fn list_query(
             ("surface_id", Some(args.surface.clone())),
             ("limit", Some(args.limit.to_string())),
             ("order", Some(args.order.as_str().to_owned())),
+            // Oldest first with no cursor would get the newest page in
+            // ascending order from Agent Stream, with no next page; starting
+            // from position 0 reads from the first record forward.
             (
                 "cursor",
                 args.cursor
+                    .or_else(|| (args.order == Order::Asc).then_some(0))
                     .map(|cursor| cursor.to_string()),
             ),
             (
@@ -361,7 +380,54 @@ async fn list_records(
     args: RecordListArgs,
     output: Output,
 ) -> Result<()> {
-    let path = list_query(&args, unix_now())?;
+    let (records, next_cursor) = fetch_page(client, &args).await?;
+    match output {
+        Output::Json => print_value(&list_json(records, next_cursor), output)?,
+        Output::Table => {
+            let rows: Vec<Value> = records
+                .iter()
+                .map(summary_row)
+                .collect();
+            let filtered = !args.outcome.is_empty()
+                || !args.stage.is_empty()
+                || args.since.is_some()
+                || args.until.is_some()
+                || args.cursor.is_some();
+            let scope = if filtered {
+                Scope::Filtered
+            } else {
+                Scope::All
+            };
+            print_list(&Value::Array(rows), output, &tables::GOVERNANCE_RECORDS, scope)?;
+            if let Some(cursor) = &next_cursor {
+                eprintln!("{}", next_page_hint(cursor));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What `records list --output json` prints: the page's records and the
+/// cursor of the next page, or null on the last page.
+fn list_json(
+    records: Vec<Value>,
+    next_cursor: Option<String>,
+) -> Value {
+    json!({ "records": records, "next_cursor": next_cursor })
+}
+
+/// The line table output prints on standard error when more records match.
+fn next_page_hint(cursor: &str) -> String {
+    format!("More records match; pass --cursor {cursor} with the same options for the next page.")
+}
+
+/// One page of records, with their prompt content masked, and the cursor of
+/// the next page from Agent Stream's `x-next-cursor` header.
+async fn fetch_page(
+    client: &GatewayClient,
+    args: &RecordListArgs,
+) -> Result<(Vec<Value>, Option<String>)> {
+    let path = list_query(args, unix_now())?;
     let (value, headers) = name_missing_surface(
         name_permission(
             client
@@ -391,30 +457,7 @@ async fn list_records(
     for record in &mut records {
         prompt_content::mask(record, Item::GovernanceRecord, LIST_MASKED_VALUE);
     }
-    match output {
-        Output::Json => print_value(&json!({ "records": records, "next_cursor": next_cursor }), output)?,
-        Output::Table => {
-            let rows: Vec<Value> = records
-                .iter()
-                .map(summary_row)
-                .collect();
-            let filtered = !args.outcome.is_empty()
-                || !args.stage.is_empty()
-                || args.since.is_some()
-                || args.until.is_some()
-                || args.cursor.is_some();
-            let scope = if filtered {
-                Scope::Filtered
-            } else {
-                Scope::All
-            };
-            print_list(&Value::Array(rows), output, &tables::GOVERNANCE_RECORDS, scope)?;
-            if let Some(cursor) = &next_cursor {
-                eprintln!("More records match; pass --cursor {cursor} with the same options for the next page.");
-            }
-        }
-    }
-    Ok(())
+    Ok((records, next_cursor))
 }
 
 /// The cursor of the next page, from the `x-next-cursor` header, when it is a
@@ -515,8 +558,8 @@ async fn verify(
     args: VerifyArgs,
     output: Output,
 ) -> Result<()> {
-    let surfaces = match args.surface {
-        Some(surface) => vec![surface],
+    let (surfaces, single) = match args.surface {
+        Some(surface) => (vec![surface], true),
         None => {
             // A list this CLI can't read fails the command, so it never
             // reports success for surfaces it did not check.
@@ -524,7 +567,7 @@ async fn verify(
             let Some(listed) = listed.as_array() else {
                 bail!("Agent Stream answered the governance surfaces list with something other than a list");
             };
-            listed
+            let listed = listed
                 .iter()
                 .map(|surface| {
                     surface
@@ -533,7 +576,8 @@ async fn verify(
                         .map(str::to_owned)
                         .ok_or_else(|| anyhow::anyhow!("Agent Stream listed a governance surface without a surface_id"))
                 })
-                .collect::<Result<Vec<_>>>()?
+                .collect::<Result<Vec<_>>>()?;
+            (listed, false)
         }
     };
     let mut verdicts = Vec::with_capacity(surfaces.len());
@@ -544,6 +588,8 @@ async fn verify(
         // surface's finding.
         let verdict = match name_missing_surface(read(client, &path).await, surface) {
             Ok(verdict) => verdict,
+            // With one --surface, its error is the answer: shown as it is.
+            Err(error) if single => return Err(error),
             Err(error) => json!({
                 "surface_id": surface,
                 "valid": false,
@@ -571,24 +617,49 @@ async fn verify(
             .get("problem")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        if SECURITY_PROBLEMS.contains(&problem) {
+        if let Some((_, meaning)) = SECURITY_PROBLEMS
+            .iter()
+            .find(|(name, _)| *name == problem)
+        {
             let surface = verdict
                 .get("surface_id")
                 .and_then(Value::as_str)
                 .unwrap_or("?");
             eprintln!(
-                "security finding: the governance record chain of surface '{}' is {}: a record was changed or \
-                 removed, or the index no longer matches the log. Do not try to repair it; keep the records as they \
-                 are and investigate.",
+                "security finding: the governance record chain of surface '{}' is {}: {meaning}. Don't try to repair \
+                 anything; keep the records as they are and investigate.",
                 flatten(surface),
                 flatten(problem)
             );
         }
     }
     if !failed.is_empty() {
-        bail!("{} of {} governance record chains did not verify", failed.len(), verdicts.len());
+        let not_checked = failed
+            .iter()
+            .filter(|verdict| {
+                verdict
+                    .get("problem")
+                    .and_then(Value::as_str)
+                    == Some(NOT_CHECKED)
+            })
+            .count();
+        bail!("{}", verify_summary(failed.len() - not_checked, not_checked, verdicts.len()));
     }
     Ok(())
+}
+
+/// The error a `verify` with failures ends with, counting chains that are not
+/// valid apart from those that could not be checked.
+fn verify_summary(
+    not_valid: usize,
+    not_checked: usize,
+    total: usize,
+) -> String {
+    match (not_valid, not_checked) {
+        (n, 0) => format!("{n} of {total} governance record chains are not valid"),
+        (0, m) => format!("{m} of {total} governance record chains could not be checked"),
+        (n, m) => format!("{n} of {total} governance record chains are not valid and {m} could not be checked"),
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +716,83 @@ mod tests {
         .await;
         result.expect("list");
         assert_eq!(requests, ["GET /api/v1/governance/records?surface_id=s1&limit=50&order=desc HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_records_page_carries_the_next_cursor_into_the_output() {
+        let (host, _) = scripted_agent_stream(vec![(
+            "GET /api/v1/governance/records?surface_id=s1&limit=50&order=desc",
+            "HTTP/1.1 200 OK\r\nx-next-cursor: 40",
+            RECORD,
+        )])
+        .await;
+        let client = GatewayClient::for_agent_stream(host, TOKEN.to_owned()).expect("client");
+        let GovernanceCommand::Records {
+            command: RecordCommand::List(args),
+        } = parse(&["records", "list", "--surface", "s1"])
+        else {
+            panic!("expected records list");
+        };
+        let (records, next_cursor) = fetch_page(&client, &args)
+            .await
+            .expect("page");
+        assert_eq!(next_cursor.as_deref(), Some("40"));
+        let output = list_json(records, next_cursor);
+        assert_eq!(output["next_cursor"], json!("40"));
+        assert_eq!(output["records"][0]["record"]["prompt"], json!(LIST_MASKED_VALUE));
+        assert_eq!(
+            next_page_hint("40"),
+            "More records match; pass --cursor 40 with the same options for the next page."
+        );
+        assert_eq!(list_json(Vec::new(), None)["next_cursor"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_records_list_oldest_first_starts_from_the_first_record() {
+        let (result, requests) = run_with(
+            vec![("GET /api/v1/governance/records?surface_id=s1&limit=50&order=asc&cursor=0", "HTTP/1.1 200 OK", "[]")],
+            &["records", "list", "--surface", "s1", "--order", "asc"],
+            Output::Json,
+        )
+        .await;
+        result.expect("list");
+        assert_eq!(requests, ["GET /api/v1/governance/records?surface_id=s1&limit=50&order=asc&cursor=0 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_verify_one_surface_shows_its_error_as_it_is() {
+        let (result, _) = run_with(
+            vec![("GET /api/v1/governance/verify?surface_id=s1", "HTTP/1.1 403 Forbidden", "Insufficient permissions")],
+            &["verify", "--surface", "s1"],
+            Output::Table,
+        )
+        .await;
+        let error = result
+            .expect_err("refused")
+            .to_string();
+        assert!(error.starts_with("Insufficient permissions; this needs the `governance.view` permission"), "{error}");
+        assert!(!error.contains("not valid"), "{error}");
+    }
+
+    #[test]
+    fn test_verify_summary_counts_not_valid_apart_from_not_checked() {
+        assert_eq!(verify_summary(2, 0, 5), "2 of 5 governance record chains are not valid");
+        assert_eq!(verify_summary(0, 1, 5), "1 of 5 governance record chains could not be checked");
+        assert_eq!(verify_summary(1, 2, 5), "1 of 5 governance record chains are not valid and 2 could not be checked");
+    }
+
+    #[test]
+    fn test_security_problems_include_truncated_and_index_mismatch() {
+        let names: Vec<&str> = SECURITY_PROBLEMS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(names, ["broken", "truncated", "index_mismatch"]);
+        assert!(
+            SECURITY_PROBLEMS[2]
+                .1
+                .contains("rebuilt the index")
+        );
     }
 
     #[tokio::test]
@@ -838,7 +986,7 @@ mod tests {
             result
                 .expect_err("one not checked")
                 .to_string(),
-            "1 of 2 governance record chains did not verify"
+            "1 of 2 governance record chains could not be checked"
         );
         assert_eq!(requests.len(), 3);
     }
@@ -900,7 +1048,7 @@ mod tests {
             result
                 .expect_err("broken chain")
                 .to_string(),
-            "1 of 2 governance record chains did not verify"
+            "1 of 2 governance record chains are not valid"
         );
         assert_eq!(
             requests,
@@ -931,11 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_refusal_names_the_governance_view_permission() {
         let (result, _) = run_with(
-            vec![(
-                "GET /api/v1/governance/surfaces",
-                "HTTP/1.1 403 Forbidden",
-                r#"{"error":"Insufficient permissions"}"#,
-            )],
+            vec![("GET /api/v1/governance/surfaces", "HTTP/1.1 403 Forbidden", "Insufficient permissions")],
             &["surfaces"],
             Output::Json,
         )
