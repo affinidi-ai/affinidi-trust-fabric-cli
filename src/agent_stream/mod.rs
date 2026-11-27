@@ -22,6 +22,7 @@ mod metrics;
 mod notifications;
 mod policies;
 mod prompt_content;
+mod prompts;
 mod request;
 mod secrets;
 mod settings;
@@ -177,6 +178,16 @@ enum AgentStreamCommand {
     Surfaces {
         #[command(subcommand)]
         command: surfaces::SurfaceCommand,
+    },
+    /// Manage prompt templates: saved, versioned prompts that a request
+    /// names instead of sending the prompt text.
+    ///
+    /// Reading and rendering need the `prompts.view` permission. Creating and
+    /// changing need `prompts.edit`, and deleting needs `prompts.delete`; by
+    /// default only administrators have those two.
+    Prompts {
+        #[command(subcommand)]
+        command: prompts::PromptCommand,
     },
     /// Manage access tokens.
     Tokens {
@@ -564,6 +575,9 @@ async fn run_command(
             return surfaces::run(command, globals.output, async || connect(saved, credentials, &globals).await)
                 .await
                 .map_err(without_reveal_hint);
+        }
+        AgentStreamCommand::Prompts { command } => {
+            return prompts::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
         }
         AgentStreamCommand::Tokens { command } => {
             let command = AccessTokenCommand::from(command);
