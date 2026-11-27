@@ -46,10 +46,14 @@ every place on this list that applies to a command that changes a surface: all b
 - The interactive shell parses each line with the same `Cli`, so a new command needs no
   shell wiring.
 - `secrets`, `users`, `identities`, `api-keys`, `policies`, `connections`,
-  `connection-points`, `mediators`, `settings`, `audit`, `metrics`, and `logs` also run
-  on Agent Stream, through their own enums in
-  [`src/agent_stream/`](../../src/agent_stream/), which a `From` maps onto the Agent
-  Gateway enums (`CrudCommand` for `connections`, `connection-points`, and `mediators`). The compiler does not point at them, but
+  `connection-points`, `mediators`, `settings`, `user-settings`, `terms`, `notifications`, `tenant-ownership`, `certificates`,
+  `credential-providers`, `jwt-verification-strategies`, `delegation-vault`, `audit`,
+  `metrics`, and `logs` also run on Agent Stream, through their own enums in
+  [`src/agent_stream/`](../../src/agent_stream/), which a `From` maps onto the shared
+  enums: the Agent Gateway ones (`CrudCommand` for `connections`,
+  `connection-points`, `mediators`, `certificates`, and `credential-providers`), or, through a `TryFrom`, `OwnershipChange`, which both
+  products' `tenant-ownership` map onto because their resource kinds differ. The
+  compiler does not point at them, but
   `each_shared_group_has_every_agent_gateway_subcommand_or_leaves_it_out_on_purpose` in
   `agent_stream/mod.rs` fails for a new Agent Gateway subcommand in one of these groups.
   When Agent Stream has the route, add the variant to the Agent Stream enum and its
@@ -83,7 +87,9 @@ group with one command beyond CRUD.
 - A group whose output is not one value, such as a file written to disk or several
   tables, returns from `run_and_print` directly, as `Audit`, `Payments`, `Metrics`, and
   `Logs` do.
-- Every error passes through `add_terms_hint` in `run`. Do not add it again.
+- Every Agent Gateway error passes through `add_terms_hint` in `run`, and every Agent
+  Stream error passes through it in `agent_stream::dispatch_with`, whichever path runs
+  the command. Do not add it again.
 
 ## Add a resource that fits the shared CRUD commands
 

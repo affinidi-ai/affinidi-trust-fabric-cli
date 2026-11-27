@@ -647,6 +647,34 @@ fn connections_delete_with_yes_sends_the_delete_without_asking() {
 
 #[cfg(feature = "agent-stream")]
 #[test]
+fn credential_deletes_and_revokes_without_yes_and_with_a_typed_host_and_no_terminal_send_nothing() {
+    for (words, refusal) in [
+        (&["certificates", "delete", "cert-1"][..], "refusing to delete 'cert-1'"),
+        (&["credential-providers", "delete", "cp-1"], "refusing to delete 'cp-1'"),
+        (&["jwt-verification-strategies", "delete", "j-1"], "refusing to delete 'j-1'"),
+        (&["delegation-vault", "revoke", "g-1"], "refusing to revoke 'g-1'"),
+        (&["delegation-vault", "revoke-user", "3f9a0c"], "refusing to revoke '3f9a0c'"),
+    ] {
+        let (host, requests) = agent_stream_host();
+        let args: Vec<&str> = ["agent-stream", "--host", &host]
+            .into_iter()
+            .chain(words.iter().copied())
+            .collect();
+
+        let output = fabric_in_fresh_home(&args, &[], &[("FABRIC_TOKEN", SESSION_TOKEN)], "");
+
+        let text = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{words:?}: {text}");
+        assert!(
+            text.contains(&format!("{refusal} without confirmation in a non-interactive session; pass --yes")),
+            "{words:?}: {text}"
+        );
+        assert!(request_lines(&requests).is_empty(), "{words:?}: {:?}", request_lines(&requests));
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
 fn settings_reset_without_force_and_with_a_typed_host_sends_nothing() {
     let (host, requests) = agent_stream_host();
 
@@ -1147,4 +1175,398 @@ fn connection_points_create_prints_only_the_id_in_a_table_and_the_answer_in_json
     assert!(!stderr(&table).contains(INVITATION_SECRET), "{}", stderr(&table));
     let printed: serde_json::Value = serde_json::from_str(&stdout(&json)).expect("JSON");
     assert_eq!(printed["connection_point"]["secret"], INVITATION_SECRET);
+}
+
+/// The groups this build adds for an Agent Stream's account settings and
+/// credentials, each with a command that would otherwise parse.
+#[cfg(not(feature = "agent-stream"))]
+const ACCOUNT_AND_CREDENTIAL_COMMANDS: [&[&str]; 8] = [
+    &["user-settings", "show"],
+    &["terms", "status"],
+    &["notifications", "welcome-template", "show"],
+    &["tenant-ownership", "impact", "pipes", "p-1"],
+    &["certificates", "list"],
+    &["credential-providers", "list"],
+    &["jwt-verification-strategies", "list"],
+    &["delegation-vault", "list"],
+];
+
+#[cfg(not(feature = "agent-stream"))]
+#[test]
+fn the_default_build_refuses_each_agent_stream_account_and_credential_group() {
+    for words in ACCOUNT_AND_CREDENTIAL_COMMANDS {
+        let args: Vec<&str> = ["agent-stream"]
+            .into_iter()
+            .chain(words.iter().copied())
+            .collect();
+
+        let output = fabric(&args, &[]);
+
+        assert_eq!(output.status.code(), Some(USAGE_EXIT_CODE), "{words:?}: {}", stderr(&output));
+        assert!(stderr(&output).contains("unrecognized subcommand 'agent-stream'"), "{words:?}: {}", stderr(&output));
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn certificates_credential_providers_jwt_strategies_and_grants_print_the_agent_gateway_tables() {
+    let (host, _) = agent_stream_stand_in(vec![
+        (
+            "GET /api/v1/certificates",
+            "200 OK",
+            r#"[{"id":"cert-1","name":"Edge","certificate_id":"c-1","tags":[],"kind":"server_leaf","active":true,"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-02T00:00:00Z"}]"#,
+        ),
+        (
+            "GET /api/v1/credential-providers",
+            "200 OK",
+            r#"[{"id":"cp-1","name":"Stripe","provider_id":"stripe","provider_type":"api_key","default_scopes":[],"token_refresh_enabled":true}]"#,
+        ),
+        (
+            "GET /api/v1/jwt-verification-strategies",
+            "200 OK",
+            r#"[{"id":"j-1","name":"Partner IdP","expected_issuer":"https://idp.example.com/","jwks_source":{"type":"remote","jwks_uri":"https://idp.example.com/jwks.json"},"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-02T00:00:00Z"}]"#,
+        ),
+        (
+            "GET /api/v1/delegation-vault",
+            "200 OK",
+            r#"[{"id":"g-1","agent_did":"did:web:agent.example","user_identity_hash":"3f9a0c","credential_provider_id":"cp-1","provider_id":"stripe","token_type":"Bearer","scopes":[],"expires_at":null,"is_expired":false,"can_refresh":false}]"#,
+        ),
+    ]);
+
+    let certificates = fabric_on_stream(&host, &["certificates", "list"], "");
+    let providers = fabric_on_stream(&host, &["credential-providers", "list"], "");
+    let strategies = fabric_on_stream(&host, &["jwt-verification-strategies", "list"], "");
+    let grants = fabric_on_stream(&host, &["delegation-vault", "list"], "");
+
+    assert_eq!(
+        stdout(&certificates),
+        "NAME  ID      KIND         ACTIVE  UPDATED\n\
+         Edge  cert-1  server_leaf  yes     2026-11-02T00:00:00Z\n",
+        "{}",
+        stderr(&certificates)
+    );
+    assert_eq!(
+        stdout(&providers),
+        "NAME    ID    PROVIDER ID  TYPE\n\
+         Stripe  cp-1  stripe       api_key\n",
+        "{}",
+        stderr(&providers)
+    );
+    assert_eq!(
+        stdout(&strategies),
+        "NAME         ID   ISSUER                    UPDATED\n\
+         Partner IdP  j-1  https://idp.example.com/  2026-11-02T00:00:00Z\n",
+        "{}",
+        stderr(&strategies)
+    );
+    assert_eq!(
+        stdout(&grants),
+        "ID   AGENT DID              PROVIDER  EXPIRES  EXPIRED\n\
+         g-1  did:web:agent.example  stripe    never    no\n",
+        "{}",
+        stderr(&grants)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn certificates_credential_providers_jwt_strategies_and_grants_print_the_agent_gateway_lines() {
+    let certificate = r#"{"id":"cert-1","name":"Edge","certificate_pem":"-----BEGIN CERTIFICATE-----"}"#;
+    let (host, _) = agent_stream_stand_in(vec![
+        ("POST /api/v1/certificates", "201 Created", certificate),
+        ("PUT /api/v1/certificates/cert-1", "200 OK", certificate),
+        ("DELETE /api/v1/certificates/cert-1", "204 No Content", ""),
+        ("GET /api/v1/certificates", "200 OK", r#"[{"id":"cert-1","name":"Edge"}]"#),
+        ("POST /api/v1/credential-providers", "201 Created", r#"{"id":"cp-1","name":"Stripe"}"#),
+        ("PUT /api/v1/credential-providers/cp-1", "200 OK", r#"{"id":"cp-1","name":"Stripe"}"#),
+        ("DELETE /api/v1/credential-providers/cp-1", "204 No Content", ""),
+        ("POST /api/v1/jwt-verification-strategies", "201 Created", r#"{"id":"j-1","name":"Partner IdP"}"#),
+        ("PUT /api/v1/jwt-verification-strategies/j-1", "200 OK", r#"{"id":"j-1","name":"Partner IdP"}"#),
+        ("DELETE /api/v1/jwt-verification-strategies/j-1", "204 No Content", ""),
+        ("DELETE /api/v1/delegation-vault/by-user/3f9a0c", "200 OK", r#"{"revoked":2}"#),
+        ("DELETE /api/v1/delegation-vault/g-1", "204 No Content", ""),
+    ]);
+    let run = |args: &[&str]| fabric_on_stream(&host, args, r#"{"name":"x"}"#);
+
+    for (args, line) in [
+        (&["certificates", "create", "--file", "-"][..], "Created certificate 'cert-1'\n"),
+        (&["certificates", "update", "Edge", "--file", "-"], "Updated certificate 'cert-1'\n"),
+        (&["certificates", "delete", "Edge", "--yes"], "Deleted certificate 'cert-1'\n"),
+        (&["credential-providers", "create", "--file", "-"], "Created credential provider 'cp-1'\n"),
+        (&["credential-providers", "update", "cp-1", "--file", "-"], "Updated credential provider 'cp-1'\n"),
+        (&["credential-providers", "delete", "cp-1", "--yes"], "Deleted credential provider 'cp-1'\n"),
+        (&["jwt-verification-strategies", "create", "--file", "-"], "Created JWT verification strategy 'j-1'\n"),
+        (&["jwt-verification-strategies", "update", "j-1", "--file", "-"], "Updated JWT verification strategy 'j-1'\n"),
+        (&["jwt-verification-strategies", "delete", "j-1", "--yes"], "Deleted JWT verification strategy 'j-1'\n"),
+        (&["delegation-vault", "revoke", "g-1", "--yes"], "Revoked grant 'g-1'\n"),
+        (&["delegation-vault", "revoke-user", "3f9a0c", "--yes"], "Revoked 2 grants for user '3f9a0c'\n"),
+    ] {
+        let output = run(args);
+
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), line, "{args:?}: {}", stderr(&output));
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn user_settings_terms_notifications_and_tenant_ownership_print_the_agent_gateway_tables_and_lines() {
+    let (host, _) = agent_stream_stand_in(vec![
+        (
+            "GET /api/v1/user-settings",
+            "200 OK",
+            r#"{"refresh_interval_seconds":30,"prometheus_auth_password_hash":"$2b$12$hash"}"#,
+        ),
+        ("POST /api/v1/user-settings", "200 OK", r#"{"refresh_interval_seconds":60}"#),
+        ("DELETE /api/v1/user-settings", "200 OK", r#"{"refresh_interval_seconds":30}"#),
+        ("GET /api/v1/terms/status", "200 OK", r#"{"accepted":true,"required":[]}"#),
+        ("POST /api/v1/terms/customer/deactivate", "204 No Content", ""),
+        ("PUT /api/v1/notifications/user-welcome-template", "204 No Content", ""),
+        ("GET /api/v1/users/u-1", "200 OK", r#"{"id":"u-1"}"#),
+        ("POST /api/v1/notifications/send-welcome", "204 No Content", ""),
+        (
+            "GET /api/v1/tenant-ownership/pipes/p-1/impact",
+            "200 OK",
+            r#"{"kind":"pipes","id":"p-1","tenant_id":"acme","immutable":false}"#,
+        ),
+        ("PUT /api/v1/tenant-ownership/pipes/p-1", "200 OK", r#"{"kind":"pipes","id":"p-1","tenant_id":"acme"}"#),
+    ]);
+    let run = |args: &[&str]| fabric_on_stream(&host, args, r#"{"refresh_interval_seconds":60}"#);
+
+    for (args, printed) in [
+        (&["user-settings", "show"][..], "{\n  \"refresh_interval_seconds\": 30\n}\n"),
+        (&["user-settings", "set", "--file", "-"], "{\n  \"refresh_interval_seconds\": 60\n}\n"),
+        (&["user-settings", "reset"], "{\n  \"refresh_interval_seconds\": 30\n}\n"),
+        (&["terms", "status"], "{\n  \"accepted\": true,\n  \"required\": []\n}\n"),
+        (&["terms", "deactivate"], "Customer Terms of Use deactivated.\n"),
+        (&["notifications", "welcome-template", "set", "--file", "-"], "Welcome notification template updated.\n"),
+        (
+            &["notifications", "send-welcome", "--user-id", "u-1", "--title", "Welcome", "--message", "Hello"],
+            "Welcome notification sent.\n",
+        ),
+        (
+            &["tenant-ownership", "impact", "pipes", "p-1"],
+            "{\n  \"id\": \"p-1\",\n  \"immutable\": false,\n  \"kind\": \"pipes\",\n  \"tenant_id\": \"acme\"\n}\n",
+        ),
+        (
+            &["tenant-ownership", "set", "pipes", "p-1", "--tenant", "acme"],
+            "{\n  \"id\": \"p-1\",\n  \"kind\": \"pipes\",\n  \"tenant_id\": \"acme\"\n}\n",
+        ),
+    ] {
+        let output = run(args);
+
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), printed, "{args:?}: {}", stderr(&output));
+    }
+}
+
+/// A certificate answer carrying a private key, which Agent Stream never
+/// sends, to check that the CLI would not print one anyway.
+#[cfg(feature = "agent-stream")]
+const CERTIFICATE_WITH_KEY: &str =
+    r#"{"id":"cert-1","name":"Edge","certificate_pem":"pem","private_key_pem":"-----BEGIN PRIVATE KEY-----x"}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn certificates_never_print_a_private_key_and_offer_no_reveal() {
+    let (host, _) = agent_stream_stand_in(vec![
+        ("GET /api/v1/certificates/cert-1", "200 OK", CERTIFICATE_WITH_KEY),
+        ("POST /api/v1/certificates", "201 Created", CERTIFICATE_WITH_KEY),
+        ("PUT /api/v1/certificates/cert-1", "200 OK", CERTIFICATE_WITH_KEY),
+        (
+            "GET /api/v1/certificates",
+            "200 OK",
+            r#"[{"id":"cert-1","name":"Edge","private_key_pem":"-----BEGIN PRIVATE KEY-----x"}]"#,
+        ),
+    ]);
+    let document = r#"{"name":"Edge","certificate_pem":"pem","private_key_pem":"-----BEGIN PRIVATE KEY-----x"}"#;
+
+    let get = fabric_on_stream(&host, &["certificates", "get", "cert-1"], "");
+    let create = fabric_on_stream(&host, &["--output", "json", "certificates", "create", "--file", "-"], document);
+    let update =
+        fabric_on_stream(&host, &["--output", "json", "certificates", "update", "cert-1", "--file", "-"], document);
+    let list = fabric_on_stream(&host, &["--output", "json", "certificates", "list"], "");
+    let reveal = fabric_on_stream(&host, &["certificates", "get", "cert-1", "--reveal"], "");
+
+    for (name, output) in [("get", &get), ("create", &create), ("update", &update), ("list", &list)] {
+        assert!(output.status.success(), "{name}: {}", stderr(output));
+        assert!(!stdout(output).contains("PRIVATE KEY"), "{name}: {}", stdout(output));
+        assert!(!stderr(output).contains("PRIVATE KEY"), "{name}: {}", stderr(output));
+        assert!(!stdout(output).contains("private_key_pem"), "{name}: {}", stdout(output));
+        assert!(stderr(output).contains("note: hid 'private_key_pem'.\n"), "{name}: {}", stderr(output));
+    }
+    assert_eq!(reveal.status.code(), Some(2), "{}", stderr(&reveal));
+    assert!(stderr(&reveal).contains("unexpected argument '--reveal'"), "{}", stderr(&reveal));
+}
+
+/// A document saved from a masked answer, as `fabric agent-gateway
+/// certificates get` prints it.
+#[cfg(feature = "agent-stream")]
+const MASKED_CERTIFICATE: &str =
+    r#"{"name":"Edge","certificate_pem":"pem","private_key_pem":"<hidden; pass --reveal to show>"}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn a_masked_document_is_refused_without_pointing_at_a_reveal_flag_the_command_lacks() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("POST /api/v1/certificates", "201 Created", r#"{"id":"cert-1"}"#),
+        ("POST /api/v1/credential-providers", "201 Created", r#"{"id":"cp-1"}"#),
+        ("PUT /api/v1/certificates/cert-1", "200 OK", r#"{"id":"cert-1"}"#),
+    ]);
+
+    for args in [
+        &["certificates", "create", "--file", "-"][..],
+        &["credential-providers", "create", "--file", "-"],
+        &["api", "put", "/v1/certificates/cert-1", "--file", "-"],
+        &["surfaces", "create", "--file", "-"],
+    ] {
+        let output = fabric_on_stream(&host, args, MASKED_CERTIFICATE);
+
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {}", stderr(&output));
+        assert!(
+            stderr(&output).ends_with(
+                "\nerror: the request body still carries the masked placeholder <hidden; pass --reveal to show>; \
+                 this command has no --reveal, so remove the masked field to leave the stored credential untouched, \
+                 or put the real value in its place\n"
+            ),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+    let secret = fabric_on_stream(
+        &host,
+        &["secrets", "update", "s-1", "--file", "-"],
+        r#"{"value":"<hidden; pass --reveal to show>","update_value":true}"#,
+    );
+    assert!(
+        stderr(&secret).ends_with(
+            "\nerror: the request body still carries the masked placeholder <hidden; pass --reveal to show>; \
+             re-read the entity with --reveal, or remove the masked field to leave the stored credential untouched\n"
+        ),
+        "`secrets` has --reveal: {}",
+        stderr(&secret)
+    );
+    assert!(
+        request_lines(&requests)
+            .iter()
+            .all(|line| line.starts_with("GET ")),
+        "{:?}",
+        request_lines(&requests)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn delegation_vault_reads_never_print_a_grant_token() {
+    let grant = r#"{"id":"g-1","agent_did":"did:web:agent.example","provider_id":"stripe","access_token":"at_do_not_print","refresh_token":"rt_do_not_print"}"#;
+    let (host, _) = agent_stream_stand_in(vec![
+        ("GET /api/v1/delegation-vault/g-1", "200 OK", grant),
+        (
+            "GET /api/v1/delegation-vault",
+            "200 OK",
+            r#"[{"id":"g-1","agent_did":"did:web:agent.example","provider_id":"stripe","access_token":"at_do_not_print","refresh_token":"rt_do_not_print"}]"#,
+        ),
+    ]);
+
+    for args in [
+        &["--output", "json", "delegation-vault", "list"][..],
+        &["--output", "json", "delegation-vault", "get", "g-1"],
+        &["delegation-vault", "get", "g-1"],
+    ] {
+        let output = fabric_on_stream(&host, args, "");
+
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        for token in ["at_do_not_print", "rt_do_not_print"] {
+            assert!(!stdout(&output).contains(token), "{args:?}: {}", stdout(&output));
+            assert!(!stderr(&output).contains(token), "{args:?}: {}", stderr(&output));
+        }
+        assert!(stdout(&output).contains("g-1"), "{args:?}: {}", stdout(&output));
+        assert!(
+            stderr(&output).contains("note: hid 'access_token', 'refresh_token'.\n"),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn send_welcome_stops_without_a_permission_warning_when_the_terms_gate_refuses_the_lookup() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        (
+            "GET /api/v1/users/u-1",
+            "403 Forbidden",
+            r#"{"code":"TERMS_ACCEPTANCE_REQUIRED","message":"Sign in to Agent Stream as this access token's owner, accept the required Terms and Conditions, then retry."}"#,
+        ),
+        ("POST /api/v1/notifications/send-welcome", "204 No Content", ""),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["notifications", "send-welcome", "--user-id", "u-1", "--title", "Welcome", "--message", "Hello"],
+        "",
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).ends_with(
+            "\nerror: Sign in to Agent Stream as this access token's owner, accept the required Terms and \
+             Conditions, then retry.\n"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("warning:"), "{}", stderr(&output));
+    assert!(
+        !request_lines(&requests)
+            .iter()
+            .any(|line| line.starts_with("POST ")),
+        "{:?}",
+        request_lines(&requests)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn send_welcome_warns_then_sends_when_the_lookup_lacks_users_view() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/users/u-1", "403 Forbidden", r#"{"required_permission":"users.view"}"#),
+        ("POST /api/v1/notifications/send-welcome", "204 No Content", ""),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["notifications", "send-welcome", "--user-id", "u-1", "--title", "Welcome", "--message", "Hello"],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Welcome notification sent.\n");
+    assert!(stderr(&output).contains("\nwarning: could not verify that user 'u-1' exists"), "{}", stderr(&output));
+    assert!(
+        request_lines(&requests).contains(&"POST /api/v1/notifications/send-welcome HTTP/1.1".to_owned()),
+        "{:?}",
+        request_lines(&requests)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn tenant_ownership_set_names_the_agent_stream_impact_command_when_a_move_is_blocked() {
+    let (host, _) = agent_stream_stand_in(vec![(
+        "PUT /api/v1/tenant-ownership/teams/t-1",
+        "409 Conflict",
+        r#"{"error":"tenant_ownership_conflict","kind":"teams","id":"t-1","requested_tenant_id":"acme","conflicts":[]}"#,
+    )]);
+
+    let output = fabric_on_stream(&host, &["tenant-ownership", "set", "teams", "t-1", "--tenant", "acme"], "");
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "run `fabric agent-stream tenant-ownership impact <kind> <id>` to see the references blocking this move"
+        ),
+        "{}",
+        stderr(&output)
+    );
 }

@@ -8,25 +8,33 @@
 
 mod api_keys;
 mod audit;
+mod certificates;
 mod config;
 mod connection_points;
 mod connections;
+mod credential_providers;
+mod delegation_vault;
 mod drift;
 mod governance;
 mod identities;
+mod jwt_verification_strategies;
 mod login;
 mod logs;
 mod mediators;
 mod metrics;
+mod notifications;
 mod policies;
 mod prompt_content;
 mod request;
 mod secrets;
 mod settings;
 mod surfaces;
+mod tenant_ownership;
+mod terms;
 #[cfg(test)]
 mod test_support;
 mod tokens;
+mod user_settings;
 mod users;
 mod when;
 mod whoami;
@@ -40,8 +48,8 @@ use crate::{
     client::GatewayClient,
     commands::{
         AccessTokenCommand, ApiArgs, CommandTarget, DEFAULT_CONNECTION, HostFlags, Output, SharedCommand, ShellGlobals,
-        ShellText, command_target, given_host_and_token, new_hash_name_warnings, print_value, run_access_tokens,
-        run_api, run_shared, shell_prefix,
+        ShellText, add_terms_hint, command_target, given_host_and_token, new_hash_name_warnings, print_value,
+        run_access_tokens, run_api, run_shared, shell_prefix, without_reveal_hint,
     },
     config::Config,
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
@@ -250,6 +258,76 @@ enum AgentStreamCommand {
         #[command(subcommand)]
         command: settings::SettingsCommand,
     },
+    /// Manage the signed-in user's own settings overrides.
+    #[command(name = "user-settings")]
+    UserSettings {
+        #[command(subcommand)]
+        command: user_settings::UserSettingsCommand,
+    },
+    /// Inspect and publish Terms of Use.
+    ///
+    /// There is no command to accept terms. Until an access token's owner
+    /// accepts them, Agent Stream refuses that token on every route except
+    /// `terms applicable` and `terms provider-health`, so the owner accepts
+    /// them in the Agent Stream dashboard. A session-token login can still run
+    /// `terms status` and `terms applicable`, and accept with
+    /// `fabric agent-stream api post /v1/terms/acceptances --file <json>`.
+    ///
+    /// When Terms of Use are switched off on this Agent Stream, `show`,
+    /// `provider-health`, `draft`, `publish`, and `deactivate` answer 404 with
+    /// TERMS_DISABLED, `applicable` answers an empty list, and `status`
+    /// answers `consent_required` false.
+    Terms {
+        #[command(subcommand)]
+        command: terms::TermsCommand,
+    },
+    /// Manage welcome notifications.
+    Notifications {
+        #[command(subcommand)]
+        command: notifications::NotificationCommand,
+    },
+    /// Inspect and reassign which tenant owns a resource.
+    #[command(name = "tenant-ownership")]
+    TenantOwnership {
+        #[command(subcommand)]
+        command: tenant_ownership::TenantOwnershipCommand,
+    },
+    /// Manage TLS certificates and their private keys.
+    ///
+    /// A private key is write-only: Agent Stream stores the key a create or an
+    /// update sends and never returns it, so there is no --reveal.
+    Certificates {
+        #[command(subcommand)]
+        command: certificates::CertificateCommand,
+    },
+    /// Manage credential providers, the OAuth 2.0 and API-key providers used
+    /// for outbound credential delegation.
+    ///
+    /// A provider stores no secret values: its `client_id_secret_ref`,
+    /// `client_secret_secret_ref` and `api_key_secret_ref` fields name secrets
+    /// by `secret_id`, and the values live in `fabric agent-stream secrets`.
+    /// To check that a token endpoint is reachable, run
+    /// `fabric agent-stream api post /v1/credential-providers/validate --file <json>`.
+    #[command(name = "credential-providers")]
+    CredentialProviders {
+        #[command(subcommand)]
+        command: credential_providers::CredentialProviderCommand,
+    },
+    /// Manage JWT verification strategies.
+    ///
+    /// A strategy names the issuer Agent Stream expects in a JWT and where it
+    /// gets the keys that verify it.
+    #[command(name = "jwt-verification-strategies", after_long_help = jwt_verification_strategies::EXAMPLES)]
+    JwtVerificationStrategies {
+        #[command(subcommand)]
+        command: jwt_verification_strategies::JwtStrategyCommand,
+    },
+    /// Inspect and revoke delegated credential grants.
+    #[command(name = "delegation-vault")]
+    DelegationVault {
+        #[command(subcommand)]
+        command: delegation_vault::DelegationVaultCommand,
+    },
     /// Read the Agent Stream audit log.
     Audit {
         #[command(subcommand)]
@@ -456,9 +534,12 @@ pub async fn dispatch(args: AgentStreamArgs) -> Result<()> {
 /// token, other than `login`, `logout` and `config`, skips that move and never
 /// touches `credentials`.
 ///
-/// An error from a keyring that cannot be reached gets one hint, as on an
-/// Agent Gateway command: the move of a `token` line adds its own, which
-/// names the connection, and the command's error gets the general one.
+/// The command's error gets the hint [`add_terms_hint`] gives its Terms code,
+/// because Agent Stream's Terms gate can refuse any route, so every command
+/// gets it here once, whichever path below runs it. An error from a keyring
+/// that cannot be reached gets one hint too, as on an Agent Gateway command:
+/// the move of a `token` line adds its own, which names the connection, and
+/// the command's error gets the general one.
 async fn dispatch_with(
     args: AgentStreamArgs,
     mut saved: Config,
@@ -483,11 +564,13 @@ async fn dispatch_with(
     };
     run_command(args.command, globals, &mut saved, credentials, path)
         .await
-        .map_err(add_no_keyring_hint)
+        .map_err(|error| add_no_keyring_hint(add_terms_hint(Product::AgentStream, error)))
 }
 
 /// Runs one command. The groups Agent Stream shares with Agent Gateway all
-/// take one path: [`refuse_before_connecting`], then [`connect`], then
+/// take one path: their command is mapped onto a [`SharedCommand`], where
+/// `tenant-ownership` refuses a resource kind Agent Stream does not track on
+/// its own, then [`refuse_before_connecting`], then [`connect`], then
 /// [`run_shared`], so where their token goes is decided in one place.
 async fn run_command(
     command: AgentStreamCommand,
@@ -507,7 +590,9 @@ async fn run_command(
         }
         AgentStreamCommand::Whoami => return whoami::whoami(saved, credentials, &globals).await,
         AgentStreamCommand::Surfaces { command } => {
-            return surfaces::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+            return surfaces::run(command, globals.output, async || connect(saved, credentials, &globals).await)
+                .await
+                .map_err(without_reveal_hint);
         }
         AgentStreamCommand::Tokens { command } => {
             let command = AccessTokenCommand::from(command);
@@ -526,7 +611,9 @@ async fn run_command(
         }
         AgentStreamCommand::Api(args) => {
             let client = connect(saved, credentials, &globals).await?;
-            let value = run_api(&client, args).await?;
+            let value = run_api(&client, args)
+                .await
+                .map_err(without_reveal_hint)?;
             return print_value(&value, globals.output);
         }
         AgentStreamCommand::Secrets { command, reveal } => SharedCommand::Secrets {
@@ -541,6 +628,16 @@ async fn run_command(
         AgentStreamCommand::ConnectionPoints { command } => SharedCommand::ConnectionPoints(command.into()),
         AgentStreamCommand::Mediators { command } => SharedCommand::Mediators(command.into()),
         AgentStreamCommand::Settings { command } => SharedCommand::Settings(command.into()),
+        AgentStreamCommand::UserSettings { command } => SharedCommand::UserSettings(command.into()),
+        AgentStreamCommand::Terms { command } => SharedCommand::Terms(command.into()),
+        AgentStreamCommand::Notifications { command } => SharedCommand::Notifications(command.into()),
+        AgentStreamCommand::TenantOwnership { command } => SharedCommand::TenantOwnership(command.try_into()?),
+        AgentStreamCommand::Certificates { command } => SharedCommand::certificates(command),
+        AgentStreamCommand::CredentialProviders { command } => SharedCommand::credential_providers(command),
+        AgentStreamCommand::JwtVerificationStrategies { command } => {
+            SharedCommand::jwt_verification_strategies(command)
+        }
+        AgentStreamCommand::DelegationVault { command } => SharedCommand::delegation_vault(command),
         AgentStreamCommand::Audit { command } => SharedCommand::Audit(command.into()),
         AgentStreamCommand::Metrics { command } => SharedCommand::Metrics(command.into()),
         AgentStreamCommand::Logs { command } => SharedCommand::Logs(command.into()),
@@ -555,10 +652,12 @@ async fn run_command(
 /// revoke, rotate, or delete that would ask for a confirmation nobody can
 /// give, a `settings reset` without --force, a `users update` or `users
 /// delete` naming the reserved `integrations` route, a `metrics truncate` or
-/// `logs truncate` without --yes, and a `policies delete` or `connections
-/// delete` that would ask for a confirmation nobody can give. Only refusals
-/// that need neither the host nor a file belong here; the ones that do are
-/// checked as the command runs.
+/// `logs truncate` without --yes, and a `policies delete`, `connections
+/// delete`, `certificates delete`, `credential-providers delete`,
+/// `jwt-verification-strategies delete`, `delegation-vault revoke`, or
+/// `delegation-vault revoke-user` that would ask for a confirmation nobody can
+/// give. Only refusals that need neither the host nor a file belong here; the
+/// ones that do are checked as the command runs.
 fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
     match command {
         SharedCommand::ApiKeys(command) => command.refuse_without_terminal(),
@@ -566,11 +665,20 @@ fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
         SharedCommand::Users(command) => command.refuse_reserved_route(Product::AgentStream),
         SharedCommand::Metrics(command) => command.refuse_unconfirmed_truncate(),
         SharedCommand::Logs(command) => command.refuse_unconfirmed_truncate(),
-        SharedCommand::Policies { .. } | SharedCommand::Connections { .. } => command.refuse_unconfirmed_delete(),
+        SharedCommand::Policies { .. }
+        | SharedCommand::Connections { .. }
+        | SharedCommand::Certificates { .. }
+        | SharedCommand::CredentialProviders { .. }
+        | SharedCommand::JwtVerificationStrategies { .. }
+        | SharedCommand::DelegationVault { .. } => command.refuse_unconfirmed_removal(),
         SharedCommand::Secrets { .. }
         | SharedCommand::Identities(_)
         | SharedCommand::ConnectionPoints(_)
         | SharedCommand::Mediators(_)
+        | SharedCommand::UserSettings(_)
+        | SharedCommand::Terms(_)
+        | SharedCommand::Notifications(_)
+        | SharedCommand::TenantOwnership(_)
         | SharedCommand::Audit(_) => Ok(()),
     }
 }
@@ -1492,7 +1600,7 @@ mod tests {
 
     /// The groups `fabric agent-stream` runs through the Agent Gateway
     /// commands.
-    const SHARED_GROUPS: [&str; 12] = [
+    const SHARED_GROUPS: [&str; 20] = [
         "secrets",
         "users",
         "identities",
@@ -1502,6 +1610,14 @@ mod tests {
         "connection-points",
         "mediators",
         "settings",
+        "user-settings",
+        "terms",
+        "notifications",
+        "tenant-ownership",
+        "certificates",
+        "credential-providers",
+        "jwt-verification-strategies",
+        "delegation-vault",
         "audit",
         "metrics",
         "logs",
@@ -1527,6 +1643,33 @@ mod tests {
         }
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn the_credential_deletes_and_revokes_take_yes_on_agent_stream_only() {
+        for words in [
+            &["certificates", "delete", "cert-1"][..],
+            &["credential-providers", "delete", "cp-1"],
+            &["jwt-verification-strategies", "delete", "j-1"],
+            &["delegation-vault", "revoke", "g-1"],
+            &["delegation-vault", "revoke-user", "3f9a0c"],
+        ] {
+            for (product, yes, parses) in [
+                ("agent-stream", "--yes", true),
+                ("agent-stream", "-y", true),
+                ("agent-stream", "", true),
+                ("agent-gateway", "--yes", false),
+                ("agent-gateway", "", true),
+            ] {
+                let args: Vec<&str> = ["fabric", product]
+                    .into_iter()
+                    .chain(words.iter().copied())
+                    .chain(Some(yes).filter(|flag| !flag.is_empty()))
+                    .collect();
+
+                assert_eq!(Cli::try_parse_from(&args).is_ok(), parses, "{args:?}");
+            }
+        }
     }
 
     #[test]
@@ -1704,6 +1847,81 @@ mod tests {
                 .iter()
                 .all(|request| sends_bearer(request, ACCESS_TOKEN))
         );
+    }
+
+    #[tokio::test]
+    async fn the_account_and_credential_groups_reach_their_routes_with_the_saved_token() {
+        let (host, requests) = scripted_agent_stream(vec![
+            ("GET /api/v1/user-settings", "HTTP/1.1 200 OK", "{}"),
+            ("GET /api/v1/terms/status", "HTTP/1.1 200 OK", "{}"),
+            ("GET /api/v1/notifications/user-welcome-template", "HTTP/1.1 200 OK", "{}"),
+            ("GET /api/v1/tenant-ownership/teams/t-1/impact", "HTTP/1.1 200 OK", "{}"),
+            ("GET /api/v1/certificates", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/credential-providers", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/jwt-verification-strategies", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/delegation-vault", "HTTP/1.1 200 OK", "[]"),
+        ])
+        .await;
+
+        for words in [
+            &["user-settings", "show"][..],
+            &["terms", "status"],
+            &["notifications", "welcome-template", "show"],
+            &["tenant-ownership", "impact", "teams", "t-1"],
+            &["certificates", "list"],
+            &["credential-providers", "list"],
+            &["jwt-verification-strategies", "list"],
+            &["delegation-vault", "list"],
+        ] {
+            let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+            run_stream(words, saved, &credentials)
+                .await
+                .unwrap_or_else(|error| panic!("{words:?}: {error:#}"));
+        }
+
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/user-settings HTTP/1.1",
+                "GET /api/v1/terms/status HTTP/1.1",
+                "GET /api/v1/notifications/user-welcome-template HTTP/1.1",
+                "GET /api/v1/tenant-ownership/teams/t-1/impact HTTP/1.1",
+                "GET /api/v1/certificates HTTP/1.1",
+                "GET /api/v1/credential-providers HTTP/1.1",
+                "GET /api/v1/jwt-verification-strategies HTTP/1.1",
+                "GET /api/v1/delegation-vault HTTP/1.1",
+            ]
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| sends_bearer(request, ACCESS_TOKEN))
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_ownership_of_a_parent_owned_kind_is_refused_before_connecting() {
+        let (host, requests) = scripted_agent_stream(Vec::new()).await;
+
+        for words in [
+            &["tenant-ownership", "impact", "api-keys", "k-1"][..],
+            &["tenant-ownership", "set", "connection-points", "c-1", "--tenant", "acme"],
+        ] {
+            let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+            let error = run_stream(words, saved, &credentials)
+                .await
+                .expect_err("Agent Stream does not track this kind on its own");
+
+            assert!(
+                error
+                    .to_string()
+                    .ends_with("Nothing was sent"),
+                "{words:?}: {error}"
+            );
+        }
+        assert!(start_lines(&requests).is_empty());
     }
 
     #[tokio::test]
