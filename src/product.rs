@@ -80,6 +80,16 @@ impl Product {
         }
     }
 
+    /// How a message names the product as the subject or owner of something,
+    /// with the article it takes there: `the gateway`, as the Agent Gateway
+    /// messages always have, or `Agent Stream`, which takes none.
+    pub(crate) fn message_subject(self) -> &'static str {
+        match self {
+            Self::AgentGateway => "the gateway",
+            Self::AgentStream => "Agent Stream",
+        }
+    }
+
     /// How a message names one of this product's saved connections:
     /// `gateway connection`, as the Agent Gateway messages always have, or
     /// `Agent Stream connection`.
@@ -87,6 +97,16 @@ impl Product {
         match self {
             Self::AgentGateway => "gateway connection",
             Self::AgentStream => "Agent Stream connection",
+        }
+    }
+
+    /// How a message names the object an API key belongs to: `Agent Surface`
+    /// on Agent Gateway, and `Surface` on Agent Stream, whose keys belong to a
+    /// Surface of either kind.
+    pub(crate) fn surface_noun(self) -> &'static str {
+        match self {
+            Self::AgentGateway => "Agent Surface",
+            Self::AgentStream => "Surface",
         }
     }
 
