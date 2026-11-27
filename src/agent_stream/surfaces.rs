@@ -205,10 +205,10 @@ pub enum SurfaceCommand {
     /// refused, since the CLI can't tell whether it was saved meanwhile.
     /// Agent Stream has no version check, so a save that lands in the short
     /// gap between that last read and the send is still overwritten. When the
-    /// send gets no answer, or a success answer the CLI can't read, the error
-    /// says the surface may have been saved, so check it with `surfaces get`
-    /// before running the command again. A change that leaves the surface as
-    /// it is sends nothing.
+    /// request was sent and no whole answer came back, Agent Stream answered
+    /// with a server error, or a success answer can't be read, the error says
+    /// to check the surface with `surfaces get` before running the command
+    /// again. A change that leaves the surface as it is sends nothing.
     ///
     /// Field names are checked against the surface as read: a top-level name
     /// must be one Agent Stream knows, and a name inside an object the
@@ -299,11 +299,11 @@ pub enum SurfaceCommand {
     /// checks the field names, reads it again and stops if it was saved
     /// meanwhile, then sends the whole surface. Agent Stream has no version
     /// check, so a save that lands in the short gap between that last read
-    /// and the send is still overwritten. When the send gets no answer, or a
-    /// success answer the CLI can't read, the error says the surface may
-    /// have been saved, so check it before running the command again. A name
-    /// inside the JSON
-    /// must be one the surface's field already has, unless --allow-new-field
+    /// and the send is still overwritten. When the request was sent and no
+    /// whole answer came back, Agent Stream answered with a server error, or
+    /// a success answer can't be read, the error says to check the surface
+    /// before running the command again. A name inside the JSON must be one
+    /// the surface's field already has, unless --allow-new-field
     /// is given; cost-tracking names are always checked against every setting
     /// Agent Stream knows, while nothing is checked inside any other field
     /// the surface does not have yet, or inside a list item. Table output
@@ -505,8 +505,10 @@ pub struct UpdateArgs {
 /// Runs one `surfaces` command. `connect` gives the client of the Agent
 /// Stream to talk to. It is called only for a command that sends something,
 /// and only once the checks that need no connection pass, so `create
-/// --dry-run` and `features` with no id need no saved connection, and a bad
-/// id, feature name, or feature flag is refused before one is made.
+/// --dry-run` and `features` with no id need no saved connection. `features
+/// <id>`, `budget`, `add-feature`, and `remove-feature` refuse a bad id,
+/// feature name, or feature flag before one is made; `get`, `update`, and
+/// `delete` check the id after connecting.
 pub async fn run(
     command: SurfaceCommand,
     output: Output,
@@ -870,9 +872,13 @@ enum SaveFailure {
     /// The request never left this machine: looking up the host,
     /// connecting, or the TLS handshake failed. Nothing was saved.
     NotSent,
-    /// Agent Stream answered with a failure of its own, such as a refusal.
-    /// Nothing was saved.
+    /// Agent Stream answered with a refusal, a status below 500 such as a
+    /// 400 or 409. Nothing was saved.
     Refused,
+    /// Agent Stream answered with a server error, such as a 500 or 503,
+    /// which can come after the surface was stored, so it may have been
+    /// saved.
+    ServerError,
     /// Agent Stream answered with success, but the answer was not JSON, so
     /// the CLI can't tell what was saved.
     Unreadable,
@@ -891,6 +897,8 @@ impl SaveFailure {
         if let Some(status) = response_status(error) {
             return if status == StatusCode::BAD_GATEWAY || status == StatusCode::GATEWAY_TIMEOUT {
                 Self::Unanswered
+            } else if status.is_server_error() {
+                Self::ServerError
             } else {
                 Self::Refused
             };
@@ -931,6 +939,10 @@ fn failed_save(
         SaveFailure::NotSent | SaveFailure::Refused => error,
         SaveFailure::Unreadable => error.context(format!(
             "Agent Stream answered the save of surface '{id}' with success, but its answer could not be read; {check}"
+        )),
+        SaveFailure::ServerError => error.context(format!(
+            "Agent Stream answered the save of surface '{id}' with a server error, so it may have been saved anyway; \
+             {check}"
         )),
         SaveFailure::Unanswered => {
             error.context(format!("Agent Stream gave no answer, so surface '{id}' may have been saved anyway; {check}"))

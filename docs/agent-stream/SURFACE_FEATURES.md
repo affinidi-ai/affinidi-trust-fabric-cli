@@ -207,10 +207,11 @@ When the send fails, the error depends on how far it got:
 | --- | --- | --- |
 | The CLI could not reach Agent Stream: the host lookup, the connection, or the TLS handshake failed | no | prints as it is |
 | Agent Stream refused the save, such as with a 400 | no | prints as it is |
+| Agent Stream answered with a server error, such as a 500 or 503, which can come after the surface was stored | maybe | says Agent Stream answered with a server error, so the surface may have been saved anyway |
 | No whole answer came back: a timeout, a dropped connection, an answer cut off, or a 502 or 504 from a proxy in front of Agent Stream | maybe | says the surface may have been saved anyway |
 | Agent Stream answered with success, but the answer was not JSON | maybe | says Agent Stream answered with success but the answer could not be read |
 
-In the last two cases, check the surface with `surfaces get <id>` or `surfaces features <id>` before running the command again, because a second `add-feature` or `remove-feature` can fail on the change the first one already made. `surfaces update` saves the same way, so its errors follow this table too.
+In the last three cases, check the surface with `surfaces get <id>` or `surfaces features <id>` before running the command again, because a second `add-feature` or `remove-feature` can fail on the change the first one already made. `surfaces update` saves the same way, so its errors follow this table too.
 
 After a save, table output lists each changed field with its old and new value, and `--output json` prints the surface as Agent Stream has it after the save. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`. Agent Stream has no dry run of its own, so its checks only run on a real save: a route another surface uses and the drift block on any surface, and those on failover targets, canary splits, and usage limits only on an `llm` surface.
 

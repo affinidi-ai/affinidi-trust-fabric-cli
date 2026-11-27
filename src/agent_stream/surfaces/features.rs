@@ -1616,6 +1616,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_save_answered_with_a_server_error_says_it_may_have_been_saved() {
+        for put in [
+            ("PUT /api/v1/pipes/s-1", "HTTP/1.1 500 Internal Server Error", "Failed to update surface: timeout"),
+            ("PUT /api/v1/pipes/s-1", "HTTP/1.1 503 Service Unavailable", ""),
+        ] {
+            let (host, requests) = scripted_agent_stream(vec![GET_STORED, put]).await;
+
+            let error = run_surfaces(&host, &["surfaces", "add-feature", "s-1", "rate-limit", "--json", RATE_LIMIT])
+                .await
+                .expect_err("the save got a server error");
+
+            let text = format!("{error:#}");
+            assert!(
+                text.starts_with(
+                    "Agent Stream answered the save of surface 's-1' with a server error, so it may have been saved \
+                     anyway; check it with `fabric agent-stream surfaces get s-1`"
+                ),
+                "{put:?}: {text}"
+            );
+            assert!(text.contains(put.2), "{put:?}: {text}");
+            assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE], "{put:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_save_agent_stream_refuses_prints_the_refusal_without_the_no_answer_advice() {
         for put in [
             ("PUT /api/v1/pipes/s-1", "HTTP/1.1 400 Bad Request", "Invalid LLM configuration: bad canary"),
