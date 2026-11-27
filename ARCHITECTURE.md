@@ -463,9 +463,10 @@ once, before a connection is resolved, by `AddFeatureArgs::checked` and
 `RemoveFeatureArgs::checked`, which return the `FeatureAddition` or `FeatureRemoval` that
 `add` and `remove` take, and `features` with no id needs no connection. When the send of a
 save fails, `SaveFailure` in `surfaces.rs` sorts the error: never sent (a connect
-`reqwest::Error`) and refused (any status but 502 or 504) print as they are, a
-success answer that is not JSON says it could not be read, and anything else says the
-surface may have been saved anyway. `budget`
+`reqwest::Error`) and refused (a status below 500) print as they are, a
+success answer that is not JSON says it could not be read, a server error says the surface
+may have been saved anyway, and anything else, a 502 or 504 included, says no answer came
+back, so the surface may have been saved anyway. `budget`
 reads `/v1/pipes/{id}/budget`, which Agent Stream gates on `metrics.view`, so a 403 that
 gives no reason of its own (`client::is_unexplained_agent_stream_forbidden`) names that
 permission.
