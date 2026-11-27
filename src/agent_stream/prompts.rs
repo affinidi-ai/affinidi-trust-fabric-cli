@@ -269,8 +269,10 @@ pub struct CreateArgs {
     label: Option<String>,
     /// JSON document of the template, or - for standard input. A file copied
     /// from `prompts get` carries `tenant_id`, `created_at`, and `updated_at`:
-    /// drop them, since Agent Stream sets them itself and refuses `tenant_id`
-    /// from an access token that belongs to no tenant.
+    /// drop them. Agent Stream sets `created_at` and `updated_at` itself. It
+    /// keeps a `tenant_id` from a browser session, so the copy would land in
+    /// the original template's tenant, and refuses one from an access token
+    /// that names another tenant or belongs to no tenant.
     #[arg(short, long)]
     file: Option<PathBuf>,
     /// Print the template that would be sent, or with --output json the

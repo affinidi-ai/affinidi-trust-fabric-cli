@@ -74,7 +74,7 @@ fabric agent-stream prompts create --file template.json
 | `--message ROLE=FILE` | One message of version 1: its role and a text file holding its content. Required with flags; repeat for each message, in order |
 | `--description` | What the template is for |
 | `--label` | Label of version 1 |
-| `--file` | A complete template document (`-` reads standard input). Can't be combined with the flags above. A file copied from `prompts get` carries `tenant_id`, `created_at` and `updated_at`: drop them, since Agent Stream sets them itself and refuses `tenant_id` from an access token that belongs to no tenant |
+| `--file` | A complete template document (`-` reads standard input). Can't be combined with the flags above. A file copied from `prompts get` carries `tenant_id`, `created_at` and `updated_at`: drop them. Agent Stream sets `created_at` and `updated_at` itself. It keeps a `tenant_id` from a browser session, so the copy would land in the original template's tenant, and refuses one from an access token that names another tenant or belongs to no tenant |
 | `--dry-run` | Print the template and send nothing. Needs no saved login |
 
 Good to know:
