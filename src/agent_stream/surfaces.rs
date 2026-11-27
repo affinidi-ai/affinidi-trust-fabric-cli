@@ -801,6 +801,33 @@ async fn update(
     .await
 }
 
+/// Changes surface `id` the way `surfaces update` does, for a command outside
+/// this module: reads the surface with [`read_live_surface`], builds the new
+/// one with `edit`, and hands it to [`save`].
+pub(super) async fn change_surface(
+    client: &GatewayClient,
+    id: &str,
+    dry_run: bool,
+    output: Output,
+    edit: impl FnOnce(&Value) -> Result<Value>,
+) -> Result<Option<String>> {
+    let path = surface_path(id)?;
+    let before = read_live_surface(client, &path, id).await?;
+    let after = edit(&before)?;
+    save(
+        client,
+        &Edit {
+            path: &path,
+            id,
+            before: &before,
+            dry_run,
+        },
+        after,
+        output,
+    )
+    .await
+}
+
 /// A surface read for a change, and how the change is to be saved.
 struct Edit<'a> {
     /// The API path of the surface.

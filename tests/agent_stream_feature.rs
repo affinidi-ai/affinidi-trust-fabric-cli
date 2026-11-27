@@ -2145,3 +2145,65 @@ fn a_surface_save_agent_stream_refuses_shows_its_reason_and_fails() {
         Some("PUT /api/v1/pipes/s-1 HTTP/1.1")
     );
 }
+
+/// An LLM surface on Anthropic, as `providers connect` reads it.
+#[cfg(feature = "agent-stream")]
+const SURFACE_ON_ANTHROPIC: &str = r#"{"id":"s-1","name":"Chat","updated_at":"2026-11-01T00:00:00Z",
+  "pipe_type":{"type":"llm","provider":{"provider_type":"anthropic","model":"claude-x","api_key_secret":"anthropic-key"}}}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_connect_lists_the_changed_provider_fields_and_saves_the_surface() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/llm-providers/custom", "200 OK", r#"{"raw":"{\"providers\":[]}","providers":[]}"#),
+        ("GET /api/v1/llm-providers", "200 OK", CATALOG),
+        ("GET /api/v1/pipes/s-1", "200 OK", SURFACE_ON_ANTHROPIC),
+        ("PUT /api/v1/pipes/s-1", "200 OK", "{}"),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["providers", "connect", "openai", "--surface", "s-1", "--secret", "openai-key", "--model", "gpt-4o-mini"],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("pipe_type.provider.provider_type: \"anthropic\" -> \"openai\""), "{text}");
+    assert!(text.contains("pipe_type.provider.model: \"claude-x\" -> \"gpt-4o-mini\""), "{text}");
+    assert!(text.contains("pipe_type.provider.api_key_secret: \"anthropic-key\" -> \"openai-key\""), "{text}");
+    assert!(text.contains("Updated surface 's-1'"), "{text}");
+    let sent = sent_body(&requests, "PUT /api/v1/pipes/s-1");
+    assert_eq!(
+        sent["pipe_type"]["provider"],
+        serde_json::json!({"provider_type": "openai", "model": "gpt-4o-mini", "api_key_secret": "openai-key"})
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_connect_refuses_a_disabled_model_exits_non_zero_and_saves_nothing() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/llm-providers/custom", "200 OK", r#"{"raw":"{\"providers\":[]}","providers":[]}"#),
+        ("GET /api/v1/llm-providers", "200 OK", CATALOG),
+        ("GET /api/v1/pipes/s-1", "200 OK", SURFACE_ON_ANTHROPIC),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["providers", "connect", "openai", "--surface", "s-1", "--secret", "openai-key", "--model", "gpt-4o"],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("model 'gpt-4o' is disabled in provider 'openai'"), "{text}");
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(
+        !request_lines(&requests)
+            .iter()
+            .any(|line| line.starts_with("PUT ")),
+        "{:?}",
+        request_lines(&requests)
+    );
+}

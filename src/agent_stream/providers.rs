@@ -12,6 +12,8 @@
 //! The catalog holds no API keys: a provider's key is a secret that a surface
 //! names.
 
+mod connect;
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -180,6 +182,46 @@ pub enum ProviderCommand {
     /// works as `providers update` does, --dry-run included.
     #[command(after_long_help = SET_PRICE_EXAMPLES)]
     SetPrice(SetPriceArgs),
+    /// Point an LLM surface at a provider, one of its models, and the stored
+    /// secret that holds the provider's API key.
+    ///
+    /// Sets the surface's `pipe_type.provider`: its `provider_type`, `model`,
+    /// and `api_key_secret`, and with --base-url its `base_url`. The secret is
+    /// named by its id (see `fabric agent-stream secrets list`); its value is
+    /// never read, sent, or printed. Before anything is saved, the CLI refuses a
+    /// model that is not in the provider's catalog entry or is disabled there,
+    /// a --secret that looks like an API key, and a --base-url for a provider
+    /// whose surface settings have no base URL (such as `anthropic`), since
+    /// Agent Stream would drop it. Without --model the surface keeps its
+    /// model, which must pass the same check. Providers a surface describes
+    /// with other fields, `azure` and `custom`, are refused; set those with
+    /// `surfaces update`. It warns about a provider that is disabled in the
+    /// catalog, and about a plain http --base-url to a host other than this
+    /// machine, which would carry the API key unencrypted.
+    ///
+    /// On a surface already on the provider, its other provider settings are
+    /// kept. Moving a surface to another provider keeps only `temperature`,
+    /// `max_tokens`, `top_p`, `frequency_penalty`, and `presence_penalty`, and
+    /// drops the rest, such as a base URL or an organization id, along with
+    /// `pipe_type.endpoint_path`, the upstream path Agent Stream's execute API
+    /// calls: they belong to the provider it leaves. Without --base-url, Agent
+    /// Stream then uses the catalog's. Surface variants and failover targets
+    /// that name their own provider are left as they are.
+    ///
+    /// The change goes through the same path as `surfaces update`: the CLI
+    /// reads the surface, refuses a deleted one or one that is not an LLM
+    /// surface, reads it again and stops if it was saved meanwhile, and
+    /// otherwise sends the whole surface. In place of the field-name check of
+    /// `surfaces update`, it writes only fields the provider takes. A change that leaves the surface as
+    /// it is sends nothing. Table output lists each changed field;
+    /// --output json prints the surface as Agent Stream has it after the
+    /// save. --dry-run shows the changes, or with --output json the changes
+    /// and the whole new surface, and saves nothing.
+    ///
+    /// Reading the Model catalog needs `llm_catalog.edit`, and reading and
+    /// changing the surface need `pipes.view` and `pipes.edit`.
+    #[command(after_long_help = connect::CONNECT_EXAMPLES)]
+    Connect(connect::ConnectArgs),
 }
 
 /// Examples shown at the bottom of `providers list --help`.
@@ -422,6 +464,12 @@ pub async fn run(
         ProviderCommand::EnableModel(args) => set_enabled(&client, args, true, output).await,
         ProviderCommand::DisableModel(args) => set_enabled(&client, args, false, output).await,
         ProviderCommand::SetPrice(args) => set_price(&client, args, output).await,
+        ProviderCommand::Connect(args) => {
+            if let Some(printed) = connect::run(&client, args, output).await? {
+                println!("{printed}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2255,6 +2303,15 @@ mod tests {
                 let name = arg
                     .get_long()
                     .unwrap_or_default();
+                if command.get_name() == "connect" && name == "secret" {
+                    // `connect --secret` takes the id of a stored secret.
+                    let help = arg
+                        .get_help()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    assert!(help.contains("not the key itself"), "{help}");
+                    continue;
+                }
                 assert!(!name.contains("key") && !name.contains("secret"), "{} --{name}", command.get_name());
             }
         }
