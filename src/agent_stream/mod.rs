@@ -253,8 +253,9 @@ enum AgentStreamCommand {
     /// Drift monitoring compares a surface's recent answers with a pinned
     /// baseline, dimension by dimension. Reading needs the `drift.view`
     /// permission; starting or cancelling a run and re-pinning the baseline
-    /// need `drift.manage`, and `drift run` and `drift baseline set` also read
-    /// with `drift.view` before they ask. Both are administrator-only by
+    /// need `drift.manage`. `drift run` also needs `drift.view` unless
+    /// --force is given, and `drift baseline set` unless --yes is given, for
+    /// the reads they make before they ask. Both are administrator-only by
     /// default.
     Drift {
         #[command(subcommand)]

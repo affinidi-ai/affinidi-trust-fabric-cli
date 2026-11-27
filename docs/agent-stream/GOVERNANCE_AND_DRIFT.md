@@ -224,7 +224,7 @@ Without a terminal and without `--yes`, the command refuses before sending anyth
 | `--target` | Replay against this surface instead. Naming the surface itself is the same as leaving it out |
 | `--variant` | Replay against this variant (by its alias) of the target, or of the surface |
 | `--wait` | Wait until the run ends |
-| `--timeout` | With `--wait`, stop waiting when the run is still in progress after this long, such as `30m` or `2h`. The run goes on |
+| `--timeout` | With `--wait`, stop waiting when the run is still in progress after this long, such as `30m` or `2h`, at most `30d`. The run goes on |
 | `--yes` | Start without asking |
 | `--force` | Start even though a run is already in progress |
 
@@ -232,7 +232,7 @@ With `--variant`, or a `--target` other than the surface itself, the run is an e
 
 Without `--wait`, the command prints `Started drift run '<id>' on surface '<id>'.` (with `--output json`, the run as Agent Stream answered, its samples hidden) and exits. `drift run` has no `--reveal`; `drift runs get <id> --reveal` shows a run's samples.
 
-With `--wait`, progress goes to standard error whenever it changes, such as `drift run '<id>': running, 12 of 50 sessions done`. When the run ends, it is printed with its samples hidden, and the command exits 1 if the run did not complete: `error: drift run '<id>' ended cancelled`. A read of the run that fails with a server error or no answer is tried again, up to 5 times in a row. After that, or after any other failure such as a refusal, the command stops waiting and says that the run may still be going, with the `drift runs get` and `drift cancel` commands for it. With `--timeout`, the command also stops waiting when the run is still in progress after that long, and exits 1 with the same advice, so a script never waits forever. When the waiting starts, the `drift cancel` command for the run is printed on standard error; Ctrl-C then stops waiting without cancelling the run.
+With `--wait`, progress goes to standard error whenever it changes, such as `drift run '<id>': running, 12 of 50 sessions done`. When the run ends, it is printed with its samples hidden, and the command exits 1 if the run did not complete: `error: drift run '<id>' ended cancelled`. A read of the run that fails with a server error or no answer is tried again, up to 5 times in a row. After that, or after any other failure such as a refusal, the command stops waiting and says that the run may still be going, with the `drift runs get` and `drift cancel` commands for it. With `--timeout`, the command also stops waiting when the run is still in progress after that long, however slowly Agent Stream answers, and exits 1 with the same advice, so a script never waits forever. A value over 30 days is refused before the run starts. When the waiting starts, the `drift cancel` command for the run is printed on standard error; Ctrl-C then stops waiting without cancelling the run.
 
 ### Cancel a run
 

@@ -7,7 +7,7 @@
 //! hold the replayed prompts and answers, which are hidden unless one run is
 //! asked for with `--reveal` (see [`prompt_content`]).
 
-use std::time::{Duration, Instant};
+use std::{future::Future, time::Duration};
 
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
@@ -69,6 +69,9 @@ const IN_PROGRESS: &[&str] = &["pending", "running"];
 /// error or no answer before it stops waiting.
 const WAIT_ATTEMPTS: u32 = 5;
 
+/// The longest `drift run --wait --timeout` accepts: thirty days.
+const MAX_WAIT_TIMEOUT: u64 = 2_592_000;
+
 #[derive(Debug, Subcommand)]
 pub enum DriftCommand {
     /// Show a surface's drift verdict against its baseline.
@@ -108,8 +111,9 @@ pub enum DriftCommand {
     /// given. That check reads the runs of the surface and the target, and
     /// the 200 most recent runs this login can see for runs from other
     /// surfaces that target them. When the command asked you to confirm, it
-    /// checks again after you answer. It needs `drift.view` as well as the
-    /// `drift.manage` the run needs. Agent Stream itself doesn't stop two
+    /// checks again after you answer. Unless --force is given, the command
+    /// needs `drift.view` for that check as well as the `drift.manage` the
+    /// run needs. Agent Stream itself doesn't stop two
     /// runs at once, so the check narrows the window for one but can't close
     /// it.
     ///
@@ -124,7 +128,8 @@ pub enum DriftCommand {
     /// fails with a server error or no answer is tried again, up to 5 times in
     /// a row; then the command stops waiting and says how to check or cancel
     /// the run. With --timeout, it also stops waiting when the run is still
-    /// in progress after that long, and exits 1 with the same advice. Ctrl-C
+    /// in progress after that long (at most 30 days), however slowly Agent
+    /// Stream answers, and exits 1 with the same advice. Ctrl-C
     /// stops waiting without cancelling the run; the command to cancel it is
     /// printed when the waiting starts.
     #[command(after_long_help = RUN_EXAMPLES)]
@@ -252,8 +257,8 @@ pub struct RunArgs {
     #[arg(long)]
     force: bool,
     /// With --wait, stop waiting when the run is still in progress after this
-    /// long, such as 30m or 2h. The run goes on. Without it, the command
-    /// waits until the run ends.
+    /// long, such as 30m or 2h, and at most 30d. The run goes on. Without it,
+    /// the command waits until the run ends.
     #[arg(long, requires = "wait")]
     timeout: Option<String>,
 }
@@ -360,7 +365,13 @@ pub async fn run(
             }
             print_value(&run, output)
         }
-        DriftCommand::Run(args) => start_run(client, args, output).await,
+        DriftCommand::Run(args) => {
+            let surface = args.surface.clone();
+            start_run(client, args, output, move |prompt| async move {
+                confirm_action("start a drift run on", &surface, async { prompt }).await
+            })
+            .await
+        }
         DriftCommand::Cancel { run_id } => {
             let id = path_id("run id", &run_id, MAX_ID)?;
             let path = with_query(CANCEL_PATH, &[("run_id", Some(id.to_owned()))]);
@@ -689,11 +700,18 @@ async fn spend_caps(
     (sessions, cost)
 }
 
-async fn start_run(
+/// Starts a drift run. `confirm` asks the question it is given and says
+/// whether the answer was yes; it is only called without --yes.
+async fn start_run<C, F>(
     client: &GatewayClient,
     args: RunArgs,
     output: Output,
-) -> Result<()> {
+    confirm: C,
+) -> Result<()>
+where
+    C: FnOnce(String) -> F,
+    F: Future<Output = Result<bool>>,
+{
     let mut args = args;
     path_id("surface id", &args.surface, MAX_ID)?;
     if let Some(target) = &args.target {
@@ -712,8 +730,11 @@ async fn start_run(
         .timeout
         .as_deref()
         .map(|timeout| parse_duration("--timeout", timeout))
-        .transpose()?
-        .map(Duration::from_secs);
+        .transpose()?;
+    if timeout.is_some_and(|seconds| seconds > MAX_WAIT_TIMEOUT) {
+        bail!("--timeout can be at most 30d");
+    }
+    let timeout = timeout.map(Duration::from_secs);
 
     if !args.force {
         refuse_if_busy(client, &args).await?;
@@ -739,7 +760,7 @@ async fn start_run(
              Session cap: {sessions}. Cost cap: {cost}.{kind} Start the run?",
             flatten(&args.surface)
         );
-        if !confirm_action("start a drift run on", &args.surface, async { prompt }).await? {
+        if !confirm(prompt).await? {
             bail!("drift run not started");
         }
         // The prompt can stay open for minutes, long enough for someone else
@@ -794,7 +815,7 @@ async fn start_run(
          with `fabric agent-stream drift cancel {id}`.",
         id = flatten(&run_id)
     );
-    let finished = wait_for(client, &run_id, timeout).await?;
+    let finished = wait_at_most(client, &run_id, timeout).await?;
     let mut shown = finished.clone();
     prompt_content::mask(&mut shown, Item::DriftRun, LIST_MASKED_VALUE);
     print_value(&shown, output)?;
@@ -842,15 +863,30 @@ fn still_going(run_id: &str) -> String {
     )
 }
 
-/// Reads the run until it is neither pending nor running, printing its
-/// progress on standard error whenever it changes. With `timeout`, stops
-/// waiting once the run is still in progress after that long.
-async fn wait_for(
+/// Waits for the run to end, for at most `timeout` when given. The limit
+/// holds over the whole wait, a read that hangs included.
+async fn wait_at_most(
     client: &GatewayClient,
     run_id: &str,
     timeout: Option<Duration>,
 ) -> Result<Value> {
-    let deadline = timeout.map(|timeout| (Instant::now() + timeout, timeout));
+    let Some(limit) = timeout else {
+        return wait_for(client, run_id).await;
+    };
+    match tokio::time::timeout(limit, wait_for(client, run_id)).await {
+        Ok(finished) => finished,
+        Err(_) => {
+            bail!("stopped waiting after {} (--timeout); {}", describe_seconds(limit.as_secs()), still_going(run_id))
+        }
+    }
+}
+
+/// Reads the run until it is neither pending nor running, printing its
+/// progress on standard error whenever it changes.
+async fn wait_for(
+    client: &GatewayClient,
+    run_id: &str,
+) -> Result<Value> {
     let mut last = None;
     loop {
         let run = read_run_retrying(client, run_id).await?;
@@ -861,9 +897,6 @@ async fn wait_for(
             .to_owned();
         if !IN_PROGRESS.contains(&status.as_str()) {
             return Ok(run);
-        }
-        if let Some((_, timeout)) = deadline.filter(|(deadline, _)| Instant::now() >= *deadline) {
-            bail!("stopped waiting after {} (--timeout); {}", describe_seconds(timeout.as_secs()), still_going(run_id));
         }
         let done = run
             .get("progress_done")
@@ -1399,7 +1432,7 @@ mod tests {
             r#"{"id":"run-9","status":"running","progress_done":1,"total":3}"#,
         )])
         .await;
-        let error = wait_for(&client_for(host).await, "run-9", Some(Duration::from_millis(20)))
+        let error = wait_at_most(&client_for(host).await, "run-9", Some(Duration::from_millis(20)))
             .await
             .expect_err("timed out")
             .to_string();
@@ -1408,6 +1441,90 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("`fabric agent-stream drift cancel run-9`"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_run_wait_timeout_holds_while_a_read_hangs() {
+        // A host that accepts the connection and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let host = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("addr")
+        );
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = wait_at_most(&client_for(host).await, "run-10", Some(Duration::from_millis(50)))
+            .await
+            .expect_err("timed out")
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "waited {:?}", started.elapsed());
+        assert!(error.contains("drift run 'run-10' may still be going"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_run_refuses_a_timeout_over_30_days_before_starting() {
+        let (result, requests) = run_with(
+            vec![],
+            &["run", "--surface", "s1", "--yes", "--force", "--wait", "--timeout", "10000000000000000000s"],
+        )
+        .await;
+        let error = result
+            .expect_err("too long")
+            .to_string();
+        assert!(error.contains("--timeout"), "{error}");
+        assert!(requests.is_empty());
+        let (result, requests) =
+            run_with(vec![], &["run", "--surface", "s1", "--yes", "--force", "--wait", "--timeout", "31d"]).await;
+        assert_eq!(
+            result
+                .expect_err("over the maximum")
+                .to_string(),
+            "--timeout can be at most 30d"
+        );
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_run_checks_again_after_confirming_and_sends_nothing_when_busy() {
+        let (host, requests) = scripted_agent_stream_in_order(vec![
+            ("GET /api/v1/drift/runs?surface_id=s1", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/drift/runs?limit=200", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/pipes/s1", "HTTP/1.1 200 OK", "{}"),
+            (
+                "GET /api/v1/drift/runs?surface_id=s1",
+                "HTTP/1.1 200 OK",
+                r#"[{"id":"late","surface_id":"s1","status":"running"}]"#,
+            ),
+        ])
+        .await;
+        let Drift {
+            command: DriftCommand::Run(args),
+        } = Drift::parse_from(["drift", "run", "--surface", "s1"])
+        else {
+            panic!("expected run");
+        };
+        let error = start_run(&client_for(host).await, args, Output::Json, |_| async { Ok(true) })
+            .await
+            .expect_err("busy after confirming")
+            .to_string();
+        assert!(error.contains("drift run 'late' on surface 's1' is in progress"), "{error}");
+        let sent = start_lines(&requests);
+        assert_eq!(sent.len(), 4, "{sent:?}");
+        assert!(
+            !sent
+                .iter()
+                .any(|line| line.starts_with("POST")),
+            "{sent:?}"
+        );
     }
 
     #[tokio::test]
