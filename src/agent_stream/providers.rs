@@ -721,7 +721,8 @@ async fn create(
     let catalog = Catalog::read(client).await?;
     if catalog.has_exact_built_in_id(&id) {
         bail!(
-            "'{id}' is a built-in provider; choose another id, or change the built-in one with `fabric agent-stream providers update {id}`"
+            "'{id}' is a built-in provider; choose another id, or change the built-in one with `fabric agent-stream providers \
+             update {id}` (the next catalog refresh undoes that change)"
         );
     }
     if catalog.has_exact_custom_id(&id) {
@@ -1576,6 +1577,7 @@ mod tests {
         .await;
         let text = error_text(result);
         assert!(text.contains("'openai' is a built-in provider; choose another id"), "{text}");
+        assert!(text.contains("the next catalog refresh undoes that change"), "{text}");
         assert!(!text.contains("earlier run"), "{text}");
         assert_eq!(sent_writes(&requests), 0);
     }
