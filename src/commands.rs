@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use crate::{
     client::{
-        GatewayClient, id_from_response, pretty_json_for_terminal, response_status, sanitize_for_terminal,
-        sanitize_multiline, sanitize_whole,
+        GatewayClient, TERMS_ACCEPTANCE_REQUIRED, id_from_response, pretty_json_for_terminal, response_code,
+        response_status, sanitize_for_terminal, sanitize_multiline, sanitize_whole,
     },
     config::{Config, Connection, normalize_host, normalize_user_host, saved_host_http_warning},
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
@@ -962,7 +962,7 @@ const SETTINGS_RESET_EXAMPLES: &str = r#"Examples:
     fabric agent-gateway settings reset --force"#;
 
 #[derive(Debug, Subcommand)]
-enum UserSettingsCommand {
+pub(crate) enum UserSettingsCommand {
     /// Show this user's settings.
     ///
     /// Without --overrides this is the effective document — appliance defaults
@@ -1024,7 +1024,7 @@ const USER_SETTINGS_RESET_EXAMPLES: &str = r#"Examples:
     fabric agent-gateway user-settings set --file overrides.json"#;
 
 #[derive(Debug, Subcommand)]
-enum TermsCommand {
+pub(crate) enum TermsCommand {
     /// Show the Terms of Use definitions.
     Show,
     /// Show the terms that apply to this gateway.
@@ -1073,7 +1073,7 @@ const TERMS_DRAFT_EXAMPLES: &str = r#"Examples:
     }"#;
 
 #[derive(Debug, Subcommand)]
-enum NotificationCommand {
+pub(crate) enum NotificationCommand {
     /// Manage the welcome notification sent to newly approved users.
     #[command(name = "welcome-template")]
     WelcomeTemplate {
@@ -1101,7 +1101,7 @@ and fires any integration bound to the user.accessed event. Prints a
 confirmation line, or null with --output json."#;
 
 #[derive(Debug, Subcommand)]
-enum WelcomeTemplateCommand {
+pub(crate) enum WelcomeTemplateCommand {
     /// Show the welcome notification template.
     Show,
     /// Replace the welcome notification template from a JSON document.
@@ -1125,31 +1125,31 @@ const NOTIFICATIONS_WELCOME_TEMPLATE_SET_EXAMPLES: &str = r#"Examples:
       agent-gateway notifications welcome-template set --file -"#;
 
 #[derive(Debug, Args)]
-struct GuardedJsonFileArgs {
+pub(crate) struct GuardedJsonFileArgs {
     /// JSON request body. Use '-' to read from standard input.
     #[arg(short, long)]
-    file: PathBuf,
+    pub(crate) file: PathBuf,
     /// Submit a document carrying fields a per-user update cannot store. A
     /// document carrying `feature_flags.terms` is still refused.
     #[arg(long)]
-    force: bool,
+    pub(crate) force: bool,
 }
 
 #[derive(Debug, Args)]
-struct SendWelcomeArgs {
+pub(crate) struct SendWelcomeArgs {
     /// Gateway user id of the recipient.
     #[arg(long)]
-    user_id: String,
+    pub(crate) user_id: String,
     /// Heading shown in the recipient's notification feed.
     #[arg(long)]
-    title: String,
+    pub(crate) title: String,
     /// Body of the notification.
     #[arg(long)]
-    message: String,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Subcommand)]
-enum CrudCommand {
+pub(crate) enum CrudCommand {
     /// List entities.
     List,
     /// Get an entity by ID.
@@ -2080,13 +2080,15 @@ fn run_offline(cli: &AgentGatewayArgs) -> Option<Result<()>> {
 
 /// Runs one command, on the appliance it is addressed to. Both the one-shot
 /// CLI and the interactive shell print what this returns, so every gateway
-/// command's error passes through `add_terms_hint` here, and only here: the
-/// gateway's Terms gate can refuse any route, not only the terms ones.
+/// command's error passes through `add_terms_hint` here: the gateway's Terms
+/// gate can refuse any route, not only the terms ones. Agent Stream's Terms
+/// gate can refuse any route too, so `crate::agent_stream::dispatch` gives
+/// every Agent Stream command's error the same hint.
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.appliance {
         Appliance::AgentGateway(args) => dispatch(*args)
             .await
-            .map_err(add_terms_hint),
+            .map_err(|error| add_terms_hint(Product::AgentGateway, error)),
         #[cfg(feature = "agent-stream")]
         Appliance::AgentStream(args) => crate::agent_stream::dispatch(*args).await,
     }
@@ -2198,8 +2200,14 @@ async fn dispatch_with(
 }
 
 /// A command of a group Agent Gateway and Agent Stream share, which `fabric
-/// agent-stream` runs through [`run_and_print`] so that it prints the same
-/// tables and confirmation lines as on Agent Gateway.
+/// agent-stream` runs through [`run_shared`] so that it prints the same tables
+/// and confirmation lines as on Agent Gateway. Every variant but
+/// `TenantOwnership` maps onto an Agent Gateway [`Command`] and runs through
+/// [`run_and_print`]; `TenantOwnership` runs through [`run_ownership_change`],
+/// which the Agent Gateway command ends in too. A variant with `ask_first`
+/// holds a delete or a revoke that must be confirmed at a prompt first: on
+/// Agent Stream it asks unless --yes is given, while the Agent Gateway command
+/// of the same name never asks and never comes here.
 #[cfg(feature = "agent-stream")]
 pub(crate) enum SharedCommand {
     Secrets {
@@ -2209,80 +2217,382 @@ pub(crate) enum SharedCommand {
     Users(UserCommand),
     Identities(IdentityCommand),
     ApiKeys(ApiKeyCommand),
-    /// `ask_first` is set for a delete that must be confirmed at a prompt
-    /// first. Agent Stream's `policies delete` asks unless --yes is given;
-    /// Agent Gateway's `policies delete` never asks and never comes here.
     Policies {
         command: PolicyCommand,
         ask_first: bool,
     },
     Settings(SettingsCommand),
+    UserSettings(UserSettingsCommand),
+    Terms(TermsCommand),
+    Notifications(NotificationCommand),
+    /// Agent Stream tracks ownership for other resource kinds than Agent
+    /// Gateway, so the kind arrives as its path name rather than as an
+    /// [`OwnershipKind`].
+    TenantOwnership(OwnershipChange),
+    /// Agent Stream never returns a certificate's private key, so there is
+    /// nothing to reveal: a key that appears anyway is removed, with a note.
+    Certificates {
+        command: CrudCommand,
+        ask_first: bool,
+    },
+    CredentialProviders {
+        command: CrudCommand,
+        ask_first: bool,
+    },
+    JwtVerificationStrategies {
+        command: JwtStrategyCommand,
+        ask_first: bool,
+    },
+    DelegationVault {
+        command: DelegationVaultCommand,
+        ask_first: bool,
+    },
     Audit(AuditCommand),
     Metrics(MetricsCommand),
     Logs(LogsCommand),
 }
 
-#[cfg(feature = "agent-stream")]
-impl From<SharedCommand> for Command {
-    fn from(command: SharedCommand) -> Self {
-        match command {
-            SharedCommand::Secrets { command, reveal } => Self::Secrets { command, reveal },
-            SharedCommand::Users(command) => Self::Users { command },
-            SharedCommand::Identities(command) => Self::Identities { command },
-            SharedCommand::ApiKeys(command) => Self::ApiKeys { command },
-            SharedCommand::Policies { command, .. } => Self::Policies { command },
-            SharedCommand::Settings(command) => Self::Settings { command },
-            SharedCommand::Audit(command) => Self::Audit { command },
-            SharedCommand::Metrics(command) => Self::Metrics { command },
-            SharedCommand::Logs(command) => Self::Logs { command },
-        }
-    }
-}
-
 /// Runs one shared command on the appliance behind `client` and prints its
-/// answer as the Agent Gateway command of the same name does. A `policies
-/// delete` with `ask_first` set first asks at a prompt naming the policy and
-/// the host, and prints an `Aborted.` line and sends no delete when the answer
-/// is not yes.
+/// answer as the Agent Gateway command of the same name does. A delete or a
+/// revoke with `ask_first` set is first confirmed at the terminal, as
+/// [`run_shared_with`] describes.
 #[cfg(feature = "agent-stream")]
 pub(crate) async fn run_shared(
     client: &GatewayClient,
     command: SharedCommand,
     output: Output,
 ) -> Result<()> {
-    if let SharedCommand::Policies {
-        command: PolicyCommand::Delete { policy_id },
-        ask_first: true,
-    } = &command
-    {
-        let path = entity_path("/v1/policy-definitions", policy_id);
-        if !confirm_action("delete", policy_id, async {
-            format!("Delete policy {}?", describe_target(client, &path, policy_id).await)
-        })
-        .await?
-        {
-            println!("Aborted. Policy '{}' was not deleted.", sanitize_whole(policy_id));
-            return Ok(());
+    run_shared_with(client, command, output, &mut AtTheTerminal).await
+}
+
+/// [`run_shared`], with the confirmation prompt answered by `prompter`. A
+/// delete or a revoke with `ask_first` set first asks a question naming what
+/// it removes and the host, and when the answer is not yes it reports an
+/// `Aborted.` line and sends no delete or revoke. A `revoke-user` question
+/// says how many grants the grant list shows for the user hash, and when it
+/// shows none, asks whether to revoke anyway. Only `secrets` takes
+/// a document that --reveal could have unmasked, so in every other group a
+/// document still carrying a masked placeholder is refused with
+/// [`without_reveal_hint`]'s wording, which names no flag.
+#[cfg(feature = "agent-stream")]
+pub(crate) async fn run_shared_with(
+    client: &GatewayClient,
+    command: SharedCommand,
+    output: Output,
+    prompter: &mut impl Prompter,
+) -> Result<()> {
+    let offers_reveal = matches!(command, SharedCommand::Secrets { .. });
+    let result = run_shared_command(client, command, output, prompter).await;
+    result.map_err(|error| {
+        if offers_reveal {
+            error
+        } else {
+            without_reveal_hint(error)
+        }
+    })
+}
+
+/// Where the confirmation of a shared command that asks first is answered.
+#[cfg(feature = "agent-stream")]
+pub(crate) trait Prompter {
+    /// Asks the question `question` builds and returns whether the answer is
+    /// yes. `verb` and `id` name the action in a refusal.
+    async fn ask(
+        &mut self,
+        verb: &str,
+        id: &str,
+        question: impl std::future::Future<Output = String>,
+    ) -> Result<bool>;
+
+    /// Reports, in `line`, that the action was not taken because the answer
+    /// was not yes.
+    fn aborted(
+        &mut self,
+        line: &str,
+    );
+}
+
+/// The [`Prompter`] of a real run: it asks on standard error, reads the answer
+/// from a terminal through [`confirm_action`], and prints the line saying the
+/// action was not taken on standard output.
+#[cfg(feature = "agent-stream")]
+struct AtTheTerminal;
+
+#[cfg(feature = "agent-stream")]
+impl Prompter for AtTheTerminal {
+    async fn ask(
+        &mut self,
+        verb: &str,
+        id: &str,
+        question: impl std::future::Future<Output = String>,
+    ) -> Result<bool> {
+        confirm_action(verb, id, question).await
+    }
+
+    fn aborted(
+        &mut self,
+        line: &str,
+    ) {
+        println!("{line}");
+    }
+}
+
+/// What a shared command that asks first is about to do: the `verb` and `id`
+/// a refusal names, the `action` its question starts with, the `target` the
+/// question describes, and the `aborted` line reported when the answer is no.
+#[cfg(feature = "agent-stream")]
+struct Confirmation<'a> {
+    verb: &'static str,
+    id: &'a str,
+    action: &'static str,
+    target: Target,
+    aborted: String,
+}
+
+/// What the question of a [`Confirmation`] shows beside the id and host.
+#[cfg(feature = "agent-stream")]
+enum Target {
+    /// One entity, whose name the question reads from this path.
+    Entity(String),
+    /// Every grant of a user hash, with how many there are once
+    /// [`Confirmation::with_grant_count`] has counted them, or `None` when
+    /// the grant list could not be read.
+    UserGrants { count: Option<usize> },
+}
+
+#[cfg(feature = "agent-stream")]
+impl<'a> Confirmation<'a> {
+    /// The confirmation of a delete of the entity at `path`, whose question
+    /// starts with `action` and whose `Aborted.` line names it as `what`.
+    fn delete(
+        id: &'a str,
+        action: &'static str,
+        what: &str,
+        path: String,
+    ) -> Self {
+        Self {
+            verb: "delete",
+            id,
+            action,
+            target: Target::Entity(path),
+            aborted: format!("Aborted. {what} '{}' was not deleted.", sanitize_whole(id)),
         }
     }
-    run_and_print(client, command.into(), output).await
+
+    /// This confirmation, with a revoke-user's grants counted from the grant
+    /// list: those whose `user_identity_hash` is the hash given. The count
+    /// stays unknown when the grant list can't be read, for example without
+    /// delegation_vault.view, or the answer is not a JSON array, and the
+    /// question then names every grant of the hash. Any other confirmation
+    /// comes back as it is.
+    async fn with_grant_count(
+        mut self,
+        client: &GatewayClient,
+    ) -> Self {
+        if let Target::UserGrants { count } = &mut self.target {
+            *count = count_user_grants(client, self.id).await;
+        }
+        self
+    }
+
+    /// The question asked at the prompt, naming the target and the host. When
+    /// the grant list shows no grant of the user hash, the question still
+    /// offers the revoke, since the revoke itself decides what is removed.
+    async fn question(
+        &self,
+        client: &GatewayClient,
+    ) -> String {
+        let host = sanitize_for_terminal(client.host());
+        let id = sanitize_whole(self.id);
+        match &self.target {
+            Target::Entity(path) => format!("{} {}?", self.action, describe_target(client, path, self.id).await),
+            Target::UserGrants { count: Some(0) } => {
+                format!("The grant list shows no grants of user hash {id} on {host}. Revoke anyway?")
+            }
+            Target::UserGrants { count: Some(1) } => format!("Revoke 1 grant of user hash {id} on {host}?"),
+            Target::UserGrants { count: Some(count) } => {
+                format!("Revoke {count} grants of user hash {id} on {host}?")
+            }
+            Target::UserGrants { count: None } => format!("{} {id} on {host}?", self.action),
+        }
+    }
+}
+
+/// How many grants in the grant list carry `user_hash` as their
+/// `user_identity_hash`, or `None` when the list cannot be read or is not a
+/// JSON array.
+#[cfg(feature = "agent-stream")]
+async fn count_user_grants(
+    client: &GatewayClient,
+    user_hash: &str,
+) -> Option<usize> {
+    let grants = client
+        .request(Method::GET, DELEGATION_VAULT_PATH, None)
+        .await
+        .ok()?;
+    Some(
+        grants
+            .as_array()?
+            .iter()
+            .filter(|grant| string_field(grant, "user_identity_hash") == Some(user_hash))
+            .count(),
+    )
 }
 
 #[cfg(feature = "agent-stream")]
 impl SharedCommand {
-    /// Fails, as [`refuse_without_terminal`] does, for an Agent Stream
-    /// `policies delete` that would ask for a confirmation nobody can give.
-    /// Called before the host is asked which product it is, so a refused
-    /// delete sends nothing at all.
-    pub(crate) fn refuse_unconfirmed_policy_delete(&self) -> Result<()> {
+    /// What this command asks before it runs, or `None` when it runs at once:
+    /// a delete or a revoke with `ask_first` set.
+    fn confirmation(&self) -> Option<Confirmation<'_>> {
         match self {
             Self::Policies {
                 command: PolicyCommand::Delete { policy_id },
                 ask_first: true,
-            } => refuse_without_terminal("delete", policy_id, false),
-            _ => Ok(()),
+            } => Some(Confirmation::delete(
+                policy_id,
+                "Delete policy",
+                "Policy",
+                entity_path("/v1/policy-definitions", policy_id),
+            )),
+            Self::Certificates {
+                command: CrudCommand::Delete { id },
+                ask_first: true,
+            } => {
+                Some(Confirmation::delete(id, "Delete certificate", "Certificate", entity_path(CERTIFICATES_PATH, id)))
+            }
+            Self::CredentialProviders {
+                command: CrudCommand::Delete { id },
+                ask_first: true,
+            } => Some(Confirmation::delete(
+                id,
+                "Delete credential provider",
+                "Credential provider",
+                entity_path(CREDENTIAL_PROVIDERS_PATH, id),
+            )),
+            Self::JwtVerificationStrategies {
+                command: JwtStrategyCommand::Crud(CrudCommand::Delete { id }),
+                ask_first: true,
+            } => Some(Confirmation::delete(
+                id,
+                "Delete JWT verification strategy",
+                "JWT verification strategy",
+                entity_path(JWT_STRATEGIES_PATH, id),
+            )),
+            Self::DelegationVault {
+                command: DelegationVaultCommand::Revoke { id },
+                ask_first: true,
+            } => Some(Confirmation {
+                verb: "revoke",
+                id,
+                action: "Revoke grant",
+                target: Target::Entity(encoded_path(DELEGATION_VAULT_PATH, id)),
+                aborted: format!("Aborted. Grant '{}' was not revoked.", sanitize_whole(id)),
+            }),
+            Self::DelegationVault {
+                command: DelegationVaultCommand::RevokeUser { user_hash },
+                ask_first: true,
+            } => Some(Confirmation {
+                verb: "revoke",
+                id: user_hash,
+                action: "Revoke every grant of user hash",
+                target: Target::UserGrants { count: None },
+                aborted: format!("Aborted. The grants of user hash '{}' were not revoked.", sanitize_whole(user_hash)),
+            }),
+            _ => None,
         }
     }
+
+    /// This command, with a `certificates delete`'s certificate given by the
+    /// id [`resolve_id`] finds for the id or name typed, so the question names
+    /// the certificate that is deleted, and an unknown or ambiguous name is
+    /// refused before anything is asked. Every other command comes back as it
+    /// is.
+    async fn with_resolved_certificate(
+        self,
+        client: &GatewayClient,
+    ) -> Result<Self> {
+        match self {
+            Self::Certificates {
+                command: CrudCommand::Delete { id },
+                ask_first,
+            } => Ok(Self::Certificates {
+                command: CrudCommand::Delete {
+                    id: resolve_id(client, &CERTIFICATE_LOOKUP, &id).await?,
+                },
+                ask_first,
+            }),
+            command => Ok(command),
+        }
+    }
+
+    /// Fails, as [`refuse_without_terminal`] does, for a delete or a revoke
+    /// that would ask for a confirmation nobody can give. Called before the
+    /// host is asked which product it is, so a refused command sends nothing
+    /// at all.
+    pub(crate) fn refuse_unconfirmed_removal(&self) -> Result<()> {
+        match self.confirmation() {
+            Some(confirmation) => refuse_without_terminal(confirmation.verb, confirmation.id, false),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+async fn run_shared_command(
+    client: &GatewayClient,
+    command: SharedCommand,
+    output: Output,
+    prompter: &mut impl Prompter,
+) -> Result<()> {
+    let command = command
+        .with_resolved_certificate(client)
+        .await?;
+    if let Some(confirmation) = command.confirmation() {
+        let confirmation = confirmation
+            .with_grant_count(client)
+            .await;
+        if !prompter
+            .ask(confirmation.verb, confirmation.id, confirmation.question(client))
+            .await?
+        {
+            prompter.aborted(&confirmation.aborted);
+            return Ok(());
+        }
+    }
+    let command = match command {
+        SharedCommand::TenantOwnership(change) => {
+            let value = run_ownership_change(client, change).await?;
+            return print_value(&value, output);
+        }
+        SharedCommand::Secrets { command, reveal } => Command::Secrets { command, reveal },
+        SharedCommand::Users(command) => Command::Users { command },
+        SharedCommand::Identities(command) => Command::Identities { command },
+        SharedCommand::ApiKeys(command) => Command::ApiKeys { command },
+        SharedCommand::Policies { command, .. } => Command::Policies { command },
+        SharedCommand::Settings(command) => Command::Settings { command },
+        SharedCommand::UserSettings(command) => Command::UserSettings { command },
+        SharedCommand::Terms(command) => Command::Terms { command },
+        SharedCommand::Notifications(command) => Command::Notifications { command },
+        // The id was resolved before the question was asked, so the delete
+        // goes to exactly the certificate the question named.
+        SharedCommand::Certificates {
+            command: CrudCommand::Delete { id },
+            ..
+        } => {
+            return match delete_certificate(client, &id, output).await? {
+                Some(value) => print_value(&value, output),
+                None => Ok(()),
+            };
+        }
+        SharedCommand::Certificates { command, .. } => Command::Certificates { command, reveal: false },
+        SharedCommand::CredentialProviders { command, .. } => Command::CredentialProviders { command },
+        SharedCommand::JwtVerificationStrategies { command, .. } => Command::JwtVerificationStrategies { command },
+        SharedCommand::DelegationVault { command, .. } => Command::DelegationVault { command },
+        SharedCommand::Audit(command) => Command::Audit { command },
+        SharedCommand::Metrics(command) => Command::Metrics { command },
+        SharedCommand::Logs(command) => Command::Logs { command },
+    };
+    run_and_print(client, command, output).await
 }
 
 /// Runs a command that talks to the appliance behind `client` and prints the
@@ -2359,7 +2669,7 @@ async fn run_and_print(
         Command::Payments { command } => return run_payments(client, command, output).await,
         Command::Metrics { command } => return run_metrics(client, command, output).await,
         Command::Logs { command } => return run_logs(client, command, output).await,
-        Command::CredentialProviders { command } => run_crud(client, "/v1/credential-providers", command).await?,
+        Command::CredentialProviders { command } => run_crud(client, CREDENTIAL_PROVIDERS_PATH, command).await?,
         Command::Certificates { command, reveal } => match run_certificates(client, command, reveal, output).await? {
             Some(value) => value,
             None => return Ok(()),
@@ -3723,13 +4033,18 @@ async fn run_user_settings(
         }
         UserSettingsCommand::Set(args) => {
             let body = read_json(&args.file)?;
+            let product = client.product();
             // First, because a merged `show` document carries the flag and the
             // merged-document refusal points at --force, which cannot help here.
-            reject_runtime_terms_flag(&body, "user-settings show")?;
-            if !args.force {
-                reject_unknown_user_settings(&body)?;
+            // Only Agent Gateway fills `feature_flags.terms` in on every read;
+            // Agent Stream stores that flag like any other.
+            if product == Product::AgentGateway {
+                reject_runtime_terms_flag(&body, "user-settings show")?;
             }
-            warn_each(user_settings_write_warnings(&body));
+            if !args.force {
+                reject_unknown_user_settings(product, &body)?;
+            }
+            warn_each(user_settings_write_warnings(product, &body));
             client
                 .request(Method::POST, "/v1/user-settings", Some(body))
                 .await
@@ -3758,13 +4073,17 @@ fn without_password_hash(mut value: Value) -> Value {
 /// document came from `user-settings show` without `--overrides`, which merges
 /// in appliance defaults, so sending it persists each of those defaults as a
 /// personal override that only `reset` can clear.
-fn reject_unknown_user_settings(body: &Value) -> Result<()> {
+fn reject_unknown_user_settings(
+    product: Product,
+    body: &Value,
+) -> Result<()> {
     let unknown = unknown_user_settings_fields(body);
     if unknown.is_empty() {
         return Ok(());
     }
+    let command = product.command();
     bail!(
-        "this document carries {} field(s) a per-user update cannot store: {}. It came from `fabric agent-gateway user-settings show` without --overrides, which merges in appliance defaults, so sending it would persist those defaults as personal overrides. Start from `fabric agent-gateway user-settings show --overrides`, or re-run with --force",
+        "this document carries {} field(s) a per-user update cannot store: {}. It came from `{command} user-settings show` without --overrides, which merges in appliance defaults, so sending it would persist those defaults as personal overrides. Start from `{command} user-settings show --overrides`, or re-run with --force",
         unknown.len(),
         unknown.join(", ")
     )
@@ -3794,17 +4113,25 @@ const USER_SETTINGS_FIELDS: &[&str] = &[
     "feature_flags",
 ];
 
-fn user_settings_write_warnings(body: &Value) -> Vec<String> {
+fn user_settings_write_warnings(
+    product: Product,
+    body: &Value,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     if !body.is_object() {
         return warnings;
     }
     let ignored = unknown_user_settings_fields(body);
     if !ignored.is_empty() {
-        warnings.push(format!(
-            "ignored by the gateway: {}. A document carrying these came from `user-settings show` without --overrides, which merges in appliance defaults — every remaining field becomes a personal override",
-            ignored.join(", ")
-        ));
+        let ignored = ignored.join(", ");
+        warnings.push(match product {
+            Product::AgentGateway => format!(
+                "ignored by the gateway: {ignored}. A document carrying these came from `user-settings show` without --overrides, which merges in appliance defaults — every remaining field becomes a personal override"
+            ),
+            Product::AgentStream => format!(
+                "ignored by Agent Stream: {ignored}. A document carrying these came from `user-settings show` without --overrides, which merges in appliance defaults, so every remaining field becomes a personal override"
+            ),
+        });
     }
     if carries_value(body, "/feature_flags") {
         warnings.push(
@@ -3859,11 +4186,28 @@ async fn run_terms(
 }
 
 /// Terms failures carry a machine `code` and no message, so the raw body
-/// reaches the user unexplained. Say what each code means. The whole chain is
-/// searched, because a command may have added context above the gateway's
-/// answer.
-fn add_terms_hint(error: anyhow::Error) -> anyhow::Error {
-    let text = format!("{error:#}");
+/// reaches the user unexplained. Say what each code means on `product`. On
+/// Agent Gateway the whole chain is searched for the code, because a command
+/// may have added context above the gateway's answer. On Agent Stream the code
+/// is read off the answer's body, and `TERMS_ACCEPTANCE_REQUIRED` gets no hint,
+/// because the client already explains that refusal, or Agent Stream sends its
+/// own message.
+pub(crate) fn add_terms_hint(
+    product: Product,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let hint = match product {
+        Product::AgentGateway => gateway_terms_hint(&format!("{error:#}")),
+        Product::AgentStream => response_code(&error).and_then(agent_stream_terms_hint),
+    };
+    match hint {
+        Some(hint) => error.context(hint),
+        None => error,
+    }
+}
+
+/// What the Terms code in Agent Gateway's error `text` means.
+fn gateway_terms_hint(text: &str) -> Option<&'static str> {
     let hint = if text.contains("TERMS_ACCEPTANCE_REQUIRED") {
         "this user has not accepted the gateway's Terms and Conditions yet, so the gateway refuses every call except the Terms of Use status routes: accept them in the Agent Gateway dashboard, or with `fabric agent-gateway api post /v1/terms/acceptances --file <json>` (see `fabric agent-gateway terms --help`), then retry; `fabric agent-gateway terms status` lists what is required"
     } else if text.contains("TERMS_DISABLED") {
@@ -3875,9 +4219,28 @@ fn add_terms_hint(error: anyhow::Error) -> anyhow::Error {
     } else if text.contains("TERMS_OPERATIONAL_FAILURE") {
         "the upstream terms provider is unavailable; check `fabric agent-gateway terms provider-health`"
     } else {
-        return error;
+        return None;
     };
-    error.context(hint)
+    Some(hint)
+}
+
+/// What the Terms `code` of an Agent Stream answer means.
+fn agent_stream_terms_hint(code: &str) -> Option<&'static str> {
+    match code {
+        "TERMS_DISABLED" => Some(
+            "this 404 means the Terms of Use feature is switched off on this Agent Stream, not that the route is missing",
+        ),
+        "TERMS_VERSION_STALE" => Some(
+            "the published terms changed while this request was in flight; re-read `fabric agent-stream terms show` and retry",
+        ),
+        "TERMS_DRAFT_REQUIRED" => Some(
+            "there is no saved draft to publish; save one with `fabric agent-stream terms draft --file <json>` first",
+        ),
+        "TERMS_OPERATIONAL_FAILURE" => {
+            Some("the upstream terms provider is unavailable; check `fabric agent-stream terms provider-health`")
+        }
+        _ => None,
+    }
 }
 
 async fn run_notifications(
@@ -3926,22 +4289,37 @@ async fn unverified_recipient_warning(
         return Ok(Vec::new());
     };
     match response_status(&error) {
-        Some(StatusCode::NOT_FOUND) => bail!(
-            "user '{user_id}' not found: no gateway user has that id, so the notification would reach nobody. Nothing was sent; `fabric agent-gateway api get /v1/users` lists user ids"
-        ),
+        Some(StatusCode::NOT_FOUND) => match client.product() {
+            Product::AgentGateway => bail!(
+                "user '{user_id}' not found: no gateway user has that id, so the notification would reach nobody. Nothing was sent; `fabric agent-gateway api get /v1/users` lists user ids"
+            ),
+            Product::AgentStream => bail!(
+                "user '{user_id}' not found: no Agent Stream user has that id, so the notification would reach nobody. Nothing was sent; `fabric agent-stream users list` lists user ids"
+            ),
+        },
         // The Terms gate refuses the send as well, so warning and sending
         // would only add a misleading permission warning to the same refusal.
-        Some(StatusCode::FORBIDDEN)
-            if error
-                .to_string()
-                .contains("TERMS_ACCEPTANCE_REQUIRED") =>
-        {
-            Err(error)
-        }
+        Some(StatusCode::FORBIDDEN) if refused_for_terms(client.product(), &error) => Err(error),
         Some(StatusCode::FORBIDDEN) => Ok(vec![format!(
             "could not verify that user '{user_id}' exists ({error}); reading another user needs the 'users.view' permission, which sending does not. Sending anyway: if the id is wrong, the notification reaches nobody"
         )]),
         _ => Err(error.context(format!("could not look up user '{user_id}' before sending; nothing was sent"))),
+    }
+}
+
+/// Whether `error` is the Terms gate refusing a request because the signed-in
+/// user has not accepted the Terms and Conditions. Agent Gateway's refusal
+/// prints its bare `code`. Agent Stream's prints a message without the code,
+/// so the code is read off the answer's body instead.
+fn refused_for_terms(
+    product: Product,
+    error: &anyhow::Error,
+) -> bool {
+    match product {
+        Product::AgentGateway => error
+            .to_string()
+            .contains(TERMS_ACCEPTANCE_REQUIRED),
+        Product::AgentStream => response_code(error) == Some(TERMS_ACCEPTANCE_REQUIRED),
     }
 }
 
@@ -4442,17 +4820,56 @@ mod gateway_config_tests {
 
     #[test]
     fn user_settings_warnings_detect_a_merged_document() {
-        let warnings = user_settings_write_warnings(&json!({
-            "refresh_interval_seconds": 30,
-            "metrics_retention_minutes": 60,
-            "audit_enabled": true
-        }));
+        let warnings = user_settings_write_warnings(
+            Product::AgentGateway,
+            &json!({
+                "refresh_interval_seconds": 30,
+                "metrics_retention_minutes": 60,
+                "audit_enabled": true
+            }),
+        );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("metrics_retention_minutes"));
         assert!(warnings[0].contains("audit_enabled"));
         assert!(!warnings[0].contains("refresh_interval_seconds"));
 
-        assert!(user_settings_write_warnings(&json!({"bucket_seconds": 5})).is_empty());
+        assert!(user_settings_write_warnings(Product::AgentGateway, &json!({"bucket_seconds": 5})).is_empty());
+    }
+
+    #[test]
+    fn user_settings_merged_document_messages_name_the_product() {
+        let merged = json!({"bucket_seconds": 5, "audit_enabled": true});
+
+        assert_eq!(
+            user_settings_write_warnings(Product::AgentGateway, &merged),
+            ["ignored by the gateway: audit_enabled. A document carrying these came from `user-settings show` \
+                 without --overrides, which merges in appliance defaults — every remaining field becomes a personal \
+                 override"]
+        );
+        assert_eq!(
+            user_settings_write_warnings(Product::AgentStream, &merged),
+            ["ignored by Agent Stream: audit_enabled. A document carrying these came from `user-settings show` \
+                 without --overrides, which merges in appliance defaults, so every remaining field becomes a \
+                 personal override"]
+        );
+        assert_eq!(
+            reject_unknown_user_settings(Product::AgentGateway, &merged)
+                .expect_err("a merged document")
+                .to_string(),
+            "this document carries 1 field(s) a per-user update cannot store: audit_enabled. It came from `fabric \
+             agent-gateway user-settings show` without --overrides, which merges in appliance defaults, so sending \
+             it would persist those defaults as personal overrides. Start from `fabric agent-gateway user-settings \
+             show --overrides`, or re-run with --force"
+        );
+        assert_eq!(
+            reject_unknown_user_settings(Product::AgentStream, &merged)
+                .expect_err("a merged document")
+                .to_string(),
+            "this document carries 1 field(s) a per-user update cannot store: audit_enabled. It came from `fabric \
+             agent-stream user-settings show` without --overrides, which merges in appliance defaults, so sending \
+             it would persist those defaults as personal overrides. Start from `fabric agent-stream user-settings \
+             show --overrides`, or re-run with --force"
+        );
     }
 
     #[tokio::test]
@@ -4505,7 +4922,8 @@ mod gateway_config_tests {
         // persisted, so the refusal has to happen before the request.
         assert_no_request(request, "`user-settings set`");
 
-        reject_unknown_user_settings(&json!({"bucket_seconds": 5})).expect("a genuine override document is accepted");
+        reject_unknown_user_settings(Product::AgentGateway, &json!({"bucket_seconds": 5}))
+            .expect("a genuine override document is accepted");
     }
 
     #[tokio::test]
@@ -4692,10 +5110,14 @@ mod gateway_config_tests {
 
     #[test]
     fn user_settings_warnings_name_a_replaced_flag_map() {
-        assert_eq!(user_settings_write_warnings(&json!({"feature_flags": {"ap2_experimental": true}})).len(), 1);
+        assert_eq!(
+            user_settings_write_warnings(Product::AgentGateway, &json!({"feature_flags": {"ap2_experimental": true}}))
+                .len(),
+            1
+        );
         // `feature_flags` is Option-typed here too, so a null leaves the stored
         // map alone and must not claim it was replaced.
-        assert!(user_settings_write_warnings(&json!({"feature_flags": null})).is_empty());
+        assert!(user_settings_write_warnings(Product::AgentGateway, &json!({"feature_flags": null})).is_empty());
     }
 
     #[tokio::test]
@@ -8447,8 +8869,11 @@ mod gateway_config_tests {
             .expect_err("a notification for no user should not be sent");
 
         let text = error.to_string();
-        assert!(text.contains("'nobody' not found"), "got: {text}");
-        assert!(text.contains("Nothing was sent"), "got: {text}");
+        assert_eq!(
+            text,
+            "user 'nobody' not found: no gateway user has that id, so the notification would reach nobody. Nothing \
+             was sent; `fabric agent-gateway api get /v1/users` lists user ids"
+        );
         assert_eq!(request_lines(requests), ["GET /api/v1/users/nobody HTTP/1.1"]);
     }
 
@@ -8561,7 +8986,7 @@ mod gateway_config_tests {
         // not add their own and print it twice.
         assert_eq!(error.to_string(), r#"{"code":"TERMS_DISABLED"}"#);
 
-        let printed = format!("{:#}", add_terms_hint(error));
+        let printed = format!("{:#}", add_terms_hint(Product::AgentGateway, error));
         assert_eq!(
             printed
                 .matches("switched off")
@@ -8584,7 +9009,7 @@ mod gateway_config_tests {
             .await
             .expect_err("the Terms gate should refuse the call");
 
-        let printed = format!("{:#}", add_terms_hint(error));
+        let printed = format!("{:#}", add_terms_hint(Product::AgentGateway, error));
         for expected in [
             "has not accepted the gateway's Terms and Conditions",
             "dashboard",
@@ -8612,9 +9037,45 @@ mod gateway_config_tests {
             ("TERMS_OPERATIONAL_FAILURE", "`fabric agent-gateway terms provider-health`"),
         ] {
             let body = format!(r#"{{"code":"{code}"}}"#);
-            let hinted = format!("{:#}", add_terms_hint(anyhow::anyhow!("{body}")));
+            let hinted = format!("{:#}", add_terms_hint(Product::AgentGateway, anyhow::anyhow!("{body}")));
             assert!(hinted.contains(expected), "{code} should be explained with {expected}, got: {hinted}");
             assert!(hinted.ends_with(&body), "{code}: the gateway's answer should follow the hint, got: {hinted}");
+        }
+    }
+
+    #[test]
+    fn gateway_terms_hints_read_word_for_word() {
+        for (code, hint) in [
+            (
+                "TERMS_ACCEPTANCE_REQUIRED",
+                "this user has not accepted the gateway's Terms and Conditions yet, so the gateway refuses every \
+                 call except the Terms of Use status routes: accept them in the Agent Gateway dashboard, or with \
+                 `fabric agent-gateway api post /v1/terms/acceptances --file <json>` (see `fabric agent-gateway \
+                 terms --help`), then retry; `fabric agent-gateway terms status` lists what is required",
+            ),
+            (
+                "TERMS_DISABLED",
+                "this 404 means the Terms of Use feature is switched off on this gateway, not that the route is \
+                 missing",
+            ),
+            (
+                "TERMS_VERSION_STALE",
+                "the published terms changed while this request was in flight; re-read `fabric agent-gateway terms \
+                 show` and retry",
+            ),
+            (
+                "TERMS_DRAFT_REQUIRED",
+                "there is no saved draft to publish; save one with `fabric agent-gateway terms draft --file <json>` \
+                 first",
+            ),
+            (
+                "TERMS_OPERATIONAL_FAILURE",
+                "the upstream terms provider is unavailable; check `fabric agent-gateway terms provider-health`",
+            ),
+        ] {
+            let body = format!(r#"{{"code":"{code}"}}"#);
+            let hinted = format!("{:#}", add_terms_hint(Product::AgentGateway, anyhow::anyhow!("{body}")));
+            assert_eq!(hinted, format!("{hint}: {body}"));
         }
     }
 
@@ -8622,13 +9083,14 @@ mod gateway_config_tests {
     fn a_terms_code_under_added_context_still_gets_its_hint() {
         let error = anyhow::Error::msg(r#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#)
             .context("the appliance settings were saved, but reading them back failed");
-        let hinted = format!("{:#}", add_terms_hint(error));
+        let hinted = format!("{:#}", add_terms_hint(Product::AgentGateway, error));
         assert!(hinted.starts_with("this user has not accepted"), "got: {hinted}");
     }
 
     #[test]
     fn an_unrelated_error_is_left_unchanged() {
-        let hinted = add_terms_hint(anyhow::anyhow!("gateway returned 500 Internal Server Error: boom"));
+        let hinted =
+            add_terms_hint(Product::AgentGateway, anyhow::anyhow!("gateway returned 500 Internal Server Error: boom"));
         assert_eq!(format!("{hinted:#}"), "gateway returned 500 Internal Server Error: boom");
         assert_eq!(hinted.chain().count(), 1);
     }
@@ -8809,7 +9271,7 @@ pub(crate) struct SecretCreateArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum DelegationVaultCommand {
+pub(crate) enum DelegationVaultCommand {
     /// List delegated credential grants.
     List,
     /// Get a grant by ID.
@@ -8864,6 +9326,8 @@ const CERTIFICATES_PATH: &str = "/v1/certificates";
 const SECRETS_PATH: &str = "/v1/secrets";
 const SURFACES_PATH: &str = "/v1/surfaces";
 const DELEGATION_VAULT_PATH: &str = "/v1/delegation-vault";
+const CREDENTIAL_PROVIDERS_PATH: &str = "/v1/credential-providers";
+const JWT_STRATEGIES_PATH: &str = "/v1/jwt-verification-strategies";
 
 /// Stand-in printed in place of a credential the caller did not ask to see.
 pub(crate) const MASKED_VALUE: &str = "<hidden; pass --reveal to show>";
@@ -9000,10 +9464,14 @@ enum CrudUpdate {
 
 /// Runs the certificates commands through the shared CRUD flow, except
 /// `update`, which sends its own `PUT` so its document is checked before the
-/// lookup. It then hides the stored private key, which `GET {id}`, `POST` and
-/// `PUT` all return in full. `get`, `update` and `delete` first resolve the
-/// caller's id or name to the `id` the entity routes take. `None` means the
-/// outcome has already been reported and there is nothing left for the shared
+/// lookup, and `delete`, which [`delete_certificate`] sends. `get`, `update`
+/// and `delete` first resolve the caller's id or name to the `id` the entity
+/// routes take. Agent Gateway's `GET {id}`, `POST` and
+/// `PUT` return the stored private key in full, so its `private_key_pem` is
+/// masked unless `reveal` is set. Agent Stream never returns a private key and
+/// its commands have no --reveal, so a `private_key_pem` that appears anyway
+/// is removed and a note on standard error says so. `None` means the outcome
+/// has already been reported and there is nothing left for the shared
 /// printer.
 async fn run_certificates(
     client: &GatewayClient,
@@ -9015,14 +9483,11 @@ async fn run_certificates(
         CrudCommand::Get { id } => CrudCommand::Get {
             id: resolve_id(client, &CERTIFICATE_LOOKUP, &id).await?,
         },
-        CrudCommand::Delete { id } => CrudCommand::Delete {
-            id: resolve_id(client, &CERTIFICATE_LOOKUP, &id).await?,
-        },
+        CrudCommand::Delete { id } => {
+            let id = resolve_id(client, &CERTIFICATE_LOOKUP, &id).await?;
+            return delete_certificate(client, &id, output).await;
+        }
         command => command,
-    };
-    let deleted = match &command {
-        CrudCommand::Delete { id } => Some(id.clone()),
-        _ => None,
     };
     let mut updated = None;
     let mut value = match command {
@@ -9038,16 +9503,34 @@ async fn run_certificates(
         }
         command => run_crud(client, CERTIFICATES_PATH, command).await?,
     };
-    if let Some(id) = deleted {
-        return Ok(confirm_empty(value, &confirmation_line("Deleted", "certificate", &id), output));
-    }
-    if !reveal {
-        mask_keys(&mut value, &["private_key_pem"]);
+    match client.product() {
+        Product::AgentGateway => {
+            if !reveal {
+                mask_keys(&mut value, &["private_key_pem"]);
+            }
+        }
+        // Agent Stream never returns a private key and its command has no
+        // --reveal, so a key that appears anyway is removed rather than
+        // masked with a placeholder that names the flag.
+        Product::AgentStream => note_hidden_fields(&drop_keys(&mut value, &["private_key_pem"])),
     }
     if let Some(id) = updated {
         return Ok(report_update(value, confirmation_line("Updated", "certificate", &id), output));
     }
     Ok(Some(value))
+}
+
+/// Deletes the certificate whose `id` has already been resolved. `None` means
+/// the confirmation line has already been printed.
+async fn delete_certificate(
+    client: &GatewayClient,
+    id: &str,
+    output: Output,
+) -> Result<Option<Value>> {
+    let value = client
+        .request(Method::DELETE, &entity_path(CERTIFICATES_PATH, id), None)
+        .await?;
+    Ok(confirm_empty(value, &confirmation_line("Deleted", "certificate", id), output))
 }
 
 /// Creation posts to `/v1/secrets/new` rather than the collection, and the
@@ -9126,21 +9609,23 @@ const SECRET_VALUE_WITHHELD_NOTE: &str =
     "note: Agent Stream sent no value, because secrets.reveal_values is off in its agent-stream.json";
 
 /// Grants are minted only by a user completing the provider's OAuth flow in a
-/// browser, so this resource has no create and no update: the gateway offers
-/// reads and the two revoke routes only. `None` means the outcome has already
-/// been reported and there is nothing left for the shared printer.
+/// browser, so this resource has no create and no update: both products offer
+/// reads and the two revoke routes only. Agent Stream answers a read with a
+/// grant's metadata only; should a grant's `access_token` or `refresh_token`
+/// appear anyway, `list` and `get` remove it and a note on standard error says
+/// so. Agent Gateway's answers are printed as they come. `None` means the
+/// outcome has already been reported and there is nothing left for the shared
+/// printer.
 async fn run_delegation_vault(
     client: &GatewayClient,
     command: DelegationVaultCommand,
     output: Output,
 ) -> Result<Option<Value>> {
     match command {
-        DelegationVaultCommand::List => client
-            .request(Method::GET, DELEGATION_VAULT_PATH, None)
+        DelegationVaultCommand::List => read_grants(client, DELEGATION_VAULT_PATH)
             .await
             .map(Some),
-        DelegationVaultCommand::Get { id } => client
-            .request(Method::GET, &encoded_path(DELEGATION_VAULT_PATH, &id), None)
+        DelegationVaultCommand::Get { id } => read_grants(client, &encoded_path(DELEGATION_VAULT_PATH, &id))
             .await
             .map(Some),
         DelegationVaultCommand::Revoke { id } => {
@@ -9163,6 +9648,20 @@ async fn run_delegation_vault(
             Ok(Some(value))
         }
     }
+}
+
+/// Reads the grant or grants at `path`, removing any token Agent Stream sent.
+async fn read_grants(
+    client: &GatewayClient,
+    path: &str,
+) -> Result<Value> {
+    let mut value = client
+        .request(Method::GET, path, None)
+        .await?;
+    if client.product() == Product::AgentStream {
+        note_hidden_fields(&drop_keys(&mut value, &["access_token", "refresh_token"]));
+    }
+    Ok(value)
 }
 
 /// `Revoked 2 grants for user '<hash>'`, with the count from the gateway's
@@ -9232,17 +9731,53 @@ fn check_secret_update(
     Ok(())
 }
 
-/// Refuses a request body carrying [`MASKED_VALUE`]. A document captured from
-/// `get` and replayed through `create` or `update` would otherwise store the
-/// placeholder as the credential itself, and the masked response would look
-/// exactly as it did before.
+/// Refuses a request body carrying [`MASKED_VALUE`] with a
+/// [`MaskedPlaceholderError`]. A document captured from `get` and replayed
+/// through `create` or `update` would otherwise store the placeholder as the
+/// credential itself, and the masked response would look exactly as it did
+/// before.
 fn reject_masked_values(value: &Value) -> Result<()> {
     if contains_masked_value(value) {
-        bail!(
-            "the request body still carries the masked placeholder {MASKED_VALUE}; re-read the entity with --reveal, or remove the masked field to leave the stored credential untouched"
-        );
+        return Err(MaskedPlaceholderError.into());
     }
     Ok(())
+}
+
+/// A request body still carries [`MASKED_VALUE`]. It reads as the refusal of
+/// a command that offers --reveal; [`without_reveal_hint`] rewords it for one
+/// that does not.
+#[derive(Debug)]
+struct MaskedPlaceholderError;
+
+impl std::fmt::Display for MaskedPlaceholderError {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the request body still carries the masked placeholder {MASKED_VALUE}; re-read the entity with --reveal, or remove the masked field to leave the stored credential untouched"
+        )
+    }
+}
+
+impl std::error::Error for MaskedPlaceholderError {}
+
+/// Rewords a [`MaskedPlaceholderError`] for a command with no --reveal, such
+/// as Agent Stream's `certificates` or `api`, so the refusal does not send the
+/// caller to a flag the command rejects. Any other error is returned as it
+/// is.
+#[cfg(feature = "agent-stream")]
+pub(crate) fn without_reveal_hint(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<MaskedPlaceholderError>()
+        .is_none()
+    {
+        return error;
+    }
+    anyhow::anyhow!(
+        "the request body still carries the masked placeholder {MASKED_VALUE}; this command has no --reveal, so remove the masked field to leave the stored credential untouched, or put the real value in its place"
+    )
 }
 
 fn contains_masked_value(value: &Value) -> bool {
@@ -9476,6 +10011,73 @@ fn mask_keys(
     }
 }
 
+/// Removes every field named in `keys`, at any depth, from `value`. Returns
+/// the names, in the order of `keys`, of those that held a value other than
+/// null somewhere, so a caller can say what it hid.
+fn drop_keys<'k>(
+    value: &mut Value,
+    keys: &[&'k str],
+) -> Vec<&'k str> {
+    let mut held = vec![false; keys.len()];
+    drop_keys_marking(value, keys, &mut held);
+    keys.iter()
+        .zip(held)
+        .filter_map(|(key, held)| held.then_some(*key))
+        .collect()
+}
+
+fn drop_keys_marking(
+    value: &mut Value,
+    keys: &[&str],
+    held: &mut [bool],
+) {
+    match value {
+        Value::Object(object) => {
+            for (key, held) in keys
+                .iter()
+                .zip(held.iter_mut())
+            {
+                if object
+                    .remove(*key)
+                    .is_some_and(|removed| !removed.is_null())
+                {
+                    *held = true;
+                }
+            }
+            for child in object.values_mut() {
+                drop_keys_marking(child, keys, held);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                drop_keys_marking(item, keys, held);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Prints `note: hid 'a', 'b'.` on standard error for the `fields` an
+/// answer had removed, the way Agent Stream's `identities get` notes a
+/// hidden `key_pair`, and nothing when none was. It names no flag, because
+/// the Agent Stream commands that remove fields offer none to keep them.
+fn note_hidden_fields(fields: &[&str]) {
+    if let Some(note) = hidden_fields_note(fields) {
+        eprintln!("{note}");
+    }
+}
+
+fn hidden_fields_note(fields: &[&str]) -> Option<String> {
+    if fields.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = fields
+        .iter()
+        .map(|field| format!("'{field}'"))
+        .collect();
+    Some(format!("note: hid {}.", named.join(", ")))
+}
+
 #[cfg(test)]
 mod secrets_certs_tests {
     use std::io::Write;
@@ -9693,6 +10295,43 @@ mod secrets_certs_tests {
             .expect("a document to print");
 
         assert_eq!(revealed["private_key_pem"], json!("test-pem"));
+    }
+
+    #[test]
+    fn drop_keys_removes_the_named_fields_at_any_depth_and_names_those_that_held_a_value() {
+        let mut value = json!([
+            {"id": "g-1", "refresh_token": "test-refresh"},
+            {"id": "g-2", "nested": {"access_token": null, "refresh_token": "test-refresh"}},
+        ]);
+
+        let held = drop_keys(&mut value, &["access_token", "refresh_token"]);
+
+        assert_eq!(value, json!([{"id": "g-1"}, {"id": "g-2", "nested": {}}]));
+        assert_eq!(held, ["refresh_token"]);
+    }
+
+    #[test]
+    fn the_hidden_fields_note_names_each_field_and_no_flag() {
+        assert_eq!(hidden_fields_note(&["private_key_pem"]).as_deref(), Some("note: hid 'private_key_pem'."));
+        assert_eq!(
+            hidden_fields_note(&["access_token", "refresh_token"]).as_deref(),
+            Some("note: hid 'access_token', 'refresh_token'.")
+        );
+        assert_eq!(hidden_fields_note(&[]), None);
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[test]
+    fn a_masked_placeholder_refusal_names_no_flag_once_reworded_for_a_command_without_reveal() {
+        let refusal = reject_masked_values(&json!({"private_key_pem": MASKED_VALUE})).expect_err("a masked document");
+
+        assert_eq!(
+            without_reveal_hint(refusal).to_string(),
+            "the request body still carries the masked placeholder <hidden; pass --reveal to show>; this command has \
+             no --reveal, so remove the masked field to leave the stored credential untouched, or put the real value \
+             in its place"
+        );
+        assert_eq!(without_reveal_hint(anyhow::anyhow!("other")).to_string(), "other");
     }
 
     #[tokio::test]
@@ -10514,17 +11153,21 @@ mod secrets_certs_tests {
             .expect("an update that leaves the value alone");
     }
 
+    /// The full refusal of a masked document on a command that offers
+    /// --reveal, pinned so the Agent Gateway text cannot change unnoticed.
+    fn masked_refusal() -> String {
+        format!(
+            "the request body still carries the masked placeholder {MASKED_VALUE}; re-read the entity with --reveal, or remove the masked field to leave the stored credential untouched"
+        )
+    }
+
     #[test]
     fn a_masked_document_is_refused_before_it_reaches_the_gateway() {
         let round_tripped = json!({"id": "s-1", "name": "Stripe", "value": MASKED_VALUE});
 
         let error = reject_masked_values(&round_tripped).expect_err("a masked value must be refused");
 
-        assert!(
-            error
-                .to_string()
-                .contains("--reveal")
-        );
+        assert_eq!(error.to_string(), masked_refusal());
         reject_masked_values(&json!({"id": "s-1", "value": "sk_live_1"})).expect("a real value");
         reject_masked_values(&json!({"id": "cert-1", "private_key_pem": null})).expect("no credential at all");
     }
@@ -10540,11 +11183,7 @@ mod secrets_certs_tests {
 
         let error = read_json(file.path()).expect_err("a masked document must be refused");
 
-        assert!(
-            error
-                .to_string()
-                .contains("--reveal")
-        );
+        assert_eq!(error.to_string(), masked_refusal());
 
         let mut clean = tempfile::NamedTempFile::new().expect("temp file");
         write!(clean, r#"{{"name":"Edge","private_key_pem":"test-pem"}}"#).expect("write");
@@ -10572,11 +11211,7 @@ mod secrets_certs_tests {
         .await
         .expect_err("a masked inline body must be refused");
 
-        assert!(
-            error
-                .to_string()
-                .contains("--reveal")
-        );
+        assert_eq!(error.to_string(), masked_refusal());
         assert_eq!(request_line(&request), "", "the refused body must not reach the gateway");
 
         let (host, request) = recording_server("HTTP/1.1 200 OK", r#"{"id":"s-1"}"#).await;
@@ -11722,7 +12357,7 @@ impl OwnershipKind {
 }
 
 #[derive(Debug, Subcommand)]
-enum JwtStrategyCommand {
+pub(crate) enum JwtStrategyCommand {
     #[command(flatten)]
     Crud(CrudCommand),
     /// Check that a JWKS URI is reachable and serves a parseable key set.
@@ -12388,55 +13023,118 @@ fn print_api_keys(
     print_list(value, output, &tables::API_KEYS, scope)
 }
 
+/// A `tenant-ownership` request with the resource kind as its path name, such
+/// as `secrets`, which is how both products' routes take it. Each product's
+/// command names its own kinds and maps onto this.
+pub(crate) enum OwnershipChange {
+    Impact { kind: &'static str, id: String },
+    Set { kind: &'static str, id: String, owner: OwnershipTarget },
+}
+
+/// Who a `tenant-ownership set` makes the owner of a resource.
+pub(crate) enum OwnershipTarget {
+    /// The tenant with this id.
+    Assign(String),
+    /// No tenant.
+    Clear,
+}
+
+impl OwnershipTarget {
+    /// Reads the --tenant and --clear flags of either product's `set`, and
+    /// refuses neither or both before any request, so an absent tenant is
+    /// never read as a clear.
+    pub(crate) fn from_flags(
+        tenant: Option<String>,
+        clear: bool,
+    ) -> Result<Self> {
+        match (tenant, clear) {
+            (Some(_), true) => bail!("--tenant and --clear cannot be combined"),
+            (Some(tenant), false) => Ok(Self::Assign(tenant)),
+            (None, true) => Ok(Self::Clear),
+            (None, false) => bail!("provide --tenant <tenant-id>, or --clear to remove tenant ownership"),
+        }
+    }
+}
+
+/// Agent Gateway's `set` takes --tenant and --clear as two optional flags, so
+/// a command with neither, or with both, is refused here, before any request.
+impl TryFrom<TenantOwnershipCommand> for OwnershipChange {
+    type Error = anyhow::Error;
+
+    fn try_from(command: TenantOwnershipCommand) -> Result<Self> {
+        Ok(match command {
+            TenantOwnershipCommand::Impact { kind, id } => Self::Impact { kind: kind.as_str(), id },
+            TenantOwnershipCommand::Set { kind, id, tenant, clear } => Self::Set {
+                kind: kind.as_str(),
+                id,
+                owner: OwnershipTarget::from_flags(tenant, clear)?,
+            },
+        })
+    }
+}
+
 async fn run_tenant_ownership(
     client: &GatewayClient,
     command: TenantOwnershipCommand,
 ) -> Result<Value> {
-    match command {
-        TenantOwnershipCommand::Impact { kind, id } => {
+    run_ownership_change(client, command.try_into()?).await
+}
+
+async fn run_ownership_change(
+    client: &GatewayClient,
+    change: OwnershipChange,
+) -> Result<Value> {
+    match change {
+        OwnershipChange::Impact { kind, id } => {
             client
                 .request(Method::GET, &format!("{}/impact", ownership_path(kind, &id)), None)
                 .await
         }
-        TenantOwnershipCommand::Set { kind, id, tenant, clear } => client
-            .request(Method::PUT, &ownership_path(kind, &id), Some(ownership_body(tenant, clear)?))
+        OwnershipChange::Set { kind, id, owner } => client
+            .request(Method::PUT, &ownership_path(kind, &id), Some(ownership_body(owner)))
             .await
-            .map_err(add_ownership_conflict_hint),
+            .map_err(|error| add_ownership_conflict_hint(client.product(), error)),
     }
 }
 
 fn ownership_path(
-    kind: OwnershipKind,
+    kind: &str,
     id: &str,
 ) -> String {
-    entity_path(&format!("/v1/tenant-ownership/{}", kind.as_str()), id)
+    entity_path(&format!("/v1/tenant-ownership/{kind}"), id)
 }
 
-/// Builds a reassignment body. The gateway reads a missing `tenant_id` as a
-/// request to clear ownership, so clearing has to be asked for outright.
-fn ownership_body(
-    tenant: Option<String>,
-    clear: bool,
-) -> Result<Value> {
-    match (tenant, clear) {
-        (Some(_), true) => bail!("--tenant and --clear cannot be combined"),
-        (Some(tenant), false) => Ok(json!({"tenant_id": tenant})),
-        (None, true) => Ok(json!({"tenant_id": null})),
-        (None, false) => bail!("provide --tenant <tenant-id>, or --clear to remove tenant ownership"),
+/// Builds a reassignment body. Agent Gateway reads a missing `tenant_id` as a
+/// request to clear ownership, so a clear is sent only for
+/// [`OwnershipTarget::Clear`], as an explicit null.
+fn ownership_body(owner: OwnershipTarget) -> Value {
+    match owner {
+        OwnershipTarget::Assign(tenant) => json!({"tenant_id": tenant}),
+        OwnershipTarget::Clear => json!({"tenant_id": null}),
     }
 }
 
-/// Appends a hint pointing at `impact` when a reassignment is blocked. The
-/// gateway answers with the blocking references, but under a constant `error`
-/// string that the shared error extraction reports in their place.
-fn add_ownership_conflict_hint(error: anyhow::Error) -> anyhow::Error {
+/// Appends a hint pointing at `impact` when a reassignment is blocked. Both
+/// products answer with the blocking references, but under a constant `error`
+/// string that the shared error extraction reports in their place:
+/// `tenant_reassignment_blocked` on Agent Gateway and
+/// `tenant_ownership_conflict` on Agent Stream.
+fn add_ownership_conflict_hint(
+    product: Product,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let blocked = match product {
+        Product::AgentGateway => "tenant_reassignment_blocked",
+        Product::AgentStream => "tenant_ownership_conflict",
+    };
     if error
         .to_string()
-        .contains("tenant_reassignment_blocked")
+        .contains(blocked)
     {
-        return error.context(
-            "run `fabric agent-gateway tenant-ownership impact <kind> <id>` to see the references blocking this move",
-        );
+        return error.context(format!(
+            "run `{} tenant-ownership impact <kind> <id>` to see the references blocking this move",
+            product.command()
+        ));
     }
     error
 }
@@ -12446,7 +13144,7 @@ async fn run_jwt_strategies(
     command: JwtStrategyCommand,
 ) -> Result<Value> {
     match command {
-        JwtStrategyCommand::Crud(command) => run_crud(client, "/v1/jwt-verification-strategies", command).await,
+        JwtStrategyCommand::Crud(command) => run_crud(client, JWT_STRATEGIES_PATH, command).await,
         JwtStrategyCommand::ValidateJwksUri { uri } => {
             client
                 .request(Method::POST, "/v1/jwt-verification-strategies/validate-jwks-uri", Some(json!({"uri": uri})))
@@ -13195,25 +13893,51 @@ mod identity_access_tests {
 
     #[test]
     fn ownership_assigns_a_tenant() {
-        assert_eq!(ownership_body(Some("tenant-1".into()), false).unwrap(), json!({"tenant_id": "tenant-1"}));
+        assert_eq!(ownership_body(OwnershipTarget::Assign("tenant-1".into())), json!({"tenant_id": "tenant-1"}));
+    }
+
+    fn gateway_set(
+        tenant: Option<&str>,
+        clear: bool,
+    ) -> Result<OwnershipChange> {
+        OwnershipChange::try_from(TenantOwnershipCommand::Set {
+            kind: OwnershipKind::Surfaces,
+            id: "s-1".to_owned(),
+            tenant: tenant.map(str::to_owned),
+            clear,
+        })
     }
 
     #[test]
     fn ownership_clears_only_when_asked() {
-        assert_eq!(ownership_body(None, true).unwrap(), json!({"tenant_id": null}));
-        let error = ownership_body(None, false).expect_err("an absent tenant must not silently clear ownership");
-        assert!(
-            error
-                .to_string()
-                .contains("--clear")
+        assert_eq!(ownership_body(OwnershipTarget::Clear), json!({"tenant_id": null}));
+        assert!(matches!(
+            gateway_set(None, true),
+            Ok(OwnershipChange::Set {
+                owner: OwnershipTarget::Clear,
+                ..
+            })
+        ));
+        assert_eq!(
+            gateway_set(None, false)
+                .err()
+                .expect("an absent tenant must not silently clear ownership")
+                .to_string(),
+            "provide --tenant <tenant-id>, or --clear to remove tenant ownership"
         );
-        ownership_body(Some("tenant-1".into()), true).expect_err("--tenant and --clear are mutually exclusive");
+        assert_eq!(
+            gateway_set(Some("tenant-1"), true)
+                .err()
+                .expect("--tenant and --clear are mutually exclusive")
+                .to_string(),
+            "--tenant and --clear cannot be combined"
+        );
     }
 
     #[test]
     fn ownership_set_leaves_the_tenant_choice_to_the_runner() {
         Cli::try_parse_from(["fabric", "agent-gateway", "tenant-ownership", "set", "surfaces", "s-1"])
-            .expect("clap accepts the positional pair; the body builder rejects a missing choice");
+            .expect("clap accepts the positional pair; the conversion into OwnershipChange rejects a missing choice");
     }
 
     #[test]
@@ -13225,7 +13949,7 @@ mod identity_access_tests {
     #[test]
     fn ownership_path_uses_the_gateway_family_name() {
         assert_eq!(
-            ownership_path(OwnershipKind::JwtVerificationStrategies, "s 1"),
+            ownership_path(OwnershipKind::JwtVerificationStrategies.as_str(), "s 1"),
             "/v1/tenant-ownership/jwt-verification-strategies/s+1"
         );
     }
@@ -13241,15 +13965,30 @@ mod identity_access_tests {
     #[test]
     fn blocked_reassignment_points_at_the_impact_report() {
         let error = anyhow::anyhow!("gateway returned 409 Conflict: tenant_reassignment_blocked");
-        let hinted = add_ownership_conflict_hint(error).to_string();
-        assert!(hinted.contains("tenant-ownership impact"));
+        let hinted = add_ownership_conflict_hint(Product::AgentGateway, error).to_string();
+        assert_eq!(
+            hinted,
+            "run `fabric agent-gateway tenant-ownership impact <kind> <id>` to see the references blocking this move"
+        );
+    }
+
+    #[test]
+    fn a_blocked_agent_stream_reassignment_points_at_the_agent_stream_impact_report() {
+        let error = anyhow::anyhow!("Agent Stream returned 409 Conflict: tenant_ownership_conflict");
+        let hinted = add_ownership_conflict_hint(Product::AgentStream, error).to_string();
+        assert_eq!(
+            hinted,
+            "run `fabric agent-stream tenant-ownership impact <kind> <id>` to see the references blocking this move"
+        );
     }
 
     #[test]
     fn other_ownership_errors_are_not_hinted() {
-        let error = anyhow::anyhow!("gateway returned 404 Not Found: surfaces 's-1' not found");
-        let hinted = add_ownership_conflict_hint(error).to_string();
-        assert!(!hinted.contains("tenant-ownership impact"));
+        for product in [Product::AgentGateway, Product::AgentStream] {
+            let error = anyhow::anyhow!("returned 404 Not Found: surfaces 's-1' not found");
+            let hinted = add_ownership_conflict_hint(product, error).to_string();
+            assert!(!hinted.contains("tenant-ownership impact"), "{product:?}");
+        }
     }
 
     #[test]

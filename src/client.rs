@@ -561,6 +561,9 @@ fn percent_decode_once(text: &str) -> String {
 pub struct GatewayStatusError {
     status: StatusCode,
     message: String,
+    /// The machine `code` of the answer's JSON body, such as
+    /// `TERMS_ACCEPTANCE_REQUIRED`, which `message` may leave out.
+    code: Option<String>,
 }
 
 impl std::fmt::Display for GatewayStatusError {
@@ -578,7 +581,7 @@ pub(crate) fn status_error(
     status: StatusCode,
     message: String,
 ) -> anyhow::Error {
-    GatewayStatusError { status, message }.into()
+    GatewayStatusError { status, message, code: None }.into()
 }
 
 /// The HTTP status a failed gateway request was answered with, or `None` when
@@ -587,6 +590,16 @@ pub fn response_status(error: &anyhow::Error) -> Option<StatusCode> {
     error
         .downcast_ref::<GatewayStatusError>()
         .map(|error| error.status)
+}
+
+/// The machine `code` the JSON body of a failed answer carried, such as
+/// `TERMS_DRAFT_REQUIRED`, or `None` when it carried none or the request failed
+/// before an answer. The printed message can leave the code out, because it
+/// prefers the server's own message, or replaces it with the CLI's own text.
+pub fn response_code(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<GatewayStatusError>()
+        .and_then(|error| error.code.as_deref())
 }
 
 /// Authentication to attach to a [`GatewayClient::request_bytes`] call.
@@ -628,18 +641,20 @@ enum Credential {
 
 /// [`gateway_error`] for an answer of `product` to a request that carried
 /// `credential`. The message is the server's own reason when it gave one, else
-/// the status. Three answers read differently on Agent Stream. A 401, which
-/// comes with an empty body, says what to do next, which depends on whether
-/// the request carried an access token or a session token, whose session Agent
-/// Stream ends after a while without use and, by default, 12 hours after
-/// sign-in. A 403 with the code `TERMS_ACCEPTANCE_REQUIRED` and no message of
-/// its own says to accept the Terms and Conditions in the Agent Stream
-/// dashboard. A 403 with an empty body to a request that carried a token names
-/// its causes: the role or the access token's scopes do not allow the request,
-/// or a resource-scoped access token was sent without a header it requires;
-/// one to a request with Basic credentials reports the status alone, because
-/// no role or scope applies to them. A 403 whose body names the missing
-/// permission, or gives a message, reads the same on both products.
+/// the status. The body's `code`, when it has one, is kept on the error for
+/// [`response_code`], whatever the message says. Three answers read
+/// differently on Agent Stream. A 401, which comes with an empty body, says
+/// what to do next, which depends on whether the request carried an access
+/// token or a session token, whose session Agent Stream ends after a while
+/// without use and, by default, 12 hours after sign-in. A 403 with the code
+/// `TERMS_ACCEPTANCE_REQUIRED` and no message of its own says to accept the
+/// Terms and Conditions in the Agent Stream dashboard. A 403 with an empty
+/// body to a request that carried a token names its causes: the role or the
+/// access token's scopes do not allow the request, or a resource-scoped access
+/// token was sent without a header it requires; one to a request with Basic
+/// credentials reports the status alone, because no role or scope applies to
+/// them. A 403 whose body names the missing permission, or gives a message,
+/// reads the same on both products.
 fn product_error(
     product: Product,
     credential: Credential,
@@ -664,6 +679,18 @@ fn product_error(
         .and_then(|value| error_detail(value, status))
         .map(|message| clean(&message));
     let message = message.as_deref();
+    let code = parsed
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str);
+    let coded_error = |status: StatusCode, message: String| -> anyhow::Error {
+        GatewayStatusError {
+            status,
+            message,
+            code: code.map(str::to_owned),
+        }
+        .into()
+    };
     if let Some(permission) = required_permission {
         // Prefer the gateway's own wording when it sent one: it
         // distinguishes an RBAC role denial ("missing permission")
@@ -671,8 +698,8 @@ fn product_error(
         // token scope does not include"), which a single generic
         // message would collapse into one case.
         return match message {
-            Some(message) => status_error(status, message.to_owned()),
-            None => status_error(status, format!("missing required scope '{permission}'")),
+            Some(message) => coded_error(status, message.to_owned()),
+            None => coded_error(status, format!("missing required scope '{permission}'")),
         };
     }
     // A JSON body with no reason field is shown whole, re-serialised from its
@@ -699,7 +726,7 @@ fn product_error(
         });
     let server_said = message.is_some() || !body_is_empty;
     if status == StatusCode::UNAUTHORIZED {
-        return status_error(
+        return coded_error(
             status,
             match product {
                 Product::AgentGateway => format!("gateway rejected the bearer token: {detail}"),
@@ -711,17 +738,12 @@ fn product_error(
         );
     }
     if status == StatusCode::FORBIDDEN && product == Product::AgentStream {
-        let terms_required = message.is_none()
-            && parsed
-                .as_ref()
-                .and_then(|value| value.get("code"))
-                .and_then(Value::as_str)
-                == Some(TERMS_ACCEPTANCE_REQUIRED);
+        let terms_required = message.is_none() && code == Some(TERMS_ACCEPTANCE_REQUIRED);
         if terms_required {
-            return status_error(status, AGENT_STREAM_TERMS_REQUIRED.to_owned());
+            return coded_error(status, AGENT_STREAM_TERMS_REQUIRED.to_owned());
         }
         if !server_said && credential != Credential::Basic {
-            return status_error(
+            return coded_error(
                 status,
                 format!(
                     "Agent Stream answered {status}, so your role or the scopes of the access token in use do not \
@@ -736,14 +758,14 @@ fn product_error(
     // own ("unknown scope: X"); only prefix the HTTP status when there
     // was nothing better for the server to say.
     if server_said {
-        return status_error(status, detail);
+        return coded_error(status, detail);
     }
-    status_error(status, format!("{} returned {status}: {detail}", product.message_name()))
+    coded_error(status, format!("{} returned {status}: {detail}", product.message_name()))
 }
 
 /// The `code` Agent Stream answers with when the signed-in user has not
 /// accepted its current Terms and Conditions.
-const TERMS_ACCEPTANCE_REQUIRED: &str = "TERMS_ACCEPTANCE_REQUIRED";
+pub(crate) const TERMS_ACCEPTANCE_REQUIRED: &str = "TERMS_ACCEPTANCE_REQUIRED";
 
 /// What a [`TERMS_ACCEPTANCE_REQUIRED`] answer from Agent Stream means, when
 /// Agent Stream sent no message of its own.
@@ -2412,6 +2434,31 @@ mod tests {
             &[],
         );
         assert_eq!(terms.to_string(), "Sign in to Agent Stream and accept the terms.");
+    }
+
+    #[test]
+    fn the_body_code_stays_on_the_error_when_the_message_leaves_it_out() {
+        for (credential, body) in [
+            (Credential::SessionToken, &br#"{"code":"TERMS_ACCEPTANCE_REQUIRED"}"#[..]),
+            (
+                Credential::AccessToken,
+                br#"{"code":"TERMS_ACCEPTANCE_REQUIRED","message":"Sign in to Agent Stream and accept the terms."}"#,
+            ),
+        ] {
+            let error = product_error(Product::AgentStream, credential, StatusCode::FORBIDDEN, body, &[]);
+
+            assert!(
+                !error
+                    .to_string()
+                    .contains("TERMS_ACCEPTANCE_REQUIRED"),
+                "{credential:?}: {error}"
+            );
+            assert_eq!(response_code(&error), Some("TERMS_ACCEPTANCE_REQUIRED"), "{credential:?}");
+        }
+
+        let no_code = product_error(Product::AgentStream, Credential::AccessToken, StatusCode::FORBIDDEN, b"", &[]);
+        assert_eq!(response_code(&no_code), None);
+        assert_eq!(response_code(&status_error(StatusCode::FORBIDDEN, "refused".to_owned())), None);
     }
 
     #[test]
