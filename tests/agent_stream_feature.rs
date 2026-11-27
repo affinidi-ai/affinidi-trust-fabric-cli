@@ -24,10 +24,7 @@ use fresh_home::fabric_in_fresh_home;
 #[cfg(feature = "agent-stream")]
 use fresh_home::fabric_in_home;
 #[cfg(feature = "agent-stream")]
-use recording_host::{
-    PROBE_REQUEST, Reply, Requests, host_answering, host_answering_with_status, host_replying, request_lines,
-    request_lowercase,
-};
+use recording_host::{PROBE_REQUEST, Reply, Requests, host_answering, host_replying, request_lines, request_lowercase};
 
 /// Exit status clap uses for a command line it cannot parse.
 #[cfg(not(feature = "agent-stream"))]
@@ -1547,10 +1544,9 @@ fn prompts_list_as_json_keeps_each_template_but_never_its_messages() {
 #[cfg(feature = "agent-stream")]
 #[test]
 fn prompts_create_shows_agent_streams_plain_text_refusal_and_exits_non_zero() {
-    let (host, requests) = host_answering_with_status(
-        AGENT_STREAM_PERMISSIONS,
-        "409 Conflict",
-        "A prompt with id 'greeter' already exists",
+    let (host, requests) = host_replying(
+        vec![("GET /api/v1/permissions/public", "200 OK", AGENT_STREAM_PERMISSIONS)],
+        ("409 Conflict", "A prompt with id 'greeter' already exists"),
     );
     let home = tempfile::TempDir::new().expect("temp dir");
     let template = home
