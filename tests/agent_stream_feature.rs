@@ -613,6 +613,40 @@ fn policies_delete_without_yes_and_with_a_typed_host_and_no_terminal_sends_nothi
 
 #[cfg(feature = "agent-stream")]
 #[test]
+fn connections_delete_without_yes_and_with_a_typed_host_and_no_terminal_sends_nothing() {
+    let (host, requests) = agent_stream_host();
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "--host", &host, "connections", "delete", "g-1"],
+        &[],
+        &[("FABRIC_TOKEN", SESSION_TOKEN)],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("refusing to delete 'g-1' without confirmation in a non-interactive session"), "{text}");
+    assert!(request_lines(&requests).is_empty(), "{:?}", request_lines(&requests));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connections_delete_with_yes_sends_the_delete_without_asking() {
+    let (host, requests) = agent_stream_stand_in(vec![("DELETE /api/v1/gateways/g-1", "204 No Content", "")]);
+
+    let output = fabric_on_stream(&host, &["connections", "delete", "g-1", "--yes"], "");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("[y/N]"), "{}", stderr(&output));
+    assert!(
+        request_lines(&requests).contains(&"DELETE /api/v1/gateways/g-1 HTTP/1.1".to_owned()),
+        "{:?}",
+        request_lines(&requests)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
 fn credential_deletes_and_revokes_without_yes_and_with_a_typed_host_and_no_terminal_send_nothing() {
     for (words, refusal) in [
         (&["certificates", "delete", "cert-1"][..], "refusing to delete 'cert-1'"),
@@ -1034,6 +1068,113 @@ fn drift_runs_get_hides_samples_unless_reveal_and_then_warns() {
     assert!(shown.status.success(), "{}", stderr(&shown));
     assert!(stdout(&shown).contains("replayed secret prompt"), "{}", stdout(&shown));
     assert!(stderr(&shown).contains("warning: this output contains prompt content"), "{}", stderr(&shown));
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connections_connection_points_and_mediators_lists_print_the_agent_gateway_tables_and_runtime_status_json() {
+    let (host, _) = agent_stream_stand_in(vec![
+        (
+            "GET /api/v1/gateways",
+            "200 OK",
+            r#"[{"id":"g-1","name":"Partner","description":"","did":"did:web:partner.example","gateway_type":"remote","status":"active","creation_type":"user","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-02T00:00:00Z","exposed_channels":[],"runtime_status":{"status":"connected","last_active_at":"2026-11-02T00:00:00Z"}}]"#,
+        ),
+        (
+            "GET /api/v1/connection-points",
+            "200 OK",
+            r#"[{"id":"cp-1","gateway_id":"g-self","mediator_id":"m-1","connection_point_did":"did:web:x","name":"Front door","description":"","oob_url":"https://x","use_count":2,"expires_at":null,"integration_id":null,"integration_variables":{},"integrations":[],"cp_type":"user","exposed_channels":[],"enabled":true,"did_method":"web"}]"#,
+        ),
+        (
+            "GET /api/v1/mediators",
+            "200 OK",
+            r#"[{"id":"m-1","name":"EU mediator","description":"Main","did":"did:web:mediator.example","status":"active","our_did":"did:peer:2.x","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-01T00:00:00Z"}]"#,
+        ),
+    ]);
+
+    let connections = fabric_on_stream(&host, &["connections", "list"], "");
+    let connections_json = fabric_on_stream(&host, &["--output", "json", "connections", "list"], "");
+    let points = fabric_on_stream(&host, &["connection-points", "list"], "");
+    let mediators = fabric_on_stream(&host, &["mediators", "list"], "");
+
+    assert_eq!(
+        stdout(&connections),
+        "NAME     ID   TYPE    STATUS  UPDATED\n\
+         Partner  g-1  remote  active  2026-11-02T00:00:00Z\n",
+        "{}",
+        stderr(&connections)
+    );
+    let listed: serde_json::Value = serde_json::from_str(&stdout(&connections_json)).expect("JSON");
+    assert_eq!(listed[0]["runtime_status"]["status"], "connected", "{}", stderr(&connections_json));
+    assert_eq!(
+        stdout(&points),
+        "NAME        ID    CONNECTION  ENABLED  USES  EXPIRES\n\
+         Front door  cp-1  g-self      yes      2     never\n",
+        "{}",
+        stderr(&points)
+    );
+    assert_eq!(
+        stdout(&mediators),
+        "NAME         ID   STATUS  DID                       DESCRIPTION\n\
+         EU mediator  m-1  active  did:web:mediator.example  Main\n",
+        "{}",
+        stderr(&mediators)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connections_connection_points_and_mediators_print_the_agent_gateway_lines() {
+    let (host, _) = agent_stream_stand_in(vec![
+        ("POST /api/v1/gateways", "200 OK", r#"{"id":"g-1","name":"Partner"}"#),
+        ("PUT /api/v1/gateways/g-1", "200 OK", r#"{"id":"g-1","name":"Partner"}"#),
+        ("DELETE /api/v1/gateways/g-1", "204 No Content", ""),
+        ("PUT /api/v1/connection-points/cp-1", "200 OK", r#"{"id":"cp-1","name":"Door"}"#),
+        ("DELETE /api/v1/connection-points/cp-1", "204 No Content", ""),
+        ("POST /api/v1/mediators", "200 OK", r#"{"id":"m-1","name":"EU mediator"}"#),
+        ("PUT /api/v1/mediators/m-1", "200 OK", r#"{"id":"m-1","name":"EU mediator"}"#),
+        ("DELETE /api/v1/mediators/m-1", "204 No Content", ""),
+    ]);
+    let run = |args: &[&str]| fabric_on_stream(&host, args, r#"{"name":"x"}"#);
+
+    for (args, line) in [
+        (&["connections", "create", "--file", "-"][..], "Created connection 'g-1'\n"),
+        (&["connections", "update", "g-1", "--file", "-"], "Updated connection 'g-1'\n"),
+        (&["connections", "delete", "g-1", "--yes"], "Deleted connection 'g-1'\n"),
+        (&["connection-points", "update", "cp-1", "--file", "-"], "Updated connection point 'cp-1'\n"),
+        (&["connection-points", "delete", "cp-1"], "Deleted connection point 'cp-1'\n"),
+        (&["mediators", "create", "--file", "-"], "Created mediator 'm-1'\n"),
+        (&["mediators", "update", "m-1", "--file", "-"], "Updated mediator 'm-1'\n"),
+        (&["mediators", "delete", "m-1"], "Deleted mediator 'm-1'\n"),
+    ] {
+        let output = run(args);
+
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), line, "{args:?}: {}", stderr(&output));
+    }
+}
+
+/// The invitation secret a `connection-points create` document sends, which
+/// the stand-in sends back in its create answer.
+#[cfg(feature = "agent-stream")]
+const INVITATION_SECRET: &str = "invitation-secret-of-at-least-32-bytes";
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn connection_points_create_prints_only_the_id_in_a_table_and_the_answer_in_json() {
+    let answer = r#"{"connection_point":{"id":"cp-1","gateway_id":"g-self","mediator_id":"m-1","name":"Door","use_count":0,"secret":"invitation-secret-of-at-least-32-bytes"}}"#;
+    let (host, _) = agent_stream_stand_in(vec![("POST /api/v1/connection-points", "200 OK", answer)]);
+    let document = format!(
+        r#"{{"gateway_id":"g-self","mediator_id":"m-1","name":"Door","description":"","secret":"{INVITATION_SECRET}"}}"#
+    );
+
+    let table = fabric_on_stream(&host, &["connection-points", "create", "--file", "-"], &document);
+    let json = fabric_on_stream(&host, &["--output", "json", "connection-points", "create", "--file", "-"], &document);
+
+    assert!(table.status.success(), "{}", stderr(&table));
+    assert_eq!(stdout(&table), "Created connection point 'cp-1'\n");
+    assert!(!stderr(&table).contains(INVITATION_SECRET), "{}", stderr(&table));
+    let printed: serde_json::Value = serde_json::from_str(&stdout(&json)).expect("JSON");
+    assert_eq!(printed["connection_point"]["secret"], INVITATION_SECRET);
 }
 
 /// The groups this build adds for an Agent Stream's account settings and

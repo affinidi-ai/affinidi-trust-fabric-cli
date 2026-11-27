@@ -30,7 +30,7 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 | **System-owned resource** (Agent Stream) | A resource Agent Stream will not move to another tenant. `tenant-ownership impact` reports it as `immutable`, and `tenant-ownership set` refuses it. |
 | **Grant** (_delegated credential grant_) | The access and refresh tokens a user's OAuth consent to a credential provider leaves in the delegation vault, held for one agent (`agent_did`) and one user (`user_identity_hash`). Listed and revoked with `delegation-vault`; the CLI never prints a grant's tokens. A revoked grant comes back only when that user completes the provider's OAuth flow again. |
 | **OS credential store** | The macOS Keychain, Windows Credential Manager, or Linux Secret Service, where the CLI keeps tokens. Tokens are never written to the configuration file. |
-| **Gateway connection** | A gateway-to-gateway link managed with `fabric agent-gateway connections`. Unrelated to a connection profile. |
+| **Gateway connection** | A gateway-to-gateway link managed with `fabric agent-gateway connections`. On Agent Stream the counterpart is a **Trust Fabric connection**, defined under Trust Fabric, below. Unrelated to a connection profile. |
 
 ## Agent Surfaces
 
@@ -56,7 +56,7 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 | Term | Meaning |
 | --- | --- |
 | **Connection point** | A DIDComm endpoint, with its own DID and keys, through which an appliance exchanges messages with a peer appliance over the Trust Fabric. Managed with `fabric agent-gateway connection-points`. On Agent Stream, the connection point manages its own identity, so `fabric agent-stream identities` cannot change it. _Not the same as an access point._ |
-| **Trust Fabric connection** (Agent Stream) | An Agent Stream's record of one appliance in the Trust Fabric, itself or a peer, which its API calls a gateway and serves at `/v1/gateways`. A policy can be set on it, and in the audit log a decision by that policy has the scope `gateway`. The Agent Stream counterpart of a gateway connection. _Not the same as a connection, the saved profile._ |
+| **Trust Fabric connection** (Agent Stream) | An Agent Stream's record of one appliance in the Trust Fabric, itself (type `self`) or a peer (type `remote`), which its API calls a gateway and serves at `/v1/gateways`. Managed with `fabric agent-stream connections` in builds with the `agent-stream` feature. A policy can be set on it, and in the audit log a decision by that policy has the scope `gateway`. The Agent Stream counterpart of a gateway connection. _Not the same as a connection, the saved profile._ |
 
 ## Agent Stream governance and drift
 
