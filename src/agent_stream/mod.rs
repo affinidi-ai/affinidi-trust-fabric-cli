@@ -15,6 +15,7 @@ mod delegation_vault;
 mod drift;
 mod governance;
 mod identities;
+mod integrations;
 mod jwt_verification_strategies;
 mod login;
 mod logs;
@@ -298,6 +299,30 @@ enum AgentStreamCommand {
     DelegationVault {
         #[command(subcommand)]
         command: delegation_vault::DelegationVaultCommand,
+    },
+    /// Manage integrations, such as the email, Slack, or webhook senders
+    /// Agent Stream notifies through.
+    ///
+    /// Each integration has a `type`, a `category` that sets which runtime
+    /// variables its `content` can use, its connection settings in
+    /// `configuration`, and the message `content` with ${VARIABLE}
+    /// placeholders. `integrations config` lists the types and categories on
+    /// offer, and `integrations runtime-variables` the variables of each
+    /// category. Agent Stream leaves only the stored credentials at the top
+    /// level of `configuration` out of its answers. The CLI removes any
+    /// secret-looking top-level value that still appears, and replaces one
+    /// nested deeper with a placeholder, with a `note: hid` line naming each.
+    /// Put the real value back in place of each placeholder before sending
+    /// the answer to `create` or `update`, which refuse it.
+    ///
+    /// Testing an integration, triggering one, and triggering several send
+    /// real messages, so they have no command here. Run them on purpose with
+    /// `fabric agent-stream api post /v1/integrations/test --file <json>`,
+    /// `api post /v1/integrations/<ID>/trigger --file <json>`, or `api post
+    /// /v1/integrations/trigger-multiple --file <json>`.
+    Integrations {
+        #[command(subcommand)]
+        command: integrations::IntegrationCommand,
     },
     /// Read the Agent Stream audit log.
     Audit {
@@ -606,6 +631,7 @@ async fn run_command(
             SharedCommand::jwt_verification_strategies(command)
         }
         AgentStreamCommand::DelegationVault { command } => SharedCommand::delegation_vault(command),
+        AgentStreamCommand::Integrations { command } => SharedCommand::integrations(command),
         AgentStreamCommand::Audit { command } => SharedCommand::Audit(command.into()),
         AgentStreamCommand::Metrics { command } => SharedCommand::Metrics(command.into()),
         AgentStreamCommand::Logs { command } => SharedCommand::Logs(command.into()),
@@ -622,10 +648,11 @@ async fn run_command(
 /// delete` naming the reserved `integrations` route, a `metrics truncate` or
 /// `logs truncate` without --yes, and a `policies delete`, `certificates
 /// delete`, `credential-providers delete`, `jwt-verification-strategies
-/// delete`, `delegation-vault revoke`, or `delegation-vault revoke-user` that
-/// would ask for a confirmation nobody can give. Only refusals that need
-/// neither the host nor a file belong here; the ones that do are checked as
-/// the command runs.
+/// delete`, `delegation-vault revoke`, `delegation-vault revoke-user`, or
+/// `integrations delete` that would ask for a confirmation nobody can give,
+/// and an `integrations get`, `update`, or `delete` whose ID is empty or names
+/// another integrations route. Only refusals that need neither the host nor a
+/// file belong here; the ones that do are checked as the command runs.
 fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
     match command {
         SharedCommand::ApiKeys(command) => command.refuse_without_terminal(),
@@ -633,6 +660,10 @@ fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
         SharedCommand::Users(command) => command.refuse_reserved_route(Product::AgentStream),
         SharedCommand::Metrics(command) => command.refuse_unconfirmed_truncate(),
         SharedCommand::Logs(command) => command.refuse_unconfirmed_truncate(),
+        SharedCommand::Integrations { command: integration, .. } => {
+            integration.refuse_sibling_route()?;
+            command.refuse_unconfirmed_removal()
+        }
         SharedCommand::Policies { .. }
         | SharedCommand::Certificates { .. }
         | SharedCommand::CredentialProviders { .. }
@@ -1565,7 +1596,7 @@ mod tests {
 
     /// The groups `fabric agent-stream` runs through the Agent Gateway
     /// commands.
-    const SHARED_GROUPS: [&str; 17] = [
+    const SHARED_GROUPS: [&str; 18] = [
         "secrets",
         "users",
         "identities",
@@ -1580,6 +1611,7 @@ mod tests {
         "credential-providers",
         "jwt-verification-strategies",
         "delegation-vault",
+        "integrations",
         "audit",
         "metrics",
         "logs",
@@ -1589,6 +1621,10 @@ mod tests {
     /// leaves out on purpose: `metrics status`, because Agent Stream has no
     /// OpenTelemetry export status route.
     const LEFT_OUT_OF_AGENT_STREAM: [(&str, &[&str]); 1] = [("metrics", &["status"])];
+
+    /// The subcommands of a shared group that only Agent Stream has: the
+    /// read-only `integrations config` and `integrations runtime-variables`.
+    const ONLY_ON_AGENT_STREAM: [(&str, &[&str]); 1] = [("integrations", &["config", "runtime-variables"])];
 
     /// The path of every subcommand under `command`, at any depth, such as
     /// `config show`, sorted.
@@ -1615,6 +1651,7 @@ mod tests {
             &["jwt-verification-strategies", "delete", "j-1"],
             &["delegation-vault", "revoke", "g-1"],
             &["delegation-vault", "revoke-user", "3f9a0c"],
+            &["integrations", "delete", "in-1"],
         ] {
             for (product, yes, parses) in [
                 ("agent-stream", "--yes", true),
@@ -1657,11 +1694,12 @@ mod tests {
                     .find_subcommand(group)
                     .unwrap_or_else(|| panic!("{group} on agent-stream")),
             );
-            let left_out: Vec<&str> = LEFT_OUT_OF_AGENT_STREAM
+            let mut left_out: Vec<&str> = LEFT_OUT_OF_AGENT_STREAM
                 .iter()
                 .filter(|(name, _)| *name == group)
                 .flat_map(|(_, paths)| paths.iter().copied())
                 .collect();
+            left_out.sort_unstable();
 
             let missing: Vec<&str> = on_gateway
                 .iter()
@@ -1681,8 +1719,14 @@ mod tests {
                         .any(|on| on == path)
                 })
                 .collect();
+            let mut only_on_stream: Vec<&str> = ONLY_ON_AGENT_STREAM
+                .iter()
+                .filter(|(name, _)| *name == group)
+                .flat_map(|(_, paths)| paths.iter().copied())
+                .collect();
+            only_on_stream.sort_unstable();
             assert_eq!(missing, left_out, "{group}: an Agent Gateway subcommand Agent Stream does not have");
-            assert!(extra.is_empty(), "{group}: an Agent Stream subcommand Agent Gateway does not have: {extra:?}");
+            assert_eq!(extra, only_on_stream, "{group}: an Agent Stream subcommand Agent Gateway does not have");
         }
     }
 
@@ -1760,7 +1804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_account_and_credential_groups_reach_their_routes_with_the_saved_token() {
+    async fn the_account_credential_and_integration_groups_reach_their_routes_with_the_saved_token() {
         let (host, requests) = scripted_agent_stream(vec![
             ("GET /api/v1/user-settings", "HTTP/1.1 200 OK", "{}"),
             ("GET /api/v1/terms/status", "HTTP/1.1 200 OK", "{}"),
@@ -1770,6 +1814,7 @@ mod tests {
             ("GET /api/v1/credential-providers", "HTTP/1.1 200 OK", "[]"),
             ("GET /api/v1/jwt-verification-strategies", "HTTP/1.1 200 OK", "[]"),
             ("GET /api/v1/delegation-vault", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/integrations", "HTTP/1.1 200 OK", "[]"),
         ])
         .await;
 
@@ -1782,6 +1827,7 @@ mod tests {
             &["credential-providers", "list"],
             &["jwt-verification-strategies", "list"],
             &["delegation-vault", "list"],
+            &["integrations", "list"],
         ] {
             let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
             run_stream(words, saved, &credentials)
@@ -1800,6 +1846,7 @@ mod tests {
                 "GET /api/v1/credential-providers HTTP/1.1",
                 "GET /api/v1/jwt-verification-strategies HTTP/1.1",
                 "GET /api/v1/delegation-vault HTTP/1.1",
+                "GET /api/v1/integrations HTTP/1.1",
             ]
         );
         assert!(

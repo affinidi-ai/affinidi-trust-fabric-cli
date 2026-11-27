@@ -620,6 +620,7 @@ fn credential_deletes_and_revokes_without_yes_and_with_a_typed_host_and_no_termi
         (&["jwt-verification-strategies", "delete", "j-1"], "refusing to delete 'j-1'"),
         (&["delegation-vault", "revoke", "g-1"], "refusing to revoke 'g-1'"),
         (&["delegation-vault", "revoke-user", "3f9a0c"], "refusing to revoke '3f9a0c'"),
+        (&["integrations", "delete", "in-1"], "refusing to delete 'in-1'"),
     ] {
         let (host, requests) = agent_stream_host();
         let args: Vec<&str> = ["agent-stream", "--host", &host]
@@ -1036,10 +1037,11 @@ fn drift_runs_get_hides_samples_unless_reveal_and_then_warns() {
     assert!(stderr(&shown).contains("warning: this output contains prompt content"), "{}", stderr(&shown));
 }
 
-/// The groups this build adds for an Agent Stream's account settings and
-/// credentials, each with a command that would otherwise parse.
+/// The groups this build adds for an Agent Stream's account settings,
+/// credentials, and integrations, each with a command that would otherwise
+/// parse.
 #[cfg(not(feature = "agent-stream"))]
-const ACCOUNT_AND_CREDENTIAL_COMMANDS: [&[&str]; 8] = [
+const ACCOUNT_CREDENTIAL_AND_INTEGRATION_COMMANDS: [&[&str]; 10] = [
     &["user-settings", "show"],
     &["terms", "status"],
     &["notifications", "welcome-template", "show"],
@@ -1048,12 +1050,14 @@ const ACCOUNT_AND_CREDENTIAL_COMMANDS: [&[&str]; 8] = [
     &["credential-providers", "list"],
     &["jwt-verification-strategies", "list"],
     &["delegation-vault", "list"],
+    &["integrations", "list"],
+    &["integrations", "config"],
 ];
 
 #[cfg(not(feature = "agent-stream"))]
 #[test]
-fn the_default_build_refuses_each_agent_stream_account_and_credential_group() {
-    for words in ACCOUNT_AND_CREDENTIAL_COMMANDS {
+fn the_default_build_refuses_each_agent_stream_account_credential_and_integration_group() {
+    for words in ACCOUNT_CREDENTIAL_AND_INTEGRATION_COMMANDS {
         let args: Vec<&str> = ["agent-stream"]
             .into_iter()
             .chain(words.iter().copied())
@@ -1256,6 +1260,229 @@ fn certificates_never_print_a_private_key_and_offer_no_reveal() {
     }
     assert_eq!(reveal.status.code(), Some(2), "{}", stderr(&reveal));
     assert!(stderr(&reveal).contains("unexpected argument '--reveal'"), "{}", stderr(&reveal));
+}
+
+/// An integration answer carrying stored credentials, which Agent Stream
+/// leaves out, to check that the CLI would not print them anyway.
+#[cfg(feature = "agent-stream")]
+const INTEGRATION_WITH_CREDENTIALS: &str = r#"{"id":"in-1","name":"mailer","description":"Alerts","type":"webhook","category":"general","configuration":{"url_secret_id":"hook-url","signing_secret":"sign-0123456789abcdef0123456789ab","headers":{"Authorization":"Bearer leaked-token","Content-Type":"application/json"}},"content":{},"status":"active"}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn integrations_print_the_agent_gateway_table_and_lines() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("POST /api/v1/integrations", "201 Created", r#"{"id":"in-1","name":"mailer"}"#),
+        ("PUT /api/v1/integrations/in-1", "200 OK", r#"{"id":"in-1","name":"mailer"}"#),
+        ("DELETE /api/v1/integrations/in-1", "204 No Content", ""),
+        (
+            "GET /api/v1/integrations",
+            "200 OK",
+            r#"[{"id":"in-1","name":"mailer","description":"Alerts","type":"email","category":"general","configuration":{},"content":{},"status":"active"}]"#,
+        ),
+    ]);
+
+    let list = fabric_on_stream(&host, &["integrations", "list"], "");
+
+    assert_eq!(
+        stdout(&list),
+        "NAME    ID    TYPE   STATUS  DESCRIPTION\n\
+         mailer  in-1  email  active  Alerts\n",
+        "{}",
+        stderr(&list)
+    );
+    for (args, line) in [
+        (&["integrations", "create", "--file", "-"][..], "Created integration 'in-1'\n"),
+        (&["integrations", "update", "in-1", "--file", "-"], "Updated integration 'in-1'\n"),
+        (&["integrations", "delete", "in-1", "--yes"], "Deleted integration 'in-1'\n"),
+    ] {
+        let output = fabric_on_stream(&host, args, INTEGRATION_DOCUMENT);
+
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), line, "{args:?}: {}", stderr(&output));
+    }
+    let document: serde_json::Value = serde_json::from_str(INTEGRATION_DOCUMENT).expect("the document is JSON");
+    assert_eq!(sent_body(&requests, "POST /api/v1/integrations"), document);
+    assert_eq!(sent_body(&requests, "PUT /api/v1/integrations/in-1"), document);
+}
+
+/// An integration document as `create` and `update` send it.
+#[cfg(feature = "agent-stream")]
+const INTEGRATION_DOCUMENT: &str = r#"{"name":"mailer","description":"Alerts","type":"email","category":"general","configuration":{"smtp_host":"smtp.example.com","smtp_password_secret_id":"smtp-key"},"content":{},"status":"active"}"#;
+
+/// An integration answer with a top-level credential, which Agent Stream
+/// leaves out, and a nested one, which Agent Stream answers as it is stored.
+#[cfg(feature = "agent-stream")]
+const INTEGRATION_WITH_A_NESTED_CREDENTIAL: &str = r#"{"id":"in-1","name":"broker","description":"","type":"webhook","category":"general","configuration":{"signing_secret":"sign-0123456789abcdef0123456789ab","options":{"sasl_password":"nested-do-not-print","region":"eu"}},"content":{},"status":"active"}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn a_nested_integration_credential_is_masked_and_the_saved_answer_is_refused_by_create_and_update() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/integrations/in-1", "200 OK", INTEGRATION_WITH_A_NESTED_CREDENTIAL),
+        ("POST /api/v1/integrations", "201 Created", r#"{"id":"in-2"}"#),
+        ("PUT /api/v1/integrations/in-1", "200 OK", r#"{"id":"in-1"}"#),
+    ]);
+
+    let get = fabric_on_stream(&host, &["--output", "json", "integrations", "get", "in-1"], "");
+
+    assert!(get.status.success(), "{}", stderr(&get));
+    let saved: serde_json::Value = serde_json::from_str(&stdout(&get)).expect("the answer is JSON");
+    assert_eq!(
+        saved["configuration"],
+        serde_json::json!({"options": {"sasl_password": "<hidden; put the real value back before sending>", "region": "eu"}}),
+        "the top-level signing_secret is removed and the nested password masked"
+    );
+    for text in [stdout(&get), stderr(&get)] {
+        assert!(!text.contains("nested-do-not-print"), "{text}");
+        assert!(!text.contains("sign-0123456789abcdef"), "{text}");
+        assert!(!text.contains("--reveal"), "{text}");
+    }
+    assert!(
+        stderr(&get).ends_with(
+            "\nnote: hid 'configuration.signing_secret', 'configuration.options.sasl_password'.\n\
+             note: put the real value back in 'configuration.options.sasl_password' before sending this to create \
+             or update, which refuse the placeholder; removing a nested field deletes it from the integration. \
+             `fabric agent-stream api get /v1/integrations/<ID>` prints the stored configuration as Agent Stream \
+             returns it.\n"
+        ),
+        "{}",
+        stderr(&get)
+    );
+
+    for args in [
+        &["integrations", "create", "--file", "-"][..],
+        &["integrations", "update", "in-1", "--file", "-"],
+        &["api", "put", "/v1/integrations/in-1", "--file", "-"],
+    ] {
+        let output = fabric_on_stream(&host, args, &stdout(&get));
+
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {}", stderr(&output));
+        assert!(
+            stderr(&output).ends_with(
+                "\nerror: the request body still carries the placeholder <hidden; put the real value back before \
+                 sending> at 'configuration.options.sasl_password'; put the real value back in its place, because \
+                 removing a nested field deletes it from the integration. `fabric agent-stream api get \
+                 /v1/integrations/<ID>` prints the stored configuration as Agent Stream returns it. Nothing was \
+                 sent\n"
+            ),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("--reveal"), "{args:?}: {}", stderr(&output));
+    }
+    assert!(
+        request_lines(&requests)
+            .iter()
+            .all(|line| line.starts_with("GET ")),
+        "{:?}",
+        request_lines(&requests)
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn a_list_asks_for_nested_values_back_only_when_it_prints_the_configuration() {
+    let (host, _) = agent_stream_stand_in(vec![(
+        "GET /api/v1/integrations",
+        "200 OK",
+        format!("[{INTEGRATION_WITH_A_NESTED_CREDENTIAL}]").leak(),
+    )]);
+
+    let table = fabric_on_stream(&host, &["integrations", "list"], "");
+    let json = fabric_on_stream(&host, &["--output", "json", "integrations", "list"], "");
+
+    assert!(table.status.success(), "{}", stderr(&table));
+    assert!(json.status.success(), "{}", stderr(&json));
+    assert!(!stderr(&table).contains("put the real value back"), "{}", stderr(&table));
+    assert!(
+        stderr(&json).contains("note: put the real value back in 'configuration.options.sasl_password' of in-1 before"),
+        "{}",
+        stderr(&json)
+    );
+    for output in [&table, &json] {
+        assert!(!stdout(output).contains("nested-do-not-print"), "{}", stdout(output));
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn integrations_never_print_a_stored_credential_and_name_what_they_hid() {
+    let (host, _) = agent_stream_stand_in(vec![
+        ("GET /api/v1/integrations/in-1", "200 OK", INTEGRATION_WITH_CREDENTIALS),
+        ("POST /api/v1/integrations", "201 Created", INTEGRATION_WITH_CREDENTIALS),
+        ("PUT /api/v1/integrations/in-1", "200 OK", INTEGRATION_WITH_CREDENTIALS),
+        ("GET /api/v1/integrations", "200 OK", format!("[{INTEGRATION_WITH_CREDENTIALS}]").leak()),
+    ]);
+    let document = r#"{"name":"mailer","configuration":{"url_secret_id":"hook-url"}}"#;
+
+    let get = fabric_on_stream(&host, &["integrations", "get", "in-1"], "");
+    let create = fabric_on_stream(&host, &["--output", "json", "integrations", "create", "--file", "-"], document);
+    let update =
+        fabric_on_stream(&host, &["--output", "json", "integrations", "update", "in-1", "--file", "-"], document);
+    let list = fabric_on_stream(&host, &["--output", "json", "integrations", "list"], "");
+
+    for (name, output) in [("get", &get), ("create", &create), ("update", &update), ("list", &list)] {
+        assert!(output.status.success(), "{name}: {}", stderr(output));
+        for secret in ["sign-0123456789abcdef", "leaked-token"] {
+            assert!(!stdout(output).contains(secret), "{name}: {}", stdout(output));
+            assert!(!stderr(output).contains(secret), "{name}: {}", stderr(output));
+        }
+        assert!(stdout(output).contains("hook-url"), "{name}: the reference stays: {}", stdout(output));
+        assert!(
+            stderr(output)
+                .contains("note: hid 'configuration.headers.Authorization', 'configuration.signing_secret'.\n"),
+            "{name}: {}",
+            stderr(output)
+        );
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn integrations_config_and_runtime_variables_print_what_agent_stream_answers() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/integrations/config", "200 OK", r#"{"types":[{"enum_value":"email"}],"categories":[]}"#),
+        (
+            "GET /api/v1/integrations/runtime-variables",
+            "200 OK",
+            r#"{"categories":[{"category":"general","variables":[]}]}"#,
+        ),
+    ]);
+
+    let config = fabric_on_stream(&host, &["--output", "json", "integrations", "config"], "");
+    let variables = fabric_on_stream(&host, &["--output", "json", "integrations", "runtime-variables"], "");
+
+    assert!(config.status.success(), "{}", stderr(&config));
+    assert!(variables.status.success(), "{}", stderr(&variables));
+    let config: serde_json::Value = serde_json::from_str(&stdout(&config)).expect("config is JSON");
+    let variables: serde_json::Value = serde_json::from_str(&stdout(&variables)).expect("variables are JSON");
+    assert_eq!(config["types"][0]["enum_value"], "email");
+    assert_eq!(variables["categories"][0]["category"], "general");
+    let sent = request_lines(&requests);
+    assert!(sent.contains(&"GET /api/v1/integrations/config HTTP/1.1".to_owned()), "{sent:?}");
+    assert!(sent.contains(&"GET /api/v1/integrations/runtime-variables HTTP/1.1".to_owned()), "{sent:?}");
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn integrations_have_no_command_that_sends_a_message() {
+    for words in
+        [&["integrations", "test"][..], &["integrations", "trigger", "in-1"], &["integrations", "trigger-multiple"]]
+    {
+        let args: Vec<&str> = ["agent-stream"]
+            .into_iter()
+            .chain(words.iter().copied())
+            .collect();
+
+        let output = fabric(&args, &[]);
+
+        assert_eq!(output.status.code(), Some(2), "{words:?}: {}", stderr(&output));
+        assert!(stderr(&output).contains("unrecognized subcommand"), "{words:?}: {}", stderr(&output));
+    }
+    let help = stdout(&fabric(&["agent-stream", "integrations", "--help"], &[]));
+    for route in ["/v1/integrations/test", "/v1/integrations/<ID>/trigger", "/v1/integrations/trigger-multiple"] {
+        assert!(help.contains(route), "{route}: {help}");
+    }
 }
 
 /// A document saved from a masked answer, as `fabric agent-gateway
