@@ -56,7 +56,7 @@ This document is the project glossary: the terms used in the CLI's commands, hel
 
 ## Agent Stream governance and drift
 
-Only in builds with the `agent-stream` feature. See [Governance and drift](docs/AGENT_STREAM_GOVERNANCE_AND_DRIFT.md).
+Only in builds with the `agent-stream` feature. See [Governance and drift](docs/agent-stream/GOVERNANCE_AND_DRIFT.md).
 
 | Term | Meaning |
 | --- | --- |

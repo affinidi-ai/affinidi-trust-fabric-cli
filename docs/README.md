@@ -28,11 +28,11 @@ Every command also documents its options in its help text: `fabric agent-gateway
 
 ## Agent Stream Commands
 
-Only in builds with the `agent-stream` Cargo feature, which releases leave out.
+`fabric agent-stream` exists only in builds with the `agent-stream` Cargo feature, which releases leave out.
 
 | Document | Command groups |
 | --- | --- |
-| [Governance and drift](AGENT_STREAM_GOVERNANCE_AND_DRIFT.md) | `governance` and `drift`: governance records, chain checks, drift verdicts, baselines, and replay runs |
+| [Governance and drift](agent-stream/GOVERNANCE_AND_DRIFT.md) | `governance` and `drift`: governance records, chain checks, drift verdicts, baselines, and replay runs |
 
 ## Development
 

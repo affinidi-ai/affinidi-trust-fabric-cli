@@ -1,8 +1,8 @@
-# Agent Stream Governance and Drift
+# Agent Stream governance and drift
 
 Audit an Agent Stream from a terminal: read its governance records, check that they are intact, and watch each surface's drift.
 
-These commands exist only in builds with the `agent-stream` Cargo feature, which releases leave out. All of them start with `fabric agent-stream`.
+`fabric agent-stream` exists only in builds with the `agent-stream` Cargo feature, which releases leave out. See [Build From Source](../development/GETTING_STARTED.md). All of these commands start with `fabric agent-stream`.
 
 ## Commands at a glance
 
