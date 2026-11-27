@@ -2269,8 +2269,8 @@ pub(crate) async fn run_shared(
 /// delete or a revoke with `ask_first` set first asks a question naming what
 /// it removes and the host, and when the answer is not yes it reports an
 /// `Aborted.` line and sends no delete or revoke. A `revoke-user` question
-/// says how many grants the grant list shows for the user hash; when it shows
-/// none, nothing is asked or revoked and a line says so. Only `secrets` takes
+/// says how many grants the grant list shows for the user hash, and when it
+/// shows none, asks whether to revoke anyway. Only `secrets` takes
 /// a document that --reveal could have unmasked, so in every other group a
 /// document still carrying a masked placeholder is refused with
 /// [`without_reveal_hint`]'s wording, which names no flag.
@@ -2304,9 +2304,8 @@ pub(crate) trait Prompter {
         question: impl std::future::Future<Output = String>,
     ) -> Result<bool>;
 
-    /// Reports, in `line`, that the action was not taken: an `Aborted.` line
-    /// after an answer that is not yes, or a line saying there was nothing to
-    /// revoke.
+    /// Reports, in `line`, that the action was not taken because the answer
+    /// was not yes.
     fn aborted(
         &mut self,
         line: &str,
@@ -2382,8 +2381,8 @@ impl<'a> Confirmation<'a> {
 
     /// This confirmation, with a revoke-user's grants counted from the grant
     /// list: those whose `user_identity_hash` is the hash given. The count
-    /// stays unknown when the list cannot be read, for example by a token
-    /// with delegation_vault.delete but not delegation_vault.view, and the
+    /// stays unknown when the grant list can't be read, for example without
+    /// delegation_vault.view, or the answer is not a JSON array, and the
     /// question then names every grant of the hash. Any other confirmation
     /// comes back as it is.
     async fn with_grant_count(
@@ -2396,23 +2395,9 @@ impl<'a> Confirmation<'a> {
         self
     }
 
-    /// The line reported in place of a question when the grant list shows no
-    /// grant of the user hash, so there is nothing to revoke; `None` for any
-    /// other confirmation.
-    fn nothing_to_revoke(
-        &self,
-        client: &GatewayClient,
-    ) -> Option<String> {
-        matches!(self.target, Target::UserGrants { count: Some(0) }).then(|| {
-            format!(
-                "No grants of user hash '{}' on {}; nothing was revoked.",
-                sanitize_whole(self.id),
-                sanitize_for_terminal(client.host())
-            )
-        })
-    }
-
-    /// The question asked at the prompt, naming the target and the host.
+    /// The question asked at the prompt, naming the target and the host. When
+    /// the grant list shows no grant of the user hash, the question still
+    /// offers the revoke, since the revoke itself decides what is removed.
     async fn question(
         &self,
         client: &GatewayClient,
@@ -2421,6 +2406,9 @@ impl<'a> Confirmation<'a> {
         let id = sanitize_whole(self.id);
         match &self.target {
             Target::Entity(path) => format!("{} {}?", self.action, describe_target(client, path, self.id).await),
+            Target::UserGrants { count: Some(0) } => {
+                format!("The grant list shows no grants of user hash {id} on {host}. Revoke anyway?")
+            }
             Target::UserGrants { count: Some(1) } => format!("Revoke 1 grant of user hash {id} on {host}?"),
             Target::UserGrants { count: Some(count) } => {
                 format!("Revoke {count} grants of user hash {id} on {host}?")
@@ -2563,10 +2551,6 @@ async fn run_shared_command(
         let confirmation = confirmation
             .with_grant_count(client)
             .await;
-        if let Some(line) = confirmation.nothing_to_revoke(client) {
-            prompter.aborted(&line);
-            return Ok(());
-        }
         if !prompter
             .ask(confirmation.verb, confirmation.id, confirmation.question(client))
             .await?

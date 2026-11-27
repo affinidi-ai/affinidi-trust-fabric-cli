@@ -284,9 +284,10 @@ the Agent Gateway command also ends in. An Agent Stream delete or revoke without
 carries `ask_first`, so `run_shared` asks first through a `Prompter`, the terminal in a
 real run and `ScriptedPrompter` in tests, and `refuse_before_connecting` refuses it with
 no terminal before anything is sent. Before asking, `revoke-user` counts the hash's grants
-in the grant list, so the question says how many the list shows; with none, it says so and
-sends no revoke. The revoke removes every grant the hash has when it runs, and the result
-line reports that number.
+in the grant list, so the question says how many the list shows; with none, it asks whether
+to revoke anyway. When the grant list can't be read, for example without
+`delegation_vault.view`, the question names every grant of the hash instead. The revoke
+removes every grant the hash has when it runs, and the result line reports that number.
 
 Inside `run_and_print`:
 

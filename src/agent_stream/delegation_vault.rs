@@ -43,13 +43,12 @@ pub enum DelegationVaultCommand {
     /// Revokes all of that user's grants at once, and a revoke cannot be
     /// undone. Unless you pass --yes, the command first counts the grants the
     /// grant list shows for the hash and names that number in its question;
-    /// when it shows none, the command says so and revokes nothing. The revoke
-    /// itself removes every grant the hash has when it runs, so the result
-    /// line reports the real number. Counting needs
-    /// the delegation_vault.view permission: without it, the question names
-    /// every grant of the hash instead. With --yes nothing is counted, and a
-    /// hash no grant carries revokes nothing. Table output reports how many
-    /// grants were revoked; `--output json` prints {"revoked": N}. Needs the
+    /// when the list shows none, it asks whether to revoke anyway. When the
+    /// grant list can't be read, for example without delegation_vault.view,
+    /// the question names every grant of the hash instead. With --yes nothing
+    /// is counted or asked. The revoke itself removes every grant the hash has
+    /// when it runs, so table output reports the real number revoked, which
+    /// can be 0; `--output json` prints {"revoked": N}. Needs the
     /// delegation_vault.delete permission.
     #[command(name = "revoke-user")]
     #[command(after_long_help = REVOKE_USER_EXAMPLES)]
@@ -222,30 +221,63 @@ mod tests {
         assert_eq!(start_lines(&requests), ["GET /api/v1/delegation-vault HTTP/1.1"]);
     }
 
+    /// A grant list whose only grant carries a hash that starts with
+    /// [`USER_HASH`], so it shows no grant of [`USER_HASH`] itself.
+    const NO_GRANTS_OF_USER_HASH: &str = r#"[{"id":"g-9","user_identity_hash":"3f9a0c0"}]"#;
+
     #[tokio::test]
-    async fn a_revoke_user_whose_hash_has_no_grants_says_so_without_asking_or_revoking() {
-        let (host, requests) = scripted_agent_stream(vec![(
-            "GET /api/v1/delegation-vault",
-            "HTTP/1.1 200 OK",
-            r#"[{"id":"g-9","user_identity_hash":"3f9a0c0"}]"#,
-        )])
-        .await;
-        let mut prompter = ScriptedPrompter::answering(true);
+    async fn a_declined_revoke_user_with_no_grants_in_the_list_asks_to_revoke_anyway_and_sends_no_revoke() {
+        let (host, requests) =
+            scripted_agent_stream(vec![("GET /api/v1/delegation-vault", "HTTP/1.1 200 OK", NO_GRANTS_OF_USER_HASH)])
+                .await;
+        let mut prompter = ScriptedPrompter::answering(false);
 
         run_shared_with(&client(host.clone()), revoke_user(false), Output::Table, &mut prompter)
             .await
-            .expect("a hash with no grants is not an error");
+            .expect("a declined revoke is not an error");
 
-        assert!(prompter.questions.is_empty(), "{:?}", prompter.questions);
-        assert_eq!(prompter.aborted, [format!("No grants of user hash '3f9a0c' on {host}; nothing was revoked.")]);
+        assert_eq!(
+            prompter.questions,
+            [format!("The grant list shows no grants of user hash 3f9a0c on {host}. Revoke anyway?")]
+        );
+        assert_eq!(prompter.aborted, ["Aborted. The grants of user hash '3f9a0c' were not revoked."]);
         assert_eq!(start_lines(&requests), ["GET /api/v1/delegation-vault HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn a_revoke_user_answered_yes_with_no_grants_in_the_list_sends_the_revoke() {
+        let (host, requests) = scripted_agent_stream(vec![
+            ("GET /api/v1/delegation-vault", "HTTP/1.1 200 OK", NO_GRANTS_OF_USER_HASH),
+            ("DELETE /api/v1/delegation-vault/by-user/3f9a0c", "HTTP/1.1 200 OK", r#"{"revoked":0}"#),
+        ])
+        .await;
+        let mut prompter = ScriptedPrompter::answering(true);
+
+        for output in [Output::Table, Output::Json] {
+            run_shared_with(&client(host.clone()), revoke_user(false), output, &mut prompter)
+                .await
+                .expect("revoke user");
+        }
+
+        let question = format!("The grant list shows no grants of user hash 3f9a0c on {host}. Revoke anyway?");
+        assert_eq!(prompter.questions, [question.clone(), question]);
+        assert!(prompter.aborted.is_empty(), "{:?}", prompter.aborted);
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/delegation-vault HTTP/1.1",
+                "DELETE /api/v1/delegation-vault/by-user/3f9a0c HTTP/1.1",
+                "GET /api/v1/delegation-vault HTTP/1.1",
+                "DELETE /api/v1/delegation-vault/by-user/3f9a0c HTTP/1.1",
+            ]
+        );
     }
 
     #[tokio::test]
     async fn a_revoke_user_question_shows_the_typed_hash_without_terminal_controls() {
         let (host, requests) =
             scripted_agent_stream(vec![("GET /api/v1/delegation-vault", "HTTP/1.1 200 OK", "[]")]).await;
-        let mut prompter = ScriptedPrompter::answering(true);
+        let mut prompter = ScriptedPrompter::answering(false);
         let command = SharedCommand::delegation_vault(DelegationVaultCommand::RevokeUser {
             user_hash: "3f9a\u{1b}[2J0c\n".to_owned(),
             yes: false,
@@ -253,10 +285,38 @@ mod tests {
 
         run_shared_with(&client(host.clone()), command, Output::Table, &mut prompter)
             .await
-            .expect("a hash with no grants is not an error");
+            .expect("a declined revoke is not an error");
 
-        assert_eq!(prompter.aborted, [format!("No grants of user hash '3f9a[2J0c ' on {host}; nothing was revoked.")]);
+        assert_eq!(
+            prompter.questions,
+            [format!("The grant list shows no grants of user hash 3f9a[2J0c  on {host}. Revoke anyway?")]
+        );
+        assert_eq!(prompter.aborted, ["Aborted. The grants of user hash '3f9a[2J0c ' were not revoked."]);
         assert_eq!(start_lines(&requests), ["GET /api/v1/delegation-vault HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn a_revoke_user_whose_grant_list_fails_or_is_not_an_array_still_asks_about_every_grant() {
+        for (status_line, body) in [
+            ("HTTP/1.1 500 Internal Server Error", r#"{"error":"Failed to list: storage unavailable"}"#),
+            ("HTTP/1.1 200 OK", r#"{"grants":[{"id":"g-1","user_identity_hash":"3f9a0c"}]}"#),
+        ] {
+            let (host, requests) =
+                scripted_agent_stream(vec![("GET /api/v1/delegation-vault", status_line, body)]).await;
+            let mut prompter = ScriptedPrompter::answering(false);
+
+            run_shared_with(&client(host.clone()), revoke_user(false), Output::Table, &mut prompter)
+                .await
+                .expect("a declined revoke is not an error");
+
+            assert_eq!(
+                prompter.questions,
+                [format!("Revoke every grant of user hash 3f9a0c on {host}?")],
+                "{status_line}"
+            );
+            assert_eq!(prompter.aborted, ["Aborted. The grants of user hash '3f9a0c' were not revoked."]);
+            assert_eq!(start_lines(&requests), ["GET /api/v1/delegation-vault HTTP/1.1"], "{status_line}");
+        }
     }
 
     #[tokio::test]
