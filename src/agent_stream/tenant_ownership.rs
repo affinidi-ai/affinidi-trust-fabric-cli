@@ -150,8 +150,9 @@ impl OwnershipKind {
 }
 
 /// Refuses a kind Agent Stream does not track on its own. clap already takes
-/// exactly one of --tenant and --clear, and the same rule is kept here so a
-/// command built any other way is never read as a clear.
+/// exactly one of --tenant and --clear; [`OwnershipTarget::from_flags`] keeps
+/// Agent Gateway's rule and wording for a command built any other way, so it
+/// is never read as a clear.
 impl TryFrom<TenantOwnershipCommand> for OwnershipChange {
     type Error = anyhow::Error;
 
@@ -161,11 +162,7 @@ impl TryFrom<TenantOwnershipCommand> for OwnershipChange {
             TenantOwnershipCommand::Set { kind, id, tenant, clear } => Self::Set {
                 kind: kind.tracked()?,
                 id,
-                owner: match (tenant, clear) {
-                    (Some(tenant), false) => OwnershipTarget::Assign(tenant),
-                    (None, true) => OwnershipTarget::Clear,
-                    (Some(_), true) | (None, false) => bail!("pass exactly one of --tenant or --clear"),
-                },
+                owner: OwnershipTarget::from_flags(tenant, clear)?,
             },
         })
     }
@@ -262,6 +259,24 @@ mod tests {
         assert!(parses(&["set", "pipes", "p-1", "--clear"]));
         assert!(!parses(&["set", "pipes", "p-1"]));
         assert!(!parses(&["set", "pipes", "p-1", "--tenant", "acme", "--clear"]));
+    }
+
+    #[test]
+    fn a_set_built_without_one_choice_is_refused_as_agent_gateway_refuses_it() {
+        let refusal = |tenant: Option<&str>, clear: bool| {
+            OwnershipChange::try_from(TenantOwnershipCommand::Set {
+                kind: OwnershipKind::Pipes,
+                id: "p-1".to_owned(),
+                tenant: tenant.map(str::to_owned),
+                clear,
+            })
+            .err()
+            .expect("neither or both is refused before any request")
+            .to_string()
+        };
+
+        assert_eq!(refusal(None, false), "provide --tenant <tenant-id>, or --clear to remove tenant ownership");
+        assert_eq!(refusal(Some("acme"), true), "--tenant and --clear cannot be combined");
     }
 
     #[tokio::test]

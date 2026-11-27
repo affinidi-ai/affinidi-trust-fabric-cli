@@ -2268,8 +2268,10 @@ pub(crate) async fn run_shared(
 /// [`run_shared`], with the confirmation prompt answered by `prompter`. A
 /// delete or a revoke with `ask_first` set first asks a question naming what
 /// it removes and the host, and when the answer is not yes it reports an
-/// `Aborted.` line and sends no delete or revoke. Only `secrets` takes a
-/// document that --reveal could have unmasked, so in every other group a
+/// `Aborted.` line and sends no delete or revoke. A `revoke-user` question
+/// says how many grants the grant list shows for the user hash; when it shows
+/// none, nothing is asked or revoked and a line says so. Only `secrets` takes
+/// a document that --reveal could have unmasked, so in every other group a
 /// document still carrying a masked placeholder is refused with
 /// [`without_reveal_hint`]'s wording, which names no flag.
 #[cfg(feature = "agent-stream")]
@@ -2302,7 +2304,9 @@ pub(crate) trait Prompter {
         question: impl std::future::Future<Output = String>,
     ) -> Result<bool>;
 
-    /// Reports that the action was not taken, in the `Aborted.` line `line`.
+    /// Reports, in `line`, that the action was not taken: an `Aborted.` line
+    /// after an answer that is not yes, or a line saying there was nothing to
+    /// revoke.
     fn aborted(
         &mut self,
         line: &str,
@@ -2310,8 +2314,8 @@ pub(crate) trait Prompter {
 }
 
 /// The [`Prompter`] of a real run: it asks on standard error, reads the answer
-/// from a terminal through [`confirm_action`], and prints the `Aborted.` line
-/// on standard output.
+/// from a terminal through [`confirm_action`], and prints the line saying the
+/// action was not taken on standard output.
 #[cfg(feature = "agent-stream")]
 struct AtTheTerminal;
 
@@ -2335,31 +2339,116 @@ impl Prompter for AtTheTerminal {
 }
 
 /// What a shared command that asks first is about to do: the `verb` and `id`
-/// a refusal names, the `action` its question starts with, the `lookup` path
-/// whose name the question shows beside the id, if the target has one, and
-/// the `aborted` line reported when the answer is no.
+/// a refusal names, the `action` its question starts with, the `target` the
+/// question describes, and the `aborted` line reported when the answer is no.
 #[cfg(feature = "agent-stream")]
 struct Confirmation<'a> {
     verb: &'static str,
     id: &'a str,
     action: &'static str,
-    lookup: Option<String>,
+    target: Target,
     aborted: String,
 }
 
+/// What the question of a [`Confirmation`] shows beside the id and host.
 #[cfg(feature = "agent-stream")]
-impl Confirmation<'_> {
+enum Target {
+    /// One entity, whose name the question reads from this path.
+    Entity(String),
+    /// Every grant of a user hash, with how many there are once
+    /// [`Confirmation::with_grant_count`] has counted them, or `None` when
+    /// the grant list could not be read.
+    UserGrants { count: Option<usize> },
+}
+
+#[cfg(feature = "agent-stream")]
+impl<'a> Confirmation<'a> {
+    /// The confirmation of a delete of the entity at `path`, whose question
+    /// starts with `action` and whose `Aborted.` line names it as `what`.
+    fn delete(
+        id: &'a str,
+        action: &'static str,
+        what: &str,
+        path: String,
+    ) -> Self {
+        Self {
+            verb: "delete",
+            id,
+            action,
+            target: Target::Entity(path),
+            aborted: format!("Aborted. {what} '{}' was not deleted.", sanitize_whole(id)),
+        }
+    }
+
+    /// This confirmation, with a revoke-user's grants counted from the grant
+    /// list: those whose `user_identity_hash` is the hash given. The count
+    /// stays unknown when the list cannot be read, for example by a token
+    /// with delegation_vault.delete but not delegation_vault.view, and the
+    /// question then names every grant of the hash. Any other confirmation
+    /// comes back as it is.
+    async fn with_grant_count(
+        mut self,
+        client: &GatewayClient,
+    ) -> Self {
+        if let Target::UserGrants { count } = &mut self.target {
+            *count = count_user_grants(client, self.id).await;
+        }
+        self
+    }
+
+    /// The line reported in place of a question when the grant list shows no
+    /// grant of the user hash, so there is nothing to revoke; `None` for any
+    /// other confirmation.
+    fn nothing_to_revoke(
+        &self,
+        client: &GatewayClient,
+    ) -> Option<String> {
+        matches!(self.target, Target::UserGrants { count: Some(0) }).then(|| {
+            format!(
+                "No grants of user hash '{}' on {}; nothing was revoked.",
+                sanitize_whole(self.id),
+                sanitize_for_terminal(client.host())
+            )
+        })
+    }
+
     /// The question asked at the prompt, naming the target and the host.
     async fn question(
         &self,
         client: &GatewayClient,
     ) -> String {
-        let target = match &self.lookup {
-            Some(path) => describe_target(client, path, self.id).await,
-            None => format!("{} on {}", sanitize_whole(self.id), sanitize_for_terminal(client.host())),
-        };
-        format!("{} {target}?", self.action)
+        let host = sanitize_for_terminal(client.host());
+        let id = sanitize_whole(self.id);
+        match &self.target {
+            Target::Entity(path) => format!("{} {}?", self.action, describe_target(client, path, self.id).await),
+            Target::UserGrants { count: Some(1) } => format!("Revoke 1 grant of user hash {id} on {host}?"),
+            Target::UserGrants { count: Some(count) } => {
+                format!("Revoke {count} grants of user hash {id} on {host}?")
+            }
+            Target::UserGrants { count: None } => format!("{} {id} on {host}?", self.action),
+        }
     }
+}
+
+/// How many grants in the grant list carry `user_hash` as their
+/// `user_identity_hash`, or `None` when the list cannot be read or is not a
+/// JSON array.
+#[cfg(feature = "agent-stream")]
+async fn count_user_grants(
+    client: &GatewayClient,
+    user_hash: &str,
+) -> Option<usize> {
+    let grants = client
+        .request(Method::GET, DELEGATION_VAULT_PATH, None)
+        .await
+        .ok()?;
+    Some(
+        grants
+            .as_array()?
+            .iter()
+            .filter(|grant| string_field(grant, "user_identity_hash") == Some(user_hash))
+            .count(),
+    )
 }
 
 #[cfg(feature = "agent-stream")]
@@ -2367,73 +2456,62 @@ impl SharedCommand {
     /// What this command asks before it runs, or `None` when it runs at once:
     /// a delete or a revoke with `ask_first` set.
     fn confirmation(&self) -> Option<Confirmation<'_>> {
-        let (verb, id, action, lookup, what) = match self {
+        match self {
             Self::Policies {
                 command: PolicyCommand::Delete { policy_id },
                 ask_first: true,
-            } => {
-                ("delete", policy_id, "Delete policy", Some(entity_path("/v1/policy-definitions", policy_id)), "Policy")
-            }
+            } => Some(Confirmation::delete(
+                policy_id,
+                "Delete policy",
+                "Policy",
+                entity_path("/v1/policy-definitions", policy_id),
+            )),
             Self::Certificates {
                 command: CrudCommand::Delete { id },
                 ask_first: true,
-            } => ("delete", id, "Delete certificate", Some(entity_path(CERTIFICATES_PATH, id)), "Certificate"),
+            } => {
+                Some(Confirmation::delete(id, "Delete certificate", "Certificate", entity_path(CERTIFICATES_PATH, id)))
+            }
             Self::CredentialProviders {
                 command: CrudCommand::Delete { id },
                 ask_first: true,
-            } => (
-                "delete",
+            } => Some(Confirmation::delete(
                 id,
                 "Delete credential provider",
-                Some(entity_path(CREDENTIAL_PROVIDERS_PATH, id)),
                 "Credential provider",
-            ),
+                entity_path(CREDENTIAL_PROVIDERS_PATH, id),
+            )),
             Self::JwtVerificationStrategies {
                 command: JwtStrategyCommand::Crud(CrudCommand::Delete { id }),
                 ask_first: true,
-            } => (
-                "delete",
+            } => Some(Confirmation::delete(
                 id,
                 "Delete JWT verification strategy",
-                Some(entity_path(JWT_STRATEGIES_PATH, id)),
                 "JWT verification strategy",
-            ),
+                entity_path(JWT_STRATEGIES_PATH, id),
+            )),
             Self::DelegationVault {
                 command: DelegationVaultCommand::Revoke { id },
                 ask_first: true,
-            } => {
-                return Some(Confirmation {
-                    verb: "revoke",
-                    id,
-                    action: "Revoke grant",
-                    lookup: Some(encoded_path(DELEGATION_VAULT_PATH, id)),
-                    aborted: format!("Aborted. Grant '{}' was not revoked.", sanitize_whole(id)),
-                });
-            }
+            } => Some(Confirmation {
+                verb: "revoke",
+                id,
+                action: "Revoke grant",
+                target: Target::Entity(encoded_path(DELEGATION_VAULT_PATH, id)),
+                aborted: format!("Aborted. Grant '{}' was not revoked.", sanitize_whole(id)),
+            }),
             Self::DelegationVault {
                 command: DelegationVaultCommand::RevokeUser { user_hash },
                 ask_first: true,
-            } => {
-                return Some(Confirmation {
-                    verb: "revoke",
-                    id: user_hash,
-                    action: "Revoke every grant of user hash",
-                    lookup: None,
-                    aborted: format!(
-                        "Aborted. The grants of user hash '{}' were not revoked.",
-                        sanitize_whole(user_hash)
-                    ),
-                });
-            }
-            _ => return None,
-        };
-        Some(Confirmation {
-            verb,
-            id,
-            action,
-            lookup,
-            aborted: format!("Aborted. {what} '{}' was not deleted.", sanitize_whole(id)),
-        })
+            } => Some(Confirmation {
+                verb: "revoke",
+                id: user_hash,
+                action: "Revoke every grant of user hash",
+                target: Target::UserGrants { count: None },
+                aborted: format!("Aborted. The grants of user hash '{}' were not revoked.", sanitize_whole(user_hash)),
+            }),
+            _ => None,
+        }
     }
 
     /// This command, with a `certificates delete`'s certificate given by the
@@ -2481,13 +2559,21 @@ async fn run_shared_command(
     let command = command
         .with_resolved_certificate(client)
         .await?;
-    if let Some(confirmation) = command.confirmation()
-        && !prompter
+    if let Some(confirmation) = command.confirmation() {
+        let confirmation = confirmation
+            .with_grant_count(client)
+            .await;
+        if let Some(line) = confirmation.nothing_to_revoke(client) {
+            prompter.aborted(&line);
+            return Ok(());
+        }
+        if !prompter
             .ask(confirmation.verb, confirmation.id, confirmation.question(client))
             .await?
-    {
-        prompter.aborted(&confirmation.aborted);
-        return Ok(());
+        {
+            prompter.aborted(&confirmation.aborted);
+            return Ok(());
+        }
     }
     let command = match command {
         SharedCommand::TenantOwnership(change) => {
@@ -11083,17 +11169,21 @@ mod secrets_certs_tests {
             .expect("an update that leaves the value alone");
     }
 
+    /// The full refusal of a masked document on a command that offers
+    /// --reveal, pinned so the Agent Gateway text cannot change unnoticed.
+    fn masked_refusal() -> String {
+        format!(
+            "the request body still carries the masked placeholder {MASKED_VALUE}; re-read the entity with --reveal, or remove the masked field to leave the stored credential untouched"
+        )
+    }
+
     #[test]
     fn a_masked_document_is_refused_before_it_reaches_the_gateway() {
         let round_tripped = json!({"id": "s-1", "name": "Stripe", "value": MASKED_VALUE});
 
         let error = reject_masked_values(&round_tripped).expect_err("a masked value must be refused");
 
-        assert!(
-            error
-                .to_string()
-                .contains("--reveal")
-        );
+        assert_eq!(error.to_string(), masked_refusal());
         reject_masked_values(&json!({"id": "s-1", "value": "sk_live_1"})).expect("a real value");
         reject_masked_values(&json!({"id": "cert-1", "private_key_pem": null})).expect("no credential at all");
     }
@@ -11109,11 +11199,7 @@ mod secrets_certs_tests {
 
         let error = read_json(file.path()).expect_err("a masked document must be refused");
 
-        assert!(
-            error
-                .to_string()
-                .contains("--reveal")
-        );
+        assert_eq!(error.to_string(), masked_refusal());
 
         let mut clean = tempfile::NamedTempFile::new().expect("temp file");
         write!(clean, r#"{{"name":"Edge","private_key_pem":"test-pem"}}"#).expect("write");
@@ -11141,11 +11227,7 @@ mod secrets_certs_tests {
         .await
         .expect_err("a masked inline body must be refused");
 
-        assert!(
-            error
-                .to_string()
-                .contains("--reveal")
-        );
+        assert_eq!(error.to_string(), masked_refusal());
         assert_eq!(request_line(&request), "", "the refused body must not reach the gateway");
 
         let (host, request) = recording_server("HTTP/1.1 200 OK", r#"{"id":"s-1"}"#).await;
@@ -12973,6 +13055,23 @@ pub(crate) enum OwnershipTarget {
     Clear,
 }
 
+impl OwnershipTarget {
+    /// Reads the --tenant and --clear flags of either product's `set`, and
+    /// refuses neither or both before any request, so an absent tenant is
+    /// never read as a clear.
+    pub(crate) fn from_flags(
+        tenant: Option<String>,
+        clear: bool,
+    ) -> Result<Self> {
+        match (tenant, clear) {
+            (Some(_), true) => bail!("--tenant and --clear cannot be combined"),
+            (Some(tenant), false) => Ok(Self::Assign(tenant)),
+            (None, true) => Ok(Self::Clear),
+            (None, false) => bail!("provide --tenant <tenant-id>, or --clear to remove tenant ownership"),
+        }
+    }
+}
+
 /// Agent Gateway's `set` takes --tenant and --clear as two optional flags, so
 /// a command with neither, or with both, is refused here, before any request.
 impl TryFrom<TenantOwnershipCommand> for OwnershipChange {
@@ -12984,12 +13083,7 @@ impl TryFrom<TenantOwnershipCommand> for OwnershipChange {
             TenantOwnershipCommand::Set { kind, id, tenant, clear } => Self::Set {
                 kind: kind.as_str(),
                 id,
-                owner: match (tenant, clear) {
-                    (Some(_), true) => bail!("--tenant and --clear cannot be combined"),
-                    (Some(tenant), false) => OwnershipTarget::Assign(tenant),
-                    (None, true) => OwnershipTarget::Clear,
-                    (None, false) => bail!("provide --tenant <tenant-id>, or --clear to remove tenant ownership"),
-                },
+                owner: OwnershipTarget::from_flags(tenant, clear)?,
             },
         })
     }

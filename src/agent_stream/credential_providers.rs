@@ -207,6 +207,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_delete_answered_yes_sends_the_delete_after_the_question() {
+        let (host, requests) = scripted_agent_stream(vec![
+            ("GET /api/v1/credential-providers/cp-1", "HTTP/1.1 200 OK", PROVIDER),
+            ("DELETE /api/v1/credential-providers/cp-1", "HTTP/1.1 204 No Content", ""),
+        ])
+        .await;
+        let mut prompter = ScriptedPrompter::answering(true);
+
+        run_shared_with(&client(host.clone()), delete(false), Output::Table, &mut prompter)
+            .await
+            .expect("delete");
+
+        assert_eq!(prompter.questions, [format!("Delete credential provider 'Stripe' (cp-1) on {host}?")]);
+        assert!(prompter.aborted.is_empty(), "{:?}", prompter.aborted);
+        assert_eq!(
+            start_lines(&requests),
+            ["GET /api/v1/credential-providers/cp-1 HTTP/1.1", "DELETE /api/v1/credential-providers/cp-1 HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
     async fn a_delete_with_yes_sends_the_delete_without_asking() {
         let (host, requests) =
             scripted_agent_stream(vec![("DELETE /api/v1/credential-providers/cp-1", "HTTP/1.1 204 No Content", "")])

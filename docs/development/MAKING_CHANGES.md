@@ -87,9 +87,9 @@ group with one command beyond CRUD.
 - A group whose output is not one value, such as a file written to disk or several
   tables, returns from `run_and_print` directly, as `Audit`, `Payments`, `Metrics`, and
   `Logs` do.
-- Every Agent Gateway error passes through `add_terms_hint` in `run`, and every error of a
-  command Agent Stream runs through `run_shared` passes through it there. Do not add it
-  again.
+- Every Agent Gateway error passes through `add_terms_hint` in `run`, and every Agent
+  Stream error passes through it in `agent_stream::dispatch_with`, whichever path runs
+  the command. Do not add it again.
 
 ## Add a resource that fits the shared CRUD commands
 

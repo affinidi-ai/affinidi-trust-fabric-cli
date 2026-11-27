@@ -683,7 +683,7 @@ fn product_error(
         .as_ref()
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str);
-    let status_error = |status: StatusCode, message: String| -> anyhow::Error {
+    let coded_error = |status: StatusCode, message: String| -> anyhow::Error {
         GatewayStatusError {
             status,
             message,
@@ -698,8 +698,8 @@ fn product_error(
         // token scope does not include"), which a single generic
         // message would collapse into one case.
         return match message {
-            Some(message) => status_error(status, message.to_owned()),
-            None => status_error(status, format!("missing required scope '{permission}'")),
+            Some(message) => coded_error(status, message.to_owned()),
+            None => coded_error(status, format!("missing required scope '{permission}'")),
         };
     }
     // A JSON body with no reason field is shown whole, re-serialised from its
@@ -726,7 +726,7 @@ fn product_error(
         });
     let server_said = message.is_some() || !body_is_empty;
     if status == StatusCode::UNAUTHORIZED {
-        return status_error(
+        return coded_error(
             status,
             match product {
                 Product::AgentGateway => format!("gateway rejected the bearer token: {detail}"),
@@ -740,10 +740,10 @@ fn product_error(
     if status == StatusCode::FORBIDDEN && product == Product::AgentStream {
         let terms_required = message.is_none() && code == Some(TERMS_ACCEPTANCE_REQUIRED);
         if terms_required {
-            return status_error(status, AGENT_STREAM_TERMS_REQUIRED.to_owned());
+            return coded_error(status, AGENT_STREAM_TERMS_REQUIRED.to_owned());
         }
         if !server_said && credential != Credential::Basic {
-            return status_error(
+            return coded_error(
                 status,
                 format!(
                     "Agent Stream answered {status}, so your role or the scopes of the access token in use do not \
@@ -758,9 +758,9 @@ fn product_error(
     // own ("unknown scope: X"); only prefix the HTTP status when there
     // was nothing better for the server to say.
     if server_said {
-        return status_error(status, detail);
+        return coded_error(status, detail);
     }
-    status_error(status, format!("{} returned {status}: {detail}", product.message_name()))
+    coded_error(status, format!("{} returned {status}: {detail}", product.message_name()))
 }
 
 /// The `code` Agent Stream answers with when the signed-in user has not

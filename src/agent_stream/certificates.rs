@@ -43,7 +43,9 @@ pub enum CertificateCommand {
     /// rest. `private_key_pem` is write-only: leave it out to keep the stored
     /// key, or send a new one to replace it. The tenant does not change here;
     /// `fabric agent-stream tenant-ownership set certificates <ID> --tenant
-    /// <TENANT>` changes it. Needs the certificates.edit permission.
+    /// <TENANT>` changes it. Needs the certificates.edit permission, and the
+    /// certificates.view permission to look a name up; without it, pass the
+    /// certificate's id, a UUID.
     Update {
         /// The certificate's id or name. A name shared by several
         /// certificates is refused; pass the id instead.
@@ -58,7 +60,9 @@ pub enum CertificateCommand {
     ///
     /// The command asks for confirmation first unless you pass --yes, and
     /// Agent Stream does not check whether anything still uses the
-    /// certificate. Needs the certificates.edit permission.
+    /// certificate. Needs the certificates.edit permission, and the
+    /// certificates.view permission to look a name up; without it, pass the
+    /// certificate's id, a UUID.
     #[command(after_long_help = DELETE_EXAMPLES)]
     Delete {
         /// The certificate's id or name. A name shared by several

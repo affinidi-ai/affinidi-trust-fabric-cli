@@ -283,7 +283,10 @@ the Agent Gateway command also ends in. An Agent Stream delete or revoke without
 `jwt-verification-strategies delete`, `delegation-vault revoke`, and `revoke-user`)
 carries `ask_first`, so `run_shared` asks first through a `Prompter`, the terminal in a
 real run and `ScriptedPrompter` in tests, and `refuse_before_connecting` refuses it with
-no terminal before anything is sent.
+no terminal before anything is sent. Before asking, `revoke-user` counts the hash's grants
+in the grant list, so the question says how many the list shows; with none, it says so and
+sends no revoke. The revoke removes every grant the hash has when it runs, and the result
+line reports that number.
 
 Inside `run_and_print`:
 

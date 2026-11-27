@@ -1167,6 +1167,58 @@ fn certificates_credential_providers_jwt_strategies_and_grants_print_the_agent_g
     }
 }
 
+#[cfg(feature = "agent-stream")]
+#[test]
+fn user_settings_terms_notifications_and_tenant_ownership_print_the_agent_gateway_tables_and_lines() {
+    let (host, _) = agent_stream_stand_in(vec![
+        (
+            "GET /api/v1/user-settings",
+            "200 OK",
+            r#"{"refresh_interval_seconds":30,"prometheus_auth_password_hash":"$2b$12$hash"}"#,
+        ),
+        ("POST /api/v1/user-settings", "200 OK", r#"{"refresh_interval_seconds":60}"#),
+        ("DELETE /api/v1/user-settings", "200 OK", r#"{"refresh_interval_seconds":30}"#),
+        ("GET /api/v1/terms/status", "200 OK", r#"{"accepted":true,"required":[]}"#),
+        ("POST /api/v1/terms/customer/deactivate", "204 No Content", ""),
+        ("PUT /api/v1/notifications/user-welcome-template", "204 No Content", ""),
+        ("GET /api/v1/users/u-1", "200 OK", r#"{"id":"u-1"}"#),
+        ("POST /api/v1/notifications/send-welcome", "204 No Content", ""),
+        (
+            "GET /api/v1/tenant-ownership/pipes/p-1/impact",
+            "200 OK",
+            r#"{"kind":"pipes","id":"p-1","tenant_id":"acme","immutable":false}"#,
+        ),
+        ("PUT /api/v1/tenant-ownership/pipes/p-1", "200 OK", r#"{"kind":"pipes","id":"p-1","tenant_id":"acme"}"#),
+    ]);
+    let run = |args: &[&str]| fabric_on_stream(&host, args, r#"{"refresh_interval_seconds":60}"#);
+
+    for (args, printed) in [
+        (&["user-settings", "show"][..], "{\n  \"refresh_interval_seconds\": 30\n}\n"),
+        (&["user-settings", "set", "--file", "-"], "{\n  \"refresh_interval_seconds\": 60\n}\n"),
+        (&["user-settings", "reset"], "{\n  \"refresh_interval_seconds\": 30\n}\n"),
+        (&["terms", "status"], "{\n  \"accepted\": true,\n  \"required\": []\n}\n"),
+        (&["terms", "deactivate"], "Customer Terms of Use deactivated.\n"),
+        (&["notifications", "welcome-template", "set", "--file", "-"], "Welcome notification template updated.\n"),
+        (
+            &["notifications", "send-welcome", "--user-id", "u-1", "--title", "Welcome", "--message", "Hello"],
+            "Welcome notification sent.\n",
+        ),
+        (
+            &["tenant-ownership", "impact", "pipes", "p-1"],
+            "{\n  \"id\": \"p-1\",\n  \"immutable\": false,\n  \"kind\": \"pipes\",\n  \"tenant_id\": \"acme\"\n}\n",
+        ),
+        (
+            &["tenant-ownership", "set", "pipes", "p-1", "--tenant", "acme"],
+            "{\n  \"id\": \"p-1\",\n  \"kind\": \"pipes\",\n  \"tenant_id\": \"acme\"\n}\n",
+        ),
+    ] {
+        let output = run(args);
+
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), printed, "{args:?}: {}", stderr(&output));
+    }
+}
+
 /// A certificate answer carrying a private key, which Agent Stream never
 /// sends, to check that the CLI would not print one anyway.
 #[cfg(feature = "agent-stream")]
