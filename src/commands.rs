@@ -8866,7 +8866,7 @@ const SURFACES_PATH: &str = "/v1/surfaces";
 const DELEGATION_VAULT_PATH: &str = "/v1/delegation-vault";
 
 /// Stand-in printed in place of a credential the caller did not ask to see.
-const MASKED_VALUE: &str = "<hidden; pass --reveal to show>";
+pub(crate) const MASKED_VALUE: &str = "<hidden; pass --reveal to show>";
 
 /// Where the CLI looks up an entity the caller named by its `id` (the field
 /// called `id_field`) or by any of `names`, for a collection whose entity
@@ -13909,7 +13909,7 @@ impl ApiKeyCommand {
 /// Fails when a destructive action needs a confirmation (`yes` is not set) and
 /// standard input is not a terminal, so the prompt could never be answered.
 /// Called before any lookup, so a refused command sends nothing at all.
-fn refuse_without_terminal(
+pub(crate) fn refuse_without_terminal(
     verb: &str,
     id: &str,
     yes: bool,
@@ -13929,7 +13929,7 @@ fn refuse_without_terminal(
 /// built (it may ask the gateway for a name) once a terminal is known to be
 /// there. Refuses instead of hanging when standard input is not a terminal,
 /// since the prompt could never be answered in that case.
-async fn confirm_action(
+pub(crate) async fn confirm_action(
     verb: &str,
     id: &str,
     prompt: impl std::future::Future<Output = String>,

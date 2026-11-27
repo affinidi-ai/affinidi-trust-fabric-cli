@@ -26,6 +26,14 @@ The hosted [Affinidi Trust Fabric documentation](https://docs.affinidi.com/produ
 
 Every command also documents its options in its help text: `fabric agent-gateway <group> <command> --help`.
 
+## Agent Stream Commands
+
+`fabric agent-stream` exists only in builds with the `agent-stream` Cargo feature, which releases leave out.
+
+| Document | Command groups |
+| --- | --- |
+| [Governance and drift](agent-stream/GOVERNANCE_AND_DRIFT.md) | `governance` and `drift`: governance records, chain checks, drift verdicts, baselines, and replay runs |
+
 ## Development
 
 | Document | Scope |

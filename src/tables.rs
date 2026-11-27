@@ -382,6 +382,87 @@ pub static AGENT_STREAM_CONNECTIONS: Layout = Layout {
     columns: &[whole("NAME", &["name"]), whole("HOST", &["host"]), col("CURRENT", &["current"])],
 };
 
+/// An Agent Stream's governance records, as `governance records list` shows
+/// them. Each row is the summary the command builds, never the prompt
+/// content.
+#[cfg(feature = "agent-stream")]
+pub static GOVERNANCE_RECORDS: Layout = Layout {
+    empty: "No governance records yet.",
+    columns: &[
+        whole("TIMESTAMP", &["timestamp"]),
+        id(&["record_id"]),
+        col("OUTCOME", &["outcome"]),
+        col("MODEL", &["model"]),
+        col("TOKENS", &["total_tokens"]),
+        col("COST", &["cost"]),
+        whole("SEQ", &["seq"]),
+    ],
+};
+
+/// The surfaces that have governance records.
+#[cfg(feature = "agent-stream")]
+pub static GOVERNANCE_SURFACES: Layout = Layout {
+    empty: "No surfaces have governance records yet.",
+    columns: &[id(&["surface_id"]), whole("NAME", &["surface_name"])],
+};
+
+/// Which LLM Surfaces record governance records and export them.
+#[cfg(feature = "agent-stream")]
+pub static GOVERNANCE_COVERAGE: Layout = Layout {
+    empty: "No LLM Surfaces yet.",
+    columns: &[
+        id(&["surface_id"]),
+        whole("NAME", &["surface_name"]),
+        col("RECORDING", &["governance_recording"]),
+        col("EXPORT", &["governance_export"]),
+        col("PIPE EVENTS", &["pipe_events"]),
+    ],
+};
+
+/// The result of checking each surface's governance record chain.
+#[cfg(feature = "agent-stream")]
+pub static GOVERNANCE_VERIFY: Layout = Layout {
+    empty: "No surfaces have governance records yet.",
+    columns: &[
+        id(&["surface_id"]),
+        col("VALID", &["valid"]),
+        col("RECORDS", &["count"]),
+        col("PROBLEM", &["problem"]).or("none"),
+        wide("ERROR", &["error"]),
+    ],
+};
+
+/// A surface's drift verdict, one row per dimension.
+#[cfg(feature = "agent-stream")]
+pub static DRIFT_DIMENSIONS: Layout = Layout {
+    empty: "No drift dimensions returned.",
+    columns: &[
+        col("DIMENSION", &["dimension"]),
+        col("STATUS", &["status"]),
+        col("BASELINE", &["baseline"]),
+        col("CURRENT", &["current"]),
+        col("CHANGE", &["relative_change"]),
+        col("SAMPLES", &["sample_count"]),
+    ],
+};
+
+/// Drift replay runs, newest first.
+#[cfg(feature = "agent-stream")]
+pub static DRIFT_RUNS: Layout = Layout {
+    empty: "No drift runs yet.",
+    columns: &[
+        id(&["id"]),
+        whole("SURFACE", &["surface_id"]),
+        whole("TARGET", &["target_surface_id"]),
+        col("STATUS", &["status"]),
+        col("TRIGGER", &["trigger"]),
+        whole("RAN AT", &["ran_at"]),
+        col("PASSED", &["passed"]),
+        col("TOTAL", &["total"]),
+        col("COST USD", &["cost_usd"]),
+    ],
+};
+
 /// How `config list` of `product` shows its saved connections.
 pub fn connections(product: Product) -> &'static Layout {
     match product {

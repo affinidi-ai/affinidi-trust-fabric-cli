@@ -9,11 +9,15 @@
 mod api_keys;
 mod audit;
 mod config;
+mod drift;
+mod governance;
 mod identities;
 mod login;
 mod logs;
 mod metrics;
 mod policies;
+mod prompt_content;
+mod request;
 mod secrets;
 mod settings;
 mod surfaces;
@@ -21,6 +25,7 @@ mod surfaces;
 mod test_support;
 mod tokens;
 mod users;
+mod when;
 mod whoami;
 
 use std::path::Path;
@@ -231,6 +236,30 @@ enum AgentStreamCommand {
     Logs {
         #[command(subcommand)]
         command: logs::LogsCommand,
+    },
+    /// Read governance records and check that they are intact.
+    ///
+    /// Governance records hold the prompts and answers of model calls, so
+    /// these commands hide them unless you ask for one record with --reveal,
+    /// and read at most one page of records at a time. Needs the
+    /// `governance.view` permission, which only administrators have by
+    /// default.
+    Governance {
+        #[command(subcommand)]
+        command: governance::GovernanceCommand,
+    },
+    /// See a surface's drift and run drift replays.
+    ///
+    /// Drift monitoring compares a surface's recent answers with a pinned
+    /// baseline, dimension by dimension. Reading needs the `drift.view`
+    /// permission; starting or cancelling a run and re-pinning the baseline
+    /// need `drift.manage`. `drift run` also needs `drift.view` unless
+    /// --force is given, and `drift baseline set` unless --yes is given, for
+    /// the reads they make before they ask. Both are administrator-only by
+    /// default.
+    Drift {
+        #[command(subcommand)]
+        command: drift::DriftCommand,
     },
     /// Call any Agent Stream management API endpoint.
     ///
@@ -456,6 +485,15 @@ async fn run_command(
             command.refuse_without_terminal()?;
             let client = connect(saved, credentials, &globals).await?;
             return run_access_tokens(&client, command, globals.output).await;
+        }
+        AgentStreamCommand::Governance { command } => {
+            let client = connect(saved, credentials, &globals).await?;
+            return governance::run(&client, command, globals.output).await;
+        }
+        AgentStreamCommand::Drift { command } => {
+            command.refuse_without_terminal()?;
+            let client = connect(saved, credentials, &globals).await?;
+            return drift::run(&client, command, globals.output).await;
         }
         AgentStreamCommand::Api(args) => {
             let client = connect(saved, credentials, &globals).await?;
