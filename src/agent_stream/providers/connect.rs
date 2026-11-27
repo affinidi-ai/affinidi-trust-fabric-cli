@@ -6,7 +6,10 @@
 //! on the provider: most take `model` and `api_key_secret`, and only some
 //! keep a `base_url`. Agent Stream drops a field a provider doesn't take
 //! without an error, so the CLI writes only the fields that provider takes,
-//! and saves through the same path as `surfaces update`.
+//! and saves through the same path as `surfaces update`. A surface moved to
+//! another provider also gets that provider's upstream path in
+//! `pipe_type.endpoint_path`, chosen from its catalog entry the way the
+//! dashboard chooses it.
 
 use anyhow::{Result, bail};
 use clap::Args;
@@ -18,6 +21,7 @@ use crate::{
     agent_stream::surfaces::change_surface,
     client::{GatewayClient, sanitize_for_terminal},
     commands::Output,
+    config::is_loopback_host,
 };
 
 /// Longest secret id Agent Stream can look up.
@@ -127,7 +131,7 @@ pub(super) async fn run(
             "a surface describes provider '{}' with {needs} rather than a model and an API key secret, so `connect` \
              can't set it; use `fabric agent-stream surfaces update {} --set pipe_type.provider.<field>=<value>`",
             args.provider,
-            args.surface
+            sanitize_for_terminal(&args.surface)
         );
     }
     let entry = Catalog::read(client)
@@ -170,9 +174,12 @@ struct Target {
 impl Target {
     /// The surface `before` with its provider settings pointing at this
     /// target. A surface already on the provider keeps its other provider
-    /// settings; one on another provider keeps only [`SHARED_SETTINGS`], and
-    /// loses `pipe_type.endpoint_path`, the upstream path Agent Stream's
-    /// execute API calls, since those belong to the provider it leaves.
+    /// settings and its `pipe_type.endpoint_path`. One on another provider
+    /// keeps only [`SHARED_SETTINGS`], and its `endpoint_path`, the upstream
+    /// path Agent Stream's execute API calls, becomes the new provider's
+    /// default from [`default_endpoint_path`]; when the catalog entry lists
+    /// no endpoint it is removed, with a warning, and Agent Stream falls back
+    /// to `/v1/chat/completions`.
     fn apply(
         &self,
         surface_id: &str,
@@ -221,7 +228,22 @@ impl Target {
         {
             pipe_type.insert("provider".to_owned(), Value::Object(settings));
             if !same_provider {
-                pipe_type.remove("endpoint_path");
+                match default_endpoint_path(&self.catalog_entry) {
+                    Some(path) => {
+                        pipe_type.insert("endpoint_path".to_owned(), Value::String(path));
+                    }
+                    None => {
+                        pipe_type.remove("endpoint_path");
+                        eprintln!(
+                            "warning: provider '{}' lists no endpoint in the Model catalog, so the surface's \
+                             `pipe_type.endpoint_path` is left unset and Agent Stream's execute API calls \
+                             `/v1/chat/completions`; set another with `fabric agent-stream surfaces update \
+                             {} --set pipe_type.endpoint_path=<path>`",
+                            self.provider,
+                            sanitize_for_terminal(surface_id)
+                        );
+                    }
+                }
             }
         }
         Ok(after)
@@ -277,6 +299,59 @@ impl Target {
             ),
             Some(_) => Ok(model),
         }
+    }
+}
+
+/// The upstream path a surface on the provider of `entry` calls by default,
+/// chosen as the dashboard chooses it: the endpoint marked `is_default` among
+/// those with the `chat_completions` capability, else the first of those,
+/// else the endpoint marked `is_default`, else the first endpoint. The
+/// provider's `api_version_prefix` goes in front unless the path already
+/// starts with it. `None` when the entry lists no endpoint with a path.
+fn default_endpoint_path(entry: &Value) -> Option<String> {
+    let endpoints: Vec<&Value> = entry
+        .get("endpoints")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|endpoint| {
+            endpoint
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some()
+        })
+        .collect();
+    let is_default = |endpoint: &&&Value| endpoint.get("is_default") == Some(&Value::Bool(true));
+    let chat: Vec<&Value> = endpoints
+        .iter()
+        .copied()
+        .filter(|endpoint| {
+            endpoint
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .is_some_and(|capabilities| capabilities.contains(&Value::from("chat_completions")))
+        })
+        .collect();
+    let chosen = chat
+        .iter()
+        .find(is_default)
+        .or_else(|| chat.first())
+        .or_else(|| {
+            endpoints
+                .iter()
+                .find(is_default)
+        })
+        .or_else(|| endpoints.first())?;
+    let path = chosen
+        .get("path")
+        .and_then(Value::as_str)?;
+    let prefix = entry
+        .get("api_version_prefix")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if prefix.is_empty() || path.starts_with(prefix) {
+        Some(path.to_owned())
+    } else {
+        Some(format!("{prefix}{path}"))
     }
 }
 
@@ -343,13 +418,7 @@ fn check_base_url(url: &str) -> Result<()> {
              key as a secret and give its id with --secret"
         );
     }
-    let loopback = match parsed.host() {
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        None => false,
-    };
-    if parsed.scheme() == "http" && !loopback {
+    if parsed.scheme() == "http" && !is_loopback_host(&parsed) {
         eprintln!(
             "warning: --base-url is plain http to a host other than this machine, so Agent Stream will send the \
              provider's API key there unencrypted"
@@ -369,9 +438,12 @@ mod tests {
     };
 
     const BUILT_IN: &str = r#"{"providers":[
-        {"enum_value":"openai","name":"OpenAI","api_schema":"openai",
+        {"enum_value":"openai","name":"OpenAI","api_schema":"openai","api_version_prefix":"/v1",
+         "endpoints":[{"name":"Embeddings","path":"/embeddings","capabilities":["embeddings"],"is_default":false},
+                      {"name":"Chat","path":"/chat/completions","capabilities":["chat_completions"],"is_default":true}],
          "models":[{"name":"GPT-4o mini","value":"gpt-4o-mini"},{"name":"GPT-4o","value":"gpt-4o","enabled":false}]},
-        {"enum_value":"anthropic","name":"Anthropic","api_schema":"anthropic",
+        {"enum_value":"anthropic","name":"Anthropic","api_schema":"anthropic","api_version_prefix":"/v1",
+         "endpoints":[{"name":"Messages","path":"/messages","capabilities":["chat_completions"],"is_default":true}],
          "models":[{"name":"Claude","value":"claude-x"}]},
         {"enum_value":"azure","name":"Azure OpenAI","models":[{"name":"GPT-4o","value":"gpt-4o"}]}]}"#;
     const CUSTOM: &str = r#"{"raw":"{\"providers\":[{\"enum_value\":\"acme\",\"name\":\"Acme\",\"api_schema\":\"openai\",\"models\":[{\"name\":\"A\",\"value\":\"a\"}]},{\"enum_value\":\"claude-proxy\",\"name\":\"Proxy\",\"api_schema\":\"anthropic\",\"models\":[{\"name\":\"C\",\"value\":\"c\"}]}]}","providers":[]}"#;
@@ -381,9 +453,10 @@ mod tests {
     const ON_ANTHROPIC: &str = r#"{"id":"s-1","name":"Chat","status":"enabled","updated_at":"2026-11-01T00:00:00Z",
         "pipe_type":{"type":"llm","endpoint_path":"/v1/messages","provider":{"provider_type":"anthropic","model":"claude-x",
         "api_key_secret":"anthropic-key","version":"2023-06-01","temperature":0.2}}}"#;
-    /// An LLM surface on OpenAI with an organization id and a base URL.
+    /// An LLM surface on OpenAI with an organization id, a base URL, and an
+    /// upstream path of its own.
     const ON_OPENAI: &str = r#"{"id":"s-1","name":"Chat","status":"enabled","updated_at":"2026-11-01T00:00:00Z",
-        "pipe_type":{"type":"llm","provider":{"provider_type":"openai","model":"gpt-4o-mini",
+        "pipe_type":{"type":"llm","endpoint_path":"/v1/responses","provider":{"provider_type":"openai","model":"gpt-4o-mini",
         "api_key_secret":"openai-key","organization_id":"org-1","base_url":"https://proxy.example.com/v1"}}}"#;
     const ON_OPENAI_LATER: &str = r#"{"id":"s-1","name":"Chat 2","status":"enabled","updated_at":"2026-11-02T00:00:00Z",
         "pipe_type":{"type":"llm","provider":{"provider_type":"openai","model":"gpt-4o-mini",
@@ -423,6 +496,15 @@ mod tests {
             Err(error) => format!("{error:#}"),
             Ok(()) => panic!("expected the command to fail"),
         }
+    }
+
+    fn saved_surface(requests: &Arc<Mutex<Vec<String>>>) -> serde_json::Value {
+        let recorded = requests.lock().unwrap();
+        let put = recorded
+            .iter()
+            .find(|request| request.starts_with("PUT "))
+            .expect("a save");
+        serde_json::from_str(request_body(put)).unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn saved_provider(requests: &Arc<Mutex<Vec<String>>>) -> serde_json::Value {
@@ -468,24 +550,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_rest_of_the_surface_is_sent_as_read_without_the_old_provider_s_upstream_path() {
+    async fn the_rest_of_the_surface_is_sent_as_read_with_the_new_provider_s_upstream_path() {
         let (result, requests) = connect(
             &["openai", "--surface", "s-1", "--secret", "openai-key", "--model", "gpt-4o-mini"],
             connecting(ON_ANTHROPIC),
         )
         .await;
         result.unwrap();
-        let recorded = requests.lock().unwrap();
-        let sent: serde_json::Value = serde_json::from_str(request_body(&recorded[4])).expect("JSON");
+        let sent = saved_surface(&requests);
         assert_eq!(sent["name"], "Chat");
         assert_eq!(sent["updated_at"], "2026-11-01T00:00:00Z");
         assert_eq!(sent["pipe_type"]["type"], "llm");
+        assert_eq!(sent["pipe_type"]["endpoint_path"], "/v1/chat/completions", "{sent}");
+    }
+
+    #[tokio::test]
+    async fn a_surface_moved_to_anthropic_calls_its_messages_endpoint() {
+        let (result, requests) = connect(
+            &["anthropic", "--surface", "s-1", "--secret", "anthropic-key", "--model", "claude-x"],
+            connecting(ON_OPENAI),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(saved_surface(&requests)["pipe_type"]["endpoint_path"], "/v1/messages");
+    }
+
+    #[tokio::test]
+    async fn a_provider_with_no_catalog_endpoint_leaves_the_upstream_path_unset() {
+        let (result, requests) =
+            connect(&["acme", "--surface", "s-1", "--secret", "acme-key", "--model", "a"], connecting(ON_OPENAI)).await;
+        result.unwrap();
+        let sent = saved_surface(&requests);
         assert!(
             sent["pipe_type"]
                 .get("endpoint_path")
                 .is_none(),
-            "Anthropic's upstream path stays on a surface moved to OpenAI: {sent}"
+            "OpenAI's upstream path stays on a surface moved to acme: {sent}"
         );
+    }
+
+    #[tokio::test]
+    async fn on_the_same_provider_the_upstream_path_is_kept() {
+        let (result, requests) =
+            connect(&["openai", "--surface", "s-1", "--secret", "openai-key-2"], connecting(ON_OPENAI)).await;
+        result.unwrap();
+        assert_eq!(saved_surface(&requests)["pipe_type"]["endpoint_path"], "/v1/responses");
+    }
+
+    #[test]
+    fn the_default_endpoint_is_chosen_as_the_dashboard_chooses_it() {
+        let entry = |prefix: &str, endpoints: serde_json::Value| json!({"enum_value": "p", "api_version_prefix": prefix, "endpoints": endpoints});
+        let chat = |path: &str, default: bool| json!({"path": path, "capabilities": ["chat_completions"], "is_default": default});
+        let other =
+            |path: &str, default: bool| json!({"path": path, "capabilities": ["embeddings"], "is_default": default});
+        assert_eq!(
+            super::default_endpoint_path(&entry(
+                "/v1",
+                json!([other("/embeddings", true), chat("/a", false), chat("/b", true)])
+            )),
+            Some("/v1/b".to_owned())
+        );
+        assert_eq!(
+            super::default_endpoint_path(&entry("/v1", json!([other("/embeddings", true), chat("/a", false)]))),
+            Some("/v1/a".to_owned())
+        );
+        assert_eq!(
+            super::default_endpoint_path(&entry("/v1", json!([other("/x", false), other("/y", true)]))),
+            Some("/v1/y".to_owned())
+        );
+        assert_eq!(
+            super::default_endpoint_path(&entry(
+                "/v1beta",
+                json!([chat("/v1beta/models/{model}:generateContent", true)])
+            )),
+            Some("/v1beta/models/{model}:generateContent".to_owned()),
+            "a prefix already on the path is not doubled"
+        );
+        assert_eq!(super::default_endpoint_path(&entry("", json!([chat("/chat", true)]))), Some("/chat".to_owned()));
+        assert_eq!(super::default_endpoint_path(&entry("/v1", json!([]))), None);
+        assert_eq!(super::default_endpoint_path(&json!({"enum_value": "p"})), None);
     }
 
     #[tokio::test]

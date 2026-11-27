@@ -2207,3 +2207,127 @@ fn providers_connect_refuses_a_disabled_model_exits_non_zero_and_saves_nothing()
         request_lines(&requests)
     );
 }
+
+/// A disabled built-in provider with a default chat endpoint, for the
+/// warnings of `providers connect`.
+#[cfg(feature = "agent-stream")]
+const DISABLED_OPENAI: &str = r#"{"providers":[{"enum_value":"openai","name":"OpenAI","enabled":false,
+  "api_version_prefix":"/v1","endpoints":[{"path":"/chat/completions","capabilities":["chat_completions"],"is_default":true}],
+  "models":[{"name":"GPT-4o mini","value":"gpt-4o-mini"}]}]}"#;
+
+/// The answers `providers connect` needs: the catalog `built_in` with an
+/// empty custom catalog, and the surface on Anthropic.
+#[cfg(feature = "agent-stream")]
+fn connect_stand_in(built_in: &'static str) -> (String, Requests) {
+    agent_stream_stand_in(vec![
+        ("GET /api/v1/llm-providers/custom", "200 OK", r#"{"raw":"{\"providers\":[]}","providers":[]}"#),
+        ("GET /api/v1/llm-providers", "200 OK", built_in),
+        ("GET /api/v1/pipes/s-1", "200 OK", SURFACE_ON_ANTHROPIC),
+        ("PUT /api/v1/pipes/s-1", "200 OK", "{}"),
+    ])
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_connect_warns_about_a_disabled_provider_and_plain_http_to_another_host() {
+    let (host, requests) = connect_stand_in(DISABLED_OPENAI);
+
+    let output = fabric_on_stream(
+        &host,
+        &[
+            "providers",
+            "connect",
+            "openai",
+            "--surface",
+            "s-1",
+            "--secret",
+            "openai-key",
+            "--model",
+            "gpt-4o-mini",
+            "--base-url",
+            "http://llm.example.com/v1",
+        ],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("warning: provider 'openai' is disabled in the Model catalog"), "{text}");
+    assert!(text.contains("warning: --base-url is plain http to a host other than this machine"), "{text}");
+    let sent = sent_body(&requests, "PUT /api/v1/pipes/s-1");
+    assert_eq!(sent["pipe_type"]["provider"]["base_url"], "http://llm.example.com/v1");
+    assert_eq!(sent["pipe_type"]["endpoint_path"], "/v1/chat/completions");
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_connect_gives_no_plain_http_warning_for_this_machine() {
+    for url in ["http://localhost:11434/v1", "http://127.0.0.1:11434/v1", "http://[::1]:11434/v1"] {
+        let (host, _) = connect_stand_in(CATALOG);
+
+        let output = fabric_on_stream(
+            &host,
+            &[
+                "providers",
+                "connect",
+                "openai",
+                "--surface",
+                "s-1",
+                "--secret",
+                "openai-key",
+                "--model",
+                "gpt-4o-mini",
+                "--base-url",
+                url,
+            ],
+            "",
+        );
+
+        let text = stderr(&output);
+        assert!(output.status.success(), "{url}: {text}");
+        assert!(!text.contains("plain http"), "{url}: {text}");
+    }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_connect_output_json_prints_the_surface_read_back_and_a_dry_run_preview() {
+    let connect =
+        ["providers", "connect", "openai", "--surface", "s-1", "--secret", "openai-key", "--model", "gpt-4o-mini"];
+    let (host, requests) = connect_stand_in(CATALOG);
+    let saved = fabric_on_stream(&host, &[&["-o", "json"][..], &connect[..]].concat(), "");
+
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    let surface: serde_json::Value = serde_json::from_str(&stdout(&saved)).expect("JSON surface");
+    assert_eq!(surface["id"], "s-1");
+    assert_eq!(
+        request_lines(&requests)
+            .last()
+            .map(String::as_str),
+        Some("GET /api/v1/pipes/s-1 HTTP/1.1"),
+        "--output json reads the surface back after the save"
+    );
+
+    let (host, requests) = connect_stand_in(CATALOG);
+    let preview = fabric_on_stream(&host, &[&["-o", "json"][..], &connect[..], &["--dry-run"][..]].concat(), "");
+
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview: serde_json::Value = serde_json::from_str(&stdout(&preview)).expect("JSON preview");
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["after"]["pipe_type"]["provider"]["model"], "gpt-4o-mini");
+    assert!(
+        preview["changes"]
+            .as_array()
+            .is_some_and(|changes| changes
+                .iter()
+                .any(|change| change["path"] == "pipe_type.provider.provider_type")),
+        "{preview}"
+    );
+    assert!(
+        !request_lines(&requests)
+            .iter()
+            .any(|line| line.starts_with("PUT ")),
+        "{:?}",
+        request_lines(&requests)
+    );
+}

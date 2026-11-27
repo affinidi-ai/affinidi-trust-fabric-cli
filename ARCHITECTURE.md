@@ -485,7 +485,9 @@ update` uses. It sets `pipe_type.provider` itself, writing only the fields the c
 provider takes on a surface, which stands in for the field-name check of `update`: `KEEP_BASE_URL` and `NO_BASE_URL` list the providers Agent
 Stream knows by name, any other provider keeps a base URL unless its `api_schema` is
 `anthropic` or `gemini`, and `azure` and `custom`, which a surface describes with other
-fields, are refused. `--secret` is a secret id, checked for its shape and refused when it
+fields, are refused. A surface moved to another provider gets that provider's default
+upstream path in `pipe_type.endpoint_path` (`default_endpoint_path`, which picks the
+catalog endpoint the dashboard picks). `--secret` is a secret id, checked for its shape and refused when it
 looks like an API key; no secret is read.
 
 `fabric agent-stream prompts` (in [`agent_stream/prompts.rs`](src/agent_stream/prompts.rs))

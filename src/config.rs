@@ -228,7 +228,9 @@ fn plain_http_warning(
     ))
 }
 
-fn is_loopback_host(url: &url::Url) -> bool {
+/// Whether `url`'s host is this machine: `localhost`, in any case, or a
+/// loopback address.
+pub(crate) fn is_loopback_host(url: &url::Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),

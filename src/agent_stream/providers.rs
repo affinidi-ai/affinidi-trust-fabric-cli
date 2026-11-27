@@ -21,6 +21,7 @@ use clap::{ArgGroup, Args, Subcommand};
 use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
+use super::surfaces::print_change;
 use crate::{
     client::{GatewayClient, pretty_json_for_terminal, response_status, sanitize_for_terminal},
     commands::{Output, confirmation_line, entity_path, print_list, read_json},
@@ -199,27 +200,34 @@ pub enum ProviderCommand {
     /// catalog, and about a plain http --base-url to a host other than this
     /// machine, which would carry the API key unencrypted.
     ///
-    /// On a surface already on the provider, its other provider settings are
-    /// kept. Moving a surface to another provider keeps only `temperature`,
-    /// `max_tokens`, `top_p`, `frequency_penalty`, and `presence_penalty`, and
-    /// drops the rest, such as a base URL or an organization id, along with
-    /// `pipe_type.endpoint_path`, the upstream path Agent Stream's execute API
-    /// calls: they belong to the provider it leaves. Without --base-url, Agent
-    /// Stream then uses the catalog's. Surface variants and failover targets
-    /// that name their own provider are left as they are.
+    /// On a surface already on the provider, its other provider settings and
+    /// its `pipe_type.endpoint_path` are kept. Moving a surface to another
+    /// provider keeps only `temperature`, `max_tokens`, `top_p`,
+    /// `frequency_penalty`, and `presence_penalty`, and drops the rest, such
+    /// as a base URL or an organization id, which belong to the provider it
+    /// leaves; without --base-url, Agent Stream then uses the catalog's. It
+    /// also sets `pipe_type.endpoint_path`, the upstream path Agent Stream's
+    /// execute API calls, to the new provider's default endpoint in the
+    /// catalog, as the dashboard does: the catalog's `api_version_prefix` and
+    /// the default chat endpoint, such as `/v1/messages`. A provider with no
+    /// endpoint in the catalog leaves it unset, with a warning. Surface
+    /// variants and failover targets that name their own provider are left as
+    /// they are.
     ///
     /// The change goes through the same path as `surfaces update`: the CLI
     /// reads the surface, refuses a deleted one or one that is not an LLM
     /// surface, reads it again and stops if it was saved meanwhile, and
     /// otherwise sends the whole surface. In place of the field-name check of
-    /// `surfaces update`, it writes only fields the provider takes. A change that leaves the surface as
-    /// it is sends nothing. Table output lists each changed field;
+    /// `surfaces update`, it writes only fields the provider takes. A change
+    /// that leaves the surface as it is sends nothing. Table output lists each changed field;
     /// --output json prints the surface as Agent Stream has it after the
     /// save. --dry-run shows the changes, or with --output json the changes
     /// and the whole new surface, and saves nothing.
     ///
     /// Reading the Model catalog needs `llm_catalog.edit`, and reading and
-    /// changing the surface need `pipes.view` and `pipes.edit`.
+    /// changing the surface need `pipes.view` and `pipes.edit`. Agent Stream
+    /// also asks for `secrets.view` on a save that sends a secret somewhere
+    /// the surface didn't send it before, which `connect` usually does.
     #[command(after_long_help = connect::CONNECT_EXAMPLES)]
     Connect(connect::ConnectArgs),
 }
@@ -464,12 +472,7 @@ pub async fn run(
         ProviderCommand::EnableModel(args) => set_enabled(&client, args, true, output).await,
         ProviderCommand::DisableModel(args) => set_enabled(&client, args, false, output).await,
         ProviderCommand::SetPrice(args) => set_price(&client, args, output).await,
-        ProviderCommand::Connect(args) => {
-            if let Some(printed) = connect::run(&client, args, output).await? {
-                println!("{printed}");
-            }
-            Ok(())
-        }
+        ProviderCommand::Connect(args) => print_change(connect::run(&client, args, output).await?),
     }
 }
 

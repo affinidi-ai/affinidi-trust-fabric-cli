@@ -570,7 +570,7 @@ pub async fn run(
 }
 
 /// Prints what a change to a surface returned to print, if anything.
-fn print_change(printed: Option<String>) -> Result<()> {
+pub(super) fn print_change(printed: Option<String>) -> Result<()> {
     if let Some(printed) = printed {
         println!("{printed}");
     }
