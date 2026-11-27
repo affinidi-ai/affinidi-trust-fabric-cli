@@ -333,6 +333,8 @@ A saved token is only sent to the host it was saved for. `--host` with a differe
 
 > [!NOTE]
 > When both `FABRIC_TOKEN` and `FABRIC_HOST` come from the environment, the CLI prints one note on standard error naming the host. Otherwise a `FABRIC_HOST` set by a project file would receive a `FABRIC_TOKEN` from your shell profile without a word. A typed `--token` or `--host`, or a host from the saved connection, prints no note.
+>
+> `metrics scrape` on either product reads the same `FABRIC_METRICS_USERNAME` and `FABRIC_METRICS_PASSWORD` variables, so a password exported for one appliance is sent to whichever host the command targets.
 
 ### `--host` and `--token` last for one command
 

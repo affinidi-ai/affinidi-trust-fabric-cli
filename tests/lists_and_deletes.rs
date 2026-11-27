@@ -437,6 +437,35 @@ fn secret_certificate_grant_and_payment_deletes_print_the_same_kind_of_line() {
 }
 
 #[test]
+fn deleting_a_user_prints_one_line_and_no_note() {
+    let table = fabric(vec![reply("DELETE", "/v1/users/u-1", "204 No Content", "")], &["users", "delete", "u-1"]);
+    let json = fabric(
+        vec![reply("DELETE", "/v1/users/u-1", "204 No Content", "")],
+        &["--output", "json", "users", "delete", "u-1"],
+    );
+
+    assert!(table.success, "{}", table.stderr);
+    assert_eq!(table.stdout, "Deleted user 'u-1'\n");
+    assert_eq!(table.stderr, "");
+    assert_eq!(json.stdout, "null\n");
+    assert_eq!(json.stderr, "");
+}
+
+#[test]
+fn secrets_get_with_reveal_and_no_value_adds_no_note() {
+    let out = fabric(
+        vec![
+            reply("GET", "/v1/secrets", "200 OK", KNOWN_ID_LIST),
+            reply("GET", "/v1/secrets/11111111-2222-4333-8444-555555555555", "200 OK", r#"{"name":"Stripe"}"#),
+        ],
+        &["secrets", "get", SECRET_ID, "--reveal"],
+    );
+
+    assert!(out.success, "{}", out.stderr);
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
 fn a_typed_id_with_a_line_break_stays_on_one_line() {
     let out = fabric(vec![reply("DELETE", "/v1/issuers/a%0Ab", "204 No Content", "")], &["issuers", "delete", "a\nb"]);
 

@@ -79,7 +79,8 @@ flowchart TB
     L --> W["dispatch_with"]
     W --> H["Resolve connection, host, token"]
     H --> G["GatewayClient"]
-    G --> X["Group handler: run_surfaces, run_crud, ..."]
+    G --> RP["run_and_print"]
+    RP --> X["Group handler: run_surfaces, run_crud, ..."]
     X --> P
 ```
 
@@ -269,8 +270,11 @@ the uncapped and multi-line variants.
 
 ### Dispatch to handlers
 
-After the client is built, `dispatch_with` does some per-command preparation, then calls
-the group's handler:
+After the client is built, `dispatch_with` calls `run_and_print`, which does some
+per-command preparation, then calls the group's handler. `fabric agent-stream secrets`,
+`users`, `identities`, `api-keys`, `policies`, `settings`, `audit`, `metrics`, and `logs`
+reach the same function through `run_shared`, with a `SharedCommand` mapped from their
+own clap enums, so both products print the same tables and confirmation lines:
 
 - `resolve_surface_command` swaps a surface name for its ID in every surface command
   that names one, printing `note: using surface <id> (<name>)` to standard error.
@@ -280,13 +284,16 @@ the group's handler:
   group-specific function such as `run_surfaces`, `run_secrets`, `run_policies`, or
   `run_api`.
 
+Agent Stream has no `metrics status`, because it has no OpenTelemetry export status
+route.
+
 Handlers return in one of three ways:
 
 | Return | Meaning | Examples |
 | --- | --- | --- |
 | `Result<Value>` | The shared printer prints it | `run_crud`, `run_policies`, `run_users` |
 | `Result<Option<Value>>` | `None` means the handler already printed its outcome | `run_surfaces`, `run_secrets`, `run_certificates` |
-| `return` from `dispatch_with` | The handler prints everything itself | `run_audit`, `run_payments`, `run_metrics`, `run_logs`, `run_api_keys`, `run_access_tokens` |
+| `return` from `run_and_print` | The handler prints everything itself | `run_audit`, `run_payments`, `run_metrics`, `run_logs`, `run_api_keys`, `run_access_tokens` |
 
 `run` wraps every Agent Gateway error with `add_terms_hint`, because the gateway's Terms
 of Use gate can refuse any route. Agent Stream errors skip it, because `product_error`
@@ -303,16 +310,20 @@ fixed prefix.
 | `warning:` | Something the user should act on, but the command continues |
 | `error:` | The command failed. Printed by `main` (or by the shell for one line) as `error: {error:#}`, so the whole `anyhow` context chain shows. |
 
-In `dispatch_with`, a value is printed by one of three paths:
+In `run_and_print`, a value is printed by one of three paths:
 
 - A delete or update with a confirmation prints one line from `confirmation_line`, such
-  as `Deleted issuer 'i-1'`, through `print_outcome`.
+  as `Deleted issuer 'i-1'`, through `print_outcome`. `users delete` takes its line from
+  `user_delete_line`: `Disabled user '<id>'` when Agent Stream answers `{"outcome":
+  "disabled"}`, because it kept the record of a user who signs in through an identity
+  provider, with a `note:` on standard error saying so, and `Deleted user '<id>'`
+  otherwise.
 - A list with a layout prints through `print_list`, which renders a `tables::Layout`
   with `tables::render_scoped`.
 - Anything else goes through `print_created_or_value`: `print_issued` for a create, else
   `print_value`.
 
-With `--output json`, these print the gateway's document. The shared printer,
+With `--output json`, these print the appliance's document. The shared printer,
 `print_value`, uses `pretty_json_for_terminal`, which escapes characters a terminal
 could act on while keeping the JSON valid. A create or rotate whose answer carries a
 secret shown once prints that secret alone on standard output, so `$(...)` captures just
@@ -399,6 +410,35 @@ is sent unchecked when the token cannot read the surface):
    `IncompleteDryRun` if only the local checks ran. A dry run never sends the patch
    without the query parameter.
 
+`fabric agent-stream surfaces` (in [`agent_stream/surfaces.rs`](src/agent_stream/surfaces.rs))
+reuses `surface_patch::build_patch`, `surface_validate::merge`, and
+`surface_validate::changes`, but not `check_surface`, which checks Agent Gateway fields.
+Agent Stream serves surfaces at `/v1/pipes`, has no `PATCH`, no dry run, and no version
+check, and drops a field it does not know without an error. So field names are checked
+before anything is sent. A top-level name must be in `SURFACE_FIELDS`, a copy of the
+field names of Agent Stream's `PipeConfig`, or in the stored surface. On `update`, from
+the flags or `--file`, a name inside an object the stored surface has must already be in
+that object unless `--allow-new-field` is given; a name inside an object the surface
+lacks, or inside a list item, is not checked. `create` has nothing stored to compare
+with, so it checks top-level names only. Flag paths with brackets or list positions,
+which only Agent Gateway paths use, and flags on `id`, `created_at`, `updated_at`,
+`tenant_id`, or `owner_user_id` are refused before anything is read or sent, and so is any
+`update` flag on `status` other than `--set status=<value>`. Both commands refuse a
+`status` other than `enabled` or `disabled`, and a `pipe_type.type` other than `llm`,
+`webhook`, or `ide_catalog` (on `update`, the stored surface's own type is accepted too,
+for a type a newer Agent Stream added).
+
+`update` reads the surface, builds the whole new surface on this machine, reads the
+surface again, and sends it with `PUT` only when `updated_at` has not moved. A surface
+with no `updated_at` is refused, since a later save could not be told apart. A `--file`
+must carry the current `updated_at`, and its `status`, `created_at`, `tenant_id`, and
+`owner_user_id` are replaced with the stored ones. After the save, table output lists
+the changed fields, and `--output json` reads the surface once more and prints it,
+because Agent Stream answers a save with an `updated_at` its store then replaces, so
+only a fresh read can go back to `--file`. A dry run of `create` or `update` prints the
+same JSON shape (`dry_run`, `changes`, `after`), and `create --dry-run` runs before any
+connection is resolved, so it needs no saved connection.
+
 ## Invariants
 
 Breaking one of these is a correctness bug, not a style question.
@@ -426,8 +466,8 @@ Every file in [`src/`](src/) and what it owns.
 | [`client.rs`](src/client.rs) | `GatewayClient`, the shared HTTP client, path checks, `gateway_error`, redaction, and the terminal sanitisers. |
 | [`config.rs`](src/config.rs) | `Config` and `Connection`, the `config.toml` and `agent-stream.toml` paths and file permissions, host normalisation, the plain-http rules, and legacy token migration. |
 | [`credentials.rs`](src/credentials.rs) | The `CredentialStore` trait, including the bound-host methods, and `OsCredentialStore` over `keyring`, one instance per product's keyring service. |
-| [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, and `remembering_probes`, which keeps a host's answer for the length of an interactive shell. |
-| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, and `tokens.rs`, which maps onto the shared access token commands), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
+| [`product.rs`](src/product.rs) | `Product`, the token prefixes of each product, the anonymous probe of a host's public permission list, `check_product`, which stops a command aimed at the other product in a binary built with the `agent-stream` feature and does nothing in one built without it, `remembering_probes`, which keeps a host's answer for the length of an interactive shell, and the names messages give each product (`message_name`, `message_subject`, `connection_noun`, `surface_noun`). |
+| [`agent_stream/`](src/agent_stream/) | `fabric agent-stream` (feature `agent-stream` only): the clap definitions, global flags, and dispatch in `mod.rs` (`api` and `shell` included), one file per command group (`config.rs`, `login.rs` for `login` and `logout`, `whoami.rs`, `surfaces.rs`, `tokens.rs`, which maps onto the shared access token commands, and `secrets.rs`, `users.rs`, `identities.rs`, `api_keys.rs`, `policies.rs`, `settings.rs`, `audit.rs`, `metrics.rs`, and `logs.rs`, which map onto the shared Agent Gateway commands through `run_shared`), and `test_support.rs` for what their tests share, including a scripted Agent Stream. |
 | [`browser_login.rs`](src/browser_login.rs) | Loopback listener, PKCE, the callback, and the code exchange. |
 | [`interactive.rs`](src/interactive.rs) | The `shell` command's read loop and line parsing. |
 | [`tables.rs`](src/tables.rs) | `Layout`, `Column`, `Scope`, every list layout, and the cell helpers. |
@@ -449,6 +489,7 @@ Every file in [`src/`](src/) and what it owns.
 | Change login | `login_and_save` and `acquire_login_token` in `commands.rs`, `browser_login.rs` |
 | Change where connections or tokens are stored | `config.rs`, `credentials.rs` |
 | Add an Agent Stream command group | A new file under `src/agent_stream/`, declared in its `mod.rs` |
+| Change a group Agent Stream shares with Agent Gateway | The group's file under `src/agent_stream/` for its help and its mapping onto the shared enum, then the shared `run_*` function in `commands.rs`, reached through `SharedCommand` and `run_shared`. A refusal that must send nothing goes in `refuse_before_connecting` in `agent_stream/mod.rs`, which `run_command` calls before `connect`. Only refusals that need neither the host nor a file go there: `metrics config set` compares the file with the live configuration, so it refuses after `connect` |
 | Add a surface feature | `FEATURES` in `features.rs` |
 | Change the `surfaces update` path syntax | `surface_patch.rs` |
 | Look a resource up by name | `Lookup`, `resolve_id`, and `resolve_surface_id` in `commands.rs` |

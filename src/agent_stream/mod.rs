@@ -6,11 +6,21 @@
 //! their own file (`agent-stream.toml`) and under their own keyring service,
 //! so each product can have a connection named `default`.
 
+mod api_keys;
+mod audit;
 mod config;
+mod identities;
 mod login;
+mod logs;
+mod metrics;
+mod policies;
+mod secrets;
+mod settings;
+mod surfaces;
 #[cfg(test)]
 mod test_support;
 mod tokens;
+mod users;
 mod whoami;
 
 use std::path::Path;
@@ -21,9 +31,9 @@ use clap::{Args, Subcommand};
 use crate::{
     client::GatewayClient,
     commands::{
-        AccessTokenCommand, ApiArgs, CommandTarget, DEFAULT_CONNECTION, HostFlags, Output, ShellGlobals, ShellText,
-        command_target, given_host_and_token, new_hash_name_warnings, print_value, run_access_tokens, run_api,
-        shell_prefix,
+        AccessTokenCommand, ApiArgs, CommandTarget, DEFAULT_CONNECTION, HostFlags, Output, SharedCommand, ShellGlobals,
+        ShellText, command_target, given_host_and_token, new_hash_name_warnings, print_value, run_access_tokens,
+        run_api, run_shared, shell_prefix,
     },
     config::Config,
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
@@ -147,10 +157,80 @@ enum AgentStreamCommand {
         #[command(subcommand)]
         command: config::ConfigCommand,
     },
+    /// Manage surfaces.
+    ///
+    /// Agent Stream's API calls a surface a pipe and serves surfaces at
+    /// `/v1/pipes`.
+    Surfaces {
+        #[command(subcommand)]
+        command: surfaces::SurfaceCommand,
+    },
     /// Manage access tokens.
     Tokens {
         #[command(subcommand)]
         command: tokens::TokenCommand,
+    },
+    /// Manage secrets.
+    ///
+    /// Other configuration refers to a secret as $SECRET:<secret-id>. Secret
+    /// values are masked in what the commands print unless --reveal is given.
+    Secrets {
+        #[command(subcommand)]
+        command: secrets::SecretCommand,
+        /// Print secret values instead of masking them. Applies to get,
+        /// create, and update; list answers never carry values and delete
+        /// prints none.
+        #[arg(long, global = true)]
+        reveal: bool,
+    },
+    /// Manage Agent Stream users.
+    ///
+    /// Agent Stream has no route to create a user, so there is no create
+    /// command.
+    Users {
+        #[command(subcommand)]
+        command: users::UserCommand,
+    },
+    /// Manage did:webvh identities.
+    ///
+    /// A connection point's identity is read-only here: Agent Stream answers
+    /// 409 to update, rotate-keys, transfer, deactivate, and trust-policy set
+    /// on it, because its connection point manages it.
+    Identities {
+        #[command(subcommand)]
+        command: identities::IdentityCommand,
+    },
+    /// Manage the API keys a Surface authenticates callers with.
+    #[command(name = "api-keys")]
+    ApiKeys {
+        #[command(subcommand)]
+        command: api_keys::ApiKeyCommand,
+    },
+    /// Manage the Rego policy definitions Agent Stream enforces.
+    Policies {
+        #[command(subcommand)]
+        command: policies::PolicyCommand,
+    },
+    /// Manage appliance-wide settings.
+    Settings {
+        #[command(subcommand)]
+        command: settings::SettingsCommand,
+    },
+    /// Read the Agent Stream audit log.
+    Audit {
+        #[command(subcommand)]
+        command: audit::AuditCommand,
+    },
+    /// Manage the metrics configuration, scrape metrics, check an OTLP
+    /// endpoint, and delete old stored metrics.
+    Metrics {
+        #[command(subcommand)]
+        command: metrics::MetricsCommand,
+    },
+    /// Download and truncate Agent Stream log files.
+    Logs {
+        #[command(subcommand)]
+        command: logs::LogsCommand,
     },
     /// Call any Agent Stream management API endpoint.
     ///
@@ -348,6 +428,9 @@ async fn dispatch_with(
         .map_err(add_no_keyring_hint)
 }
 
+/// Runs one command. The groups Agent Stream shares with Agent Gateway all
+/// take one path: [`refuse_before_connecting`], then [`connect`], then
+/// [`run_shared`], so where their token goes is decided in one place.
 async fn run_command(
     command: AgentStreamCommand,
     globals: Globals,
@@ -355,23 +438,65 @@ async fn run_command(
     credentials: &impl CredentialStore,
     path: &Path,
 ) -> Result<()> {
-    match command {
+    let shared = match command {
         AgentStreamCommand::Shell => bail!("the interactive shell is already open"),
-        AgentStreamCommand::Config { command } => config::run(saved, credentials, command, path, globals.output),
-        AgentStreamCommand::Login(args) => login::login(saved, credentials, path, &globals, args).await,
-        AgentStreamCommand::Logout => login::logout(saved, credentials, path, globals.connection.as_deref()).await,
-        AgentStreamCommand::Whoami => whoami::whoami(saved, credentials, &globals).await,
+        AgentStreamCommand::Config { command } => {
+            return config::run(saved, credentials, command, path, globals.output);
+        }
+        AgentStreamCommand::Login(args) => return login::login(saved, credentials, path, &globals, args).await,
+        AgentStreamCommand::Logout => {
+            return login::logout(saved, credentials, path, globals.connection.as_deref()).await;
+        }
+        AgentStreamCommand::Whoami => return whoami::whoami(saved, credentials, &globals).await,
+        AgentStreamCommand::Surfaces { command } => {
+            return surfaces::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+        }
         AgentStreamCommand::Tokens { command } => {
             let command = AccessTokenCommand::from(command);
             command.refuse_without_terminal()?;
             let client = connect(saved, credentials, &globals).await?;
-            run_access_tokens(&client, command, globals.output).await
+            return run_access_tokens(&client, command, globals.output).await;
         }
         AgentStreamCommand::Api(args) => {
             let client = connect(saved, credentials, &globals).await?;
             let value = run_api(&client, args).await?;
-            print_value(&value, globals.output)
+            return print_value(&value, globals.output);
         }
+        AgentStreamCommand::Secrets { command, reveal } => SharedCommand::Secrets {
+            command: command.into(),
+            reveal,
+        },
+        AgentStreamCommand::Users { command } => SharedCommand::Users(command.into()),
+        AgentStreamCommand::Identities { command } => SharedCommand::Identities(command.into()),
+        AgentStreamCommand::ApiKeys { command } => SharedCommand::ApiKeys(command.into()),
+        AgentStreamCommand::Policies { command } => SharedCommand::policies(command),
+        AgentStreamCommand::Settings { command } => SharedCommand::Settings(command.into()),
+        AgentStreamCommand::Audit { command } => SharedCommand::Audit(command.into()),
+        AgentStreamCommand::Metrics { command } => SharedCommand::Metrics(command.into()),
+        AgentStreamCommand::Logs { command } => SharedCommand::Logs(command.into()),
+    };
+    refuse_before_connecting(&shared)?;
+    let client = connect(saved, credentials, &globals).await?;
+    run_shared(&client, shared, globals.output).await
+}
+
+/// Fails for a shared command that is refused before the host is asked which
+/// product it is, so a refused command sends nothing at all: an API key
+/// revoke, rotate, or delete that would ask for a confirmation nobody can
+/// give, a `settings reset` without --force, a `users update` or `users
+/// delete` naming the reserved `integrations` route, a `metrics truncate` or
+/// `logs truncate` without --yes, and a `policies delete` that would ask for a
+/// confirmation nobody can give. Only refusals that need neither the host
+/// nor a file belong here; the ones that do are checked as the command runs.
+fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
+    match command {
+        SharedCommand::ApiKeys(command) => command.refuse_without_terminal(),
+        SharedCommand::Settings(command) => command.refuse_unforced_reset(Product::AgentStream),
+        SharedCommand::Users(command) => command.refuse_reserved_route(Product::AgentStream),
+        SharedCommand::Metrics(command) => command.refuse_unconfirmed_truncate(),
+        SharedCommand::Logs(command) => command.refuse_unconfirmed_truncate(),
+        SharedCommand::Policies { .. } => command.refuse_unconfirmed_policy_delete(),
+        SharedCommand::Secrets { .. } | SharedCommand::Identities(_) | SharedCommand::Audit(_) => Ok(()),
     }
 }
 
@@ -411,7 +536,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::test_support::NoKeyring;
     use super::{
-        test_support::{MemoryCredentials, Route, UnusedKeyring, scripted_agent_stream, start_lines},
+        test_support::{
+            MemoryCredentials, Route, UnusedKeyring, run_stream, saved_login, scripted_agent_stream, sends_bearer,
+            start_lines, stream_args,
+        },
         *,
     };
     use crate::{commands::Cli, config::Connection};
@@ -444,68 +572,6 @@ mod tests {
     const NOT_SIGNED_IN: Route =
         ("GET /api/auth/check", "HTTP/1.1 200 OK", r#"{"authenticated":false,"username":null,"terms_enabled":false}"#);
     const TOKEN_LIST: Route = ("GET /api/v1/access-tokens", "HTTP/1.1 200 OK", r#"{"access_tokens":[]}"#);
-
-    /// The Agent Stream arguments of `fabric agent-stream <words>`.
-    fn stream_args(words: &[&str]) -> AgentStreamArgs {
-        Cli::try_parse_from(
-            ["fabric", "agent-stream"]
-                .into_iter()
-                .chain(words.iter().copied()),
-        )
-        .unwrap_or_else(|error| panic!("{words:?}: {error}"))
-        .into_agent_stream()
-    }
-
-    /// One saved Agent Stream connection, `default`, current, at `host`, with
-    /// `token` bound to that host.
-    fn saved_login(
-        host: &str,
-        token: &str,
-    ) -> (Config, MemoryCredentials) {
-        let mut saved = Config {
-            current: Some("default".to_owned()),
-            ..Config::default()
-        };
-        saved
-            .connections
-            .insert("default".to_owned(), Connection::new(host.to_owned()));
-        let credentials = MemoryCredentials::default();
-        credentials
-            .set_token("default", token)
-            .unwrap();
-        credentials
-            .set_bound_host("default", host)
-            .unwrap();
-        (saved, credentials)
-    }
-
-    /// Runs `fabric agent-stream <words>` against `saved` and `credentials`,
-    /// with the connections file in a fresh directory.
-    async fn run_stream(
-        words: &[&str],
-        saved: Config,
-        credentials: &impl CredentialStore,
-    ) -> Result<()> {
-        let dir = tempfile::tempdir().unwrap();
-        dispatch_with(
-            stream_args(words),
-            saved,
-            credentials,
-            &dir.path()
-                .join("agent-stream.toml"),
-        )
-        .await
-    }
-
-    /// Whether a recorded request carried `token` as its bearer token.
-    fn sends_bearer(
-        request: &str,
-        token: &str,
-    ) -> bool {
-        request
-            .to_ascii_lowercase()
-            .contains(&format!("authorization: bearer {}", token.to_ascii_lowercase()))
-    }
 
     #[tokio::test]
     async fn login_with_an_access_token_asks_the_host_reads_the_profile_and_saves_the_token_in_the_store_only() {
@@ -1177,7 +1243,7 @@ mod tests {
         let gateway_line = cli
             .interactive_prefix()
             .into_iter()
-            .chain(["surfaces".to_owned(), "list".to_owned()]);
+            .chain(["issuers".to_owned(), "list".to_owned()]);
         assert!(Cli::try_parse_from(gateway_line).is_err(), "an Agent Gateway command is not an Agent Stream one");
     }
 
@@ -1315,6 +1381,230 @@ mod tests {
         for subcommand in ["revoke", "rotate"] {
             assert_eq!(help_of(subcommand, "id"), "ID of the access token (see `fabric agent-stream tokens list`)");
         }
+    }
+
+    /// Every help text of `command` and its subcommands: about, long about,
+    /// examples, each argument's help, and the help of each value an argument
+    /// accepts.
+    fn help_texts(command: &clap::Command) -> Vec<String> {
+        let mut texts: Vec<String> = [command.get_about(), command.get_long_about(), command.get_after_long_help()]
+            .into_iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect();
+        texts.extend(
+            command
+                .get_arguments()
+                .flat_map(|argument| [argument.get_help(), argument.get_long_help()])
+                .flatten()
+                .map(ToString::to_string),
+        );
+        texts.extend(
+            command
+                .get_arguments()
+                .flat_map(clap::Arg::get_possible_values)
+                .filter_map(|value| {
+                    value
+                        .get_help()
+                        .map(ToString::to_string)
+                }),
+        );
+        for subcommand in command.get_subcommands() {
+            texts.extend(help_texts(subcommand));
+        }
+        texts
+    }
+
+    /// The groups `fabric agent-stream` runs through the Agent Gateway
+    /// commands.
+    const SHARED_GROUPS: [&str; 9] =
+        ["secrets", "users", "identities", "api-keys", "policies", "settings", "audit", "metrics", "logs"];
+
+    /// The Agent Gateway subcommands of a shared group that Agent Stream
+    /// leaves out on purpose: `metrics status`, because Agent Stream has no
+    /// OpenTelemetry export status route.
+    const LEFT_OUT_OF_AGENT_STREAM: [(&str, &[&str]); 1] = [("metrics", &["status"])];
+
+    /// The path of every subcommand under `command`, at any depth, such as
+    /// `config show`, sorted.
+    fn subcommand_paths(command: &clap::Command) -> Vec<String> {
+        let mut paths = Vec::new();
+        for subcommand in command.get_subcommands() {
+            let name = subcommand.get_name();
+            paths.push(name.to_owned());
+            paths.extend(
+                subcommand_paths(subcommand)
+                    .into_iter()
+                    .map(|path| format!("{name} {path}")),
+            );
+        }
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn each_shared_group_has_every_agent_gateway_subcommand_or_leaves_it_out_on_purpose() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let gateway = command
+            .find_subcommand("agent-gateway")
+            .expect("agent-gateway");
+        let stream = command
+            .find_subcommand("agent-stream")
+            .expect("the feature build has agent-stream");
+
+        for group in SHARED_GROUPS {
+            let on_gateway = subcommand_paths(
+                gateway
+                    .find_subcommand(group)
+                    .unwrap_or_else(|| panic!("{group} on agent-gateway")),
+            );
+            let on_stream = subcommand_paths(
+                stream
+                    .find_subcommand(group)
+                    .unwrap_or_else(|| panic!("{group} on agent-stream")),
+            );
+            let left_out: Vec<&str> = LEFT_OUT_OF_AGENT_STREAM
+                .iter()
+                .filter(|(name, _)| *name == group)
+                .flat_map(|(_, paths)| paths.iter().copied())
+                .collect();
+
+            let missing: Vec<&str> = on_gateway
+                .iter()
+                .map(String::as_str)
+                .filter(|path| {
+                    !on_stream
+                        .iter()
+                        .any(|on| on == path)
+                })
+                .collect();
+            let extra: Vec<&str> = on_stream
+                .iter()
+                .map(String::as_str)
+                .filter(|path| {
+                    !on_gateway
+                        .iter()
+                        .any(|on| on == path)
+                })
+                .collect();
+            assert_eq!(missing, left_out, "{group}: an Agent Gateway subcommand Agent Stream does not have");
+            assert!(extra.is_empty(), "{group}: an Agent Stream subcommand Agent Gateway does not have: {extra:?}");
+        }
+    }
+
+    #[test]
+    fn the_shared_groups_help_never_names_agent_gateway() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let stream = command
+            .find_subcommand("agent-stream")
+            .expect("the feature build has agent-stream");
+
+        for group in SHARED_GROUPS {
+            let texts = help_texts(
+                stream
+                    .find_subcommand(group)
+                    .unwrap_or_else(|| panic!("{group}")),
+            );
+            for text in texts {
+                // A field name in backticks, such as `gateways` in the
+                // `policies impact` answer, is what Agent Stream sends, but a
+                // command in backticks still never names the other product.
+                let prose: String = text
+                    .split('`')
+                    .step_by(2)
+                    .collect();
+                let lower = prose.to_ascii_lowercase();
+                assert!(!lower.contains("gateway"), "{group}: {text}");
+                assert!(!lower.contains("agent surface"), "{group}: {text}");
+                assert!(
+                    !text
+                        .to_ascii_lowercase()
+                        .contains("agent-gateway"),
+                    "{group}: {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shared_groups_reach_their_routes_with_the_saved_token() {
+        let (host, requests) = scripted_agent_stream(vec![
+            ("GET /api/v1/secrets", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/users", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/identities", "HTTP/1.1 200 OK", r#"{"identities":[],"count":0}"#),
+            ("GET /api/v1/api-keys", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/policy-definitions", "HTTP/1.1 200 OK", "[]"),
+        ])
+        .await;
+
+        for group in ["secrets", "users", "identities", "api-keys", "policies"] {
+            let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+            run_stream(&[group, "list"], saved, &credentials)
+                .await
+                .unwrap_or_else(|error| panic!("{group}: {error:#}"));
+        }
+
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/secrets HTTP/1.1",
+                "GET /api/v1/users HTTP/1.1",
+                "GET /api/v1/identities HTTP/1.1",
+                "GET /api/v1/api-keys HTTP/1.1",
+                "GET /api/v1/policy-definitions HTTP/1.1",
+            ]
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| sends_bearer(request, ACCESS_TOKEN))
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_audit_metrics_and_logs_reach_their_routes_with_the_saved_token() {
+        let (host, requests) = scripted_agent_stream(vec![
+            ("GET /api/v1/settings", "HTTP/1.1 200 OK", "{}"),
+            ("GET /api/v1/audit?limit=100&page=1", "HTTP/1.1 200 OK", r#"{"events":[],"total":0}"#),
+            ("GET /api/v1/metrics/config", "HTTP/1.1 200 OK", "{}"),
+            ("POST /api/v1/logs/truncate", "HTTP/1.1 200 OK", r#"{"files_removed":0}"#),
+        ])
+        .await;
+
+        for words in [
+            &["settings", "show"][..],
+            &["audit", "list"],
+            &["metrics", "config", "show"],
+            &["logs", "truncate", "--yes"],
+        ] {
+            let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+            run_stream(words, saved, &credentials)
+                .await
+                .unwrap_or_else(|error| panic!("{words:?}: {error:#}"));
+        }
+
+        assert_eq!(
+            start_lines(&requests),
+            [
+                "GET /api/v1/settings HTTP/1.1",
+                "GET /api/v1/audit?limit=100&page=1 HTTP/1.1",
+                "GET /api/v1/metrics/config HTTP/1.1",
+                "POST /api/v1/logs/truncate HTTP/1.1",
+            ]
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| sends_bearer(request, ACCESS_TOKEN))
+        );
     }
 
     #[tokio::test]
