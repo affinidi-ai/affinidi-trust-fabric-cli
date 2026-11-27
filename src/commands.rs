@@ -11756,9 +11756,8 @@ async fn run_users(
 /// `/v1/users/integrations` is a separate route that answers PUT by replacing
 /// the whole user-integration configuration, so any document sent there, a
 /// user record or `{}`, would clear every assignment and report success.
-/// Agent Gateway had the same route until v1.0.1 removed it, and its refusal
-/// is left as it was on purpose. The refusal names the `api` command of
-/// `product`.
+/// The Agent Gateway refusal is left as it was on purpose. The refusal names
+/// the `api` command of `product`.
 fn reject_reserved_user_route(
     product: Product,
     user_id: &str,
