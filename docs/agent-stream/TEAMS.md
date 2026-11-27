@@ -142,6 +142,7 @@ fabric agent-stream teams remove-member 0b7e4a52-0000-4000-8000-000000000001 api
 - Agent Stream makes the change to the team as it is stored, so nothing else in the team is overwritten.
 - Table output lists the team's member ids before and after. `--dry-run` shows the same and sends nothing.
 - Removing a member from a team keeps the member.
+- A deleted team is refused, as `teams update` refuses it. Agent Stream itself would add a member to a deleted team, where it counts nothing.
 
 ### Delete a team
 
@@ -161,5 +162,7 @@ Agent Stream replaces the whole member or team on every save and has no version 
 4. It sends the whole record. A change that leaves the record as it was sends nothing.
 
 `--file` replaces the whole record. It must carry the record's current `updated_at`, so start from a fresh `get`; a copy read before another save is refused. Its `created_at`, `updated_at`, `tenant_id`, `system`, `auto_provisioned`, and `test_fixture` are replaced with the stored ones, with a note for each that differed. A member document can't have both `identifiers` and the older `identifier`, which Agent Stream can't read together. Its budgets and limits must match the stored ones, and any it leaves out are kept. A deleted record can't be changed.
+
+If Agent Stream gives no answer to a create or a save, for example after a timeout, it may have applied it anyway, and the error says so. Check with `members list`, `teams list`, or `get` before running the command again: Agent Stream allows two teams with one name, so a repeated `teams create` makes a second team.
 
 After a save, table output lists each changed field with its old and new value, and `--output json` prints the record as Agent Stream answered the save, which can go straight back to `--file`. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`.

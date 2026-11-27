@@ -136,16 +136,18 @@ pub enum TeamCommand {
     /// no member, or more than one, is refused before anything is sent. A
     /// member already in the team sends nothing. Agent Stream adds the member
     /// to the team as it is stored, so nothing else in the team is changed.
-    /// Table output lists the team's members before and after. --dry-run
-    /// shows the change and sends nothing.
+    /// A deleted team is refused, as `teams update` refuses it. Table output
+    /// lists the team's members before and after. --dry-run shows the change
+    /// and sends nothing.
     #[command(after_long_help = ADD_MEMBER_EXAMPLES)]
     AddMember(MemberChangeArgs),
     /// Remove a member from a team.
     ///
     /// The member is named as for `add-member`. A member not in the team
     /// sends nothing. The member itself is kept; delete it with `members
-    /// delete` once it is in no team. Table output lists the team's members
-    /// before and after. --dry-run shows the change and sends nothing.
+    /// delete` once it is in no team. A deleted team is refused. Table output
+    /// lists the team's members before and after. --dry-run shows the change
+    /// and sends nothing.
     #[command(after_long_help = REMOVE_MEMBER_EXAMPLES)]
     RemoveMember(MemberChangeArgs),
 }
@@ -308,7 +310,15 @@ pub async fn run(
             }
             let answer = client
                 .request(Method::POST, TEAMS.path, Some(team))
-                .await?;
+                .await
+                .map_err(|error| {
+                    records::unanswered_write(error, || {
+                        "Agent Stream gave no answer, so the team may have been created anyway; Agent Stream \
+                         allows two teams with one name, so check `fabric agent-stream teams list` before running \
+                         this again"
+                            .to_owned()
+                    })
+                })?;
             let id = text_field(&answer, "id").to_owned();
             print_outcome(&answer, output, &confirmation_line("Created", "team", &id))
         }
@@ -479,6 +489,7 @@ async fn change_member(
     let team = TEAMS
         .read(client, &args.team)
         .await?;
+    records::refuse_deleted(TEAMS, &team, &args.team)?;
     let member_id = resolve_member(Some(client), &args.member).await?;
     let ids = member_ids(&team);
     let present_now = ids.contains(&member_id);
@@ -1055,5 +1066,41 @@ mod tests {
             serde_json::from_str::<Value>(STORED).unwrap()
         );
         assert_eq!(start_lines(&requests), ["GET /api/v1/teams/0b7e4a52-0000-4000-8000-000000000001 HTTP/1.1"]);
+    }
+
+    const DELETED_TEAM: &str =
+        r#"{"id":"t-gone","name":"Gone","status":"deleted","members":["m-ada"],"updated_at":"2026-11-02T00:00:00Z"}"#;
+
+    #[tokio::test]
+    async fn add_member_and_remove_member_refuse_a_deleted_team_after_reading_it() {
+        for words in [&["teams", "add-member", "t-gone", "m-bob"][..], &["teams", "remove-member", "t-gone", "m-ada"]] {
+            let (result, requests) =
+                run_teams(words, vec![("GET /api/v1/teams/t-gone", "HTTP/1.1 200 OK", DELETED_TEAM)]).await;
+            assert!(error_text(result).contains("team 't-gone' is deleted, so it can't be changed"), "{words:?}");
+            assert_eq!(start_lines(&requests), ["GET /api/v1/teams/t-gone HTTP/1.1"], "{words:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_agent_stream_never_answers_says_the_team_may_exist_and_what_to_check() {
+        let (host, requests) = super::super::records::tests::answering_reads_dropping_writes("[]").await;
+        let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
+        let result =
+            run_stream(&["teams", "create", "--name", "Research", "--member", "m-ada"], saved, &credentials).await;
+        let text = error_text(result);
+        assert!(
+            text.starts_with(
+                "Agent Stream gave no answer, so the team may have been created anyway; Agent Stream allows two \
+                 teams with one name, so check `fabric agent-stream teams list` before running this again: "
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            ["POST /api/v1/teams HTTP/1.1"]
+        );
     }
 }

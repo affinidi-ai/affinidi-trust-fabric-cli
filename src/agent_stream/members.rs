@@ -300,7 +300,15 @@ pub async fn run(
             refuse_identifiers_in_use(&client, &member, None, &[]).await?;
             let answer = client
                 .request(Method::POST, MEMBERS.path, Some(member))
-                .await?;
+                .await
+                .map_err(|error| {
+                    records::unanswered_write(error, || {
+                        "Agent Stream gave no answer, so the member may have been created anyway; check \
+                         `fabric agent-stream members list` before running this again, which would otherwise be \
+                         refused because the member's identifiers are already in use"
+                            .to_owned()
+                    })
+                })?;
             let id = text_field(&answer, "id").to_owned();
             print_outcome(&answer, output, &confirmation_line("Created", "member", &id))
         }
@@ -1227,5 +1235,51 @@ mod tests {
             .expect("--output json prints the member as it is");
         assert_eq!(serde_json::from_str::<Value>(&json_text).unwrap(), before);
         assert!(start_lines(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_create_agent_stream_never_answers_says_the_member_may_exist_and_what_to_check() {
+        let (host, requests) = super::super::records::tests::answering_reads_dropping_writes("[]").await;
+        let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
+        let result = run_stream(&["members", "create", "--identifier", "custom:x"], saved, &credentials).await;
+        let text = error_text(result);
+        assert!(
+            text.starts_with(
+                "Agent Stream gave no answer, so the member may have been created anyway; check `fabric \
+                 agent-stream members list` before running this again, which would otherwise be refused because \
+                 the member's identifiers are already in use: "
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .as_slice(),
+            ["GET /api/v1/members HTTP/1.1", "POST /api/v1/members HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_agent_stream_never_answers_says_it_may_be_saved_and_how_to_check() {
+        let (host, requests) = super::super::records::tests::answering_reads_dropping_writes(STORED).await;
+        let (saved, credentials) = saved_login(&host, TEST_ACCESS_TOKEN);
+        let result = run_stream(&["members", "update", MEMBER_ID, "--name", "Ada L"], saved, &credentials).await;
+        let text = error_text(result);
+        assert!(
+            text.starts_with(&format!(
+                "Agent Stream gave no answer, so member '{MEMBER_ID}' may have been saved anyway; check it with \
+                 `fabric agent-stream members get {MEMBER_ID}` before running this again: "
+            )),
+            "{text}"
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .last()
+                .map(String::as_str),
+            Some("PUT /api/v1/members/6f1c2d3e-0000-4000-8000-000000000001 HTTP/1.1")
+        );
     }
 }

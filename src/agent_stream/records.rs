@@ -14,7 +14,7 @@ use reqwest::Method;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    client::{GatewayClient, pretty_json_for_terminal, sanitize_for_terminal},
+    client::{GatewayClient, pretty_json_for_terminal, response_status, sanitize_for_terminal},
     commands::{Output, confirmation_line, entity_path},
     surface_validate::{self, Change},
     tables,
@@ -364,13 +364,37 @@ pub async fn save_text(
     let path = kind.record_path(id)?;
     let saved = client
         .request(Method::PUT, &path, Some(after))
-        .await?;
+        .await
+        .map_err(|error| {
+            unanswered_write(error, || {
+                format!(
+                    "Agent Stream gave no answer, so {noun} '{id}' may have been saved anyway; check it with \
+                     `fabric agent-stream {group} get {id}` before running this again",
+                    noun = kind.noun,
+                    group = kind.group
+                )
+            })
+        })?;
     match output {
         Output::Table => {
             Ok(Some(format!("{}\n{}", change_summary(&changes), confirmation_line("Updated", kind.noun, id))))
         }
         Output::Json => pretty_json_for_terminal(&saved).map(Some),
     }
+}
+
+/// A failed write, with `advice` added when Agent Stream never answered it,
+/// such as a timeout or a dropped connection: the write may then have been
+/// applied anyway, and running the command again could repeat it. An answer
+/// from Agent Stream, such as a refusal, is returned as it is.
+pub fn unanswered_write(
+    error: anyhow::Error,
+    advice: impl FnOnce() -> String,
+) -> anyhow::Error {
+    if response_status(&error).is_some() {
+        return error;
+    }
+    error.context(advice())
 }
 
 /// What a dry run prints: the changes, or with --output json the changes and
@@ -457,4 +481,71 @@ pub fn listed(
         .as_array()
         .map(Vec::as_slice)
         .with_context(|| format!("Agent Stream did not answer with a list of {}", kind.group))
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use reqwest::StatusCode;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::unanswered_write;
+
+    /// A local server that answers every GET with `read_answer`, and closes the
+    /// connection on anything else without answering, as a write looks when it
+    /// times out or its connection drops. Returns its base URL and the start
+    /// line of each request.
+    pub async fn answering_reads_dropping_writes(read_answer: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener
+            .local_addr()
+            .expect("local addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 65536];
+                let read = socket
+                    .read(&mut buf)
+                    .await
+                    .unwrap_or(0);
+                let start = String::from_utf8_lossy(&buf[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(start.clone());
+                if start.starts_with("GET ") {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{read_answer}",
+                        read_answer.len()
+                    );
+                    let _ = socket
+                        .write_all(response.as_bytes())
+                        .await;
+                    let _ = socket.shutdown().await;
+                }
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[test]
+    fn an_answer_from_agent_stream_is_kept_and_no_answer_gets_the_advice() {
+        let refused = crate::client::gateway_error(StatusCode::CONFLICT, b"already exists", &[]);
+        let kept = format!("{:#}", unanswered_write(refused, || "check first".to_owned()));
+        assert!(kept.contains("already exists") && !kept.contains("check first"), "{kept}");
+
+        let dropped = unanswered_write(anyhow::anyhow!("operation timed out"), || "check first".to_owned());
+        assert_eq!(format!("{dropped:#}"), "check first: operation timed out");
+    }
 }
