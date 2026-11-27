@@ -91,6 +91,8 @@ These exist only in builds with the `agent-stream` feature.
 | **Default version** | The version of a prompt template a request gets when it names none: `default_version`, or the highest version when that is unset. Changed with `prompts set-default`, which is how a template is rolled back. |
 | **Member** | A known caller of an Agent Stream, a person, service, or API key, that usage, limits, and spend are counted against. Recognised by its **identifiers**, written `KIND:VALUE` on the command line (`email:`, `subject:`, `api_key:`, or `custom:`). Managed with `fabric agent-stream members`. |
 | **Team** | A group of Members on an Agent Stream with a shared budget. A team holds member ids only; `teams add-member` and `teams remove-member` take a member's id or one of its identifiers. Managed with `fabric agent-stream teams`. |
+| **Model catalog** | The LLM providers an Agent Stream knows, with their endpoints, models, and prices, which it uses to route calls and work out their cost. Managed with `fabric agent-stream providers`. It holds no API keys: a provider's key is a secret that a surface names. |
+| **Provider** | One entry of the Model catalog, known by its id (`enum_value`), which a surface names. A **built-in** provider ships with Agent Stream and is replaced by a catalog refresh; a **custom** provider is added by a user, survives a refresh, and is saved by replacing the whole custom catalog. _Agent Stream's API calls these LLM providers._ |
 
 ## Related
 

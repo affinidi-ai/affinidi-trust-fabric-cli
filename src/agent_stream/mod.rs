@@ -24,6 +24,7 @@ mod notifications;
 mod policies;
 mod prompt_content;
 mod prompts;
+mod providers;
 mod records;
 mod request;
 mod secrets;
@@ -214,6 +215,17 @@ enum AgentStreamCommand {
     Prompts {
         #[command(subcommand)]
         command: prompts::PromptCommand,
+    },
+    /// Manage the Model catalog: the LLM providers an Agent Stream knows, with
+    /// their endpoints, models, and prices.
+    ///
+    /// Every providers command, reading included, needs the
+    /// `llm_catalog.edit` permission, which by default only administrators
+    /// have. The catalog holds no API keys: a provider's key is stored as a
+    /// secret, and the surface that uses the provider names that secret.
+    Providers {
+        #[command(subcommand)]
+        command: providers::ProviderCommand,
     },
     /// Manage access tokens.
     Tokens {
@@ -610,6 +622,9 @@ async fn run_command(
         }
         AgentStreamCommand::Teams { command } => {
             return teams::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+        }
+        AgentStreamCommand::Providers { command } => {
+            return providers::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
         }
         AgentStreamCommand::Tokens { command } => {
             let command = AccessTokenCommand::from(command);
