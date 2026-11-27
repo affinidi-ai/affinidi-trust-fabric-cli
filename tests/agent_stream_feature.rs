@@ -1429,3 +1429,93 @@ fn tenant_ownership_set_names_the_agent_stream_impact_command_when_a_move_is_blo
         stderr(&output)
     );
 }
+
+/// Two prompt templates as Agent Stream lists them, messages included.
+#[cfg(feature = "agent-stream")]
+const PROMPT_TEMPLATES: &str = r#"[{"id":"greeter","name":"Greeter","status":"enabled","default_version":2,
+  "versions":[{"version":1,"messages":[{"role":"system","content":"SECRET-PROMPT-TEXT"}]},
+              {"version":2,"messages":[{"role":"system","content":"SECRET-PROMPT-TEXT"}]}],
+  "updated_at":"2026-11-02T00:00:00Z"}]"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_list_prints_each_template_with_its_version_numbers_and_never_its_messages() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, PROMPT_TEMPLATES);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "prompts", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(text.contains("ID") && text.contains("VERSIONS") && text.contains("DEFAULT"), "{text}");
+    assert!(text.contains("greeter") && text.contains("1, 2"), "{text}");
+    assert!(!text.contains("SECRET-PROMPT-TEXT"), "{text}");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/prompts HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_render_prints_each_message_role_and_content() {
+    let answer = r#"{"messages":[{"role":"system","content":"Hi Ada"},{"role":"user","content":"Where is it?"}],"variables":["name"]}"#;
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, answer);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "prompts", "render", "greeter", "--var", "name=Ada"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "[system]\nHi Ada\n\n[user]\nWhere is it?\n");
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "POST /api/v1/prompts/greeter/render HTTP/1.1"]);
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn prompts_create_dry_run_prints_the_preview_and_needs_no_login() {
+    let home = tempfile::TempDir::new().expect("temp dir");
+    let template = home
+        .path()
+        .join("template.json");
+    std::fs::write(
+        &template,
+        r#"{"id":"greeter","name":"Greeter","versions":[{"version":1,"messages":[{"role":"user","content":"Hi"}]}]}"#,
+    )
+    .expect("template file");
+
+    let output = fabric_in_home(
+        home.path(),
+        &[
+            "agent-stream",
+            "prompts",
+            "create",
+            "--file",
+            template
+                .to_str()
+                .expect("path"),
+            "--dry-run",
+            "--output",
+            "json",
+        ],
+        &[],
+        &[UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let preview: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON preview");
+    assert_eq!(preview["dry_run"], serde_json::json!(true));
+    assert_eq!(preview["after"]["id"], serde_json::json!("greeter"));
+    assert!(
+        preview["changes"]
+            .as_array()
+            .expect("changes")
+            .contains(&serde_json::json!({"version": 1, "change": "added"})),
+        "{preview}"
+    );
+}

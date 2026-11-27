@@ -33,6 +33,7 @@ Every command also documents its options in its help text: `fabric agent-gateway
 | Document | Command groups |
 | --- | --- |
 | [Governance and drift](agent-stream/GOVERNANCE_AND_DRIFT.md) | `governance` and `drift`: governance records, chain checks, drift verdicts, baselines, and replay runs |
+| [Prompt templates](agent-stream/PROMPTS.md) | `prompts`: create, version, preview, and roll back prompt templates |
 
 ## Development
 

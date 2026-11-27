@@ -177,6 +177,21 @@ pub static AGENT_STREAM_SURFACES: Layout = Layout {
     ],
 };
 
+/// The prompt templates of an Agent Stream, as `fabric agent-stream prompts
+/// list` shows them: never their messages.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_PROMPTS: Layout = Layout {
+    empty: "No prompt templates yet.",
+    columns: &[
+        id(&["id"]),
+        whole("NAME", &["name"]),
+        col("STATUS", &["status"]),
+        col("VERSIONS", &["version_numbers"]),
+        col("DEFAULT", &["default_version"]),
+        col("UPDATED", &["updated_at"]),
+    ],
+};
+
 pub static POLICIES: Layout = Layout {
     empty: "No policies yet.",
     columns: &[

@@ -81,6 +81,15 @@ Only in builds with the `agent-stream` feature. See [Governance and drift](docs/
 | **Masked value** | A secret value, private key, or similar field the CLI hides in output unless `--reveal` is passed. A masked document must not be sent back, and the CLI refuses one that is. Agent Stream's `certificates`, `identities`, and `delegation-vault` have no `--reveal`, because Agent Stream never sends a private key or a grant's tokens: an identity carries only its `public_key`, and the CLI removes a certificate's `private_key_pem` or a grant's `access_token` and `refresh_token` should one appear, and prints a `note: hid` line naming what it removed. |
 | **Redaction** | Replacing credentials and personal data with `[redacted]`: always in error messages, and in audit and payment records unless `--reveal` is passed, so output can be logged safely. |
 
+## Agent Stream resources
+
+These exist only in builds with the `agent-stream` feature.
+
+| Term | Meaning |
+| --- | --- |
+| **Prompt template** | A saved prompt on an Agent Stream that a model request names by its id, filling `{{name}}` placeholders from the request's variables, instead of sending the prompt text. It holds numbered **versions**, each a list of messages with a role and content. Managed with `fabric agent-stream prompts`. Agent Stream's API calls it a _prompt_ and serves it at `/v1/prompts`. |
+| **Default version** | The version of a prompt template a request gets when it names none: `default_version`, or the highest version when that is unset. Changed with `prompts set-default`, which is how a template is rolled back. |
+
 ## Related
 
 - [Agent Gateway glossary](https://github.com/affinidi-ai/agent-gateway/blob/main/CONTEXT.md): the gateway's own terms in full
