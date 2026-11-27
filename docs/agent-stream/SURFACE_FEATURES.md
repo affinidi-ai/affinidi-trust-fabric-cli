@@ -79,9 +79,10 @@ usage-limits  usage_limits  1 item   -         fabric agent-stream surfaces remo
 judge         judge         not set  strict    -
 ```
 
-- STATE is `on` or `off` for a setting with an `enabled` flag, `set` for one without, and the number of items for a list, with a note when its switch is off.
+- STATE is `on` or `off` for a setting with an `enabled` flag, `set` for one without, and the number of items for a list, with a note when its switch is off. Cost tracking that is off but has a price set shows `off (prices used)`, because Agent Stream prices the surface's calls with those prices whatever `enabled` says.
 - VARIANTS names the variants that use their own value of the feature. See [Variants](#variants).
 - A feature only variants set shows as `not set`, with no remove command, since `remove-feature` changes only the base surface.
+- A deleted surface shows no remove commands, and a line under the table says it is deleted, since a deleted surface can't be changed.
 - `--output json` prints each feature with its `field`, `state`, base `value`, and `overridden_by` variants.
 
 ## Add or change a feature
@@ -115,7 +116,7 @@ The JSON is read and its shape checked before anything is sent: a setting takes 
 
 - **A list** gets the JSON appended as one item, at the end. An item already in the list, by its `id` or by the same fields, is refused. A new routing rule goes last, and Agent Stream uses the first rule that matches.
 
-A name inside the JSON must be one the surface's field already has, unless `--allow-new-field` is given, because a typo would otherwise be dropped by Agent Stream without an error. Agent Stream leaves empty optional settings out of the surface it returns, so a correct name can look new; for example, `alert_threshold_percent` when `cost_tracking` has none yet. Nothing is checked inside a field the surface does not have yet, or inside a list item.
+A name inside the JSON must be one the surface's field already has, unless `--allow-new-field` is given, because a typo would otherwise be dropped by Agent Stream without an error. Agent Stream leaves empty optional settings out of the surface it returns, so a correct name can look new; for example, `alert_threshold_percent` when `cost_tracking` has none yet. So `cost-tracking` names are always checked against every setting Agent Stream knows, even on a surface with no `cost_tracking` yet, and `monthly_budget` instead of `monthly_budget_usd` is refused. Nothing is checked inside any other field the surface does not have yet, or inside a list item.
 
 ### Cost tracking and prices
 
@@ -179,9 +180,10 @@ MONTH    SPENT   LIMIT    USED   REMAINING  EXCEEDED
 2026-11  $12.50  $100.00  12.5%  $87.50     no
 ```
 
-- Agent Stream counts spend only while `cost_tracking` has `enabled` set to true, a `monthly_budget_usd` above 0, and an `alert_threshold_percent`. With none of that, or no model call yet this month, the command says so instead of printing a table.
+- Agent Stream counts spend only while `cost_tracking` has `enabled` set to true, a `monthly_budget_usd` above 0, and an `alert_threshold_percent`. The command says so instead of printing a table only when nothing was counted this month.
 - It counts only the surface's own model calls. Judge and jury calls count against usage limits instead.
-- Agent Stream takes a changed budget into its count at the next model call, so until then LIMIT shows the old one.
+- Spend counted earlier this month stays, with the limit it was counted under, until the month ends. So after cost tracking is turned off or removed mid-month, the table still shows that SPENT and LIMIT.
+- A changed limit shows in LIMIT only after the next counted call, so until then LIMIT shows the old one.
 - A 403 that gives no reason of its own adds that the route needs `metrics.view`. A 403 with a reason, such as Terms and Conditions not yet accepted, shows that reason alone.
 - `--output json` prints Agent Stream's answer, so a script can stop once the budget is used up:
 
@@ -198,6 +200,8 @@ Agent Stream replaces the whole surface on every save and has no version check. 
 3. It reads the surface again, and stops with nothing saved if someone else saved it in the meantime. A save that lands in the short gap before the send is still overwritten.
 4. It sends the whole surface. A change that leaves the surface as it was sends nothing.
 
-After a save, table output lists each changed field with its old and new value, and `--output json` prints the surface as Agent Stream has it after the save. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`. Agent Stream has no dry run of its own, so its checks, such as those on failover targets, canary splits, and usage limits, only run on a real save.
+When Agent Stream gives no answer to the send, such as a timeout, a dropped connection, or a 502 or 504 from a proxy in front of it, the surface may have been saved anyway. The error then says so: check it with `surfaces get <id>` or `surfaces features <id>` before running the command again, because a second `add-feature` or `remove-feature` can fail on the change the first one already made. A refusal from Agent Stream, such as a 400, prints as it is.
+
+After a save, table output lists each changed field with its old and new value, and `--output json` prints the surface as Agent Stream has it after the save. `--dry-run` shows the changes and saves nothing; with `--output json` it prints `{ "dry_run": true, "changes": [...], "after": {...} }`. Agent Stream has no dry run of its own, so its checks only run on a real save: a route another surface uses and the drift block on any surface, and those on failover targets, canary splits, and usage limits only on an `llm` surface.
 
 Notes go to standard error, so `--output json` stays one JSON document.

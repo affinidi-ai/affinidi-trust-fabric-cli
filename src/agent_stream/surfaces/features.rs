@@ -14,7 +14,10 @@ use clap::{ArgGroup, Args};
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 
-use super::{Edit, Given, check_id, check_nested_fields, closest, pipe_type_of, read_live_surface, save, surface_path};
+use super::{
+    Edit, Given, STATUS_DELETED, check_id, check_nested_fields, closest, pipe_type_of, read_live_surface, save,
+    status_of, surface_path,
+};
 use crate::{
     client::{GatewayClient, is_unexplained_agent_stream_forbidden, pretty_json_for_terminal},
     commands::{Output, read_json},
@@ -232,9 +235,11 @@ const COST_TRACKING: &str = "cost_tracking";
 const COST_TRACKING_KEPT: [&str; 3] = ["enabled", "input_price_per_1k", "output_price_per_1k"];
 
 /// Every setting of `cost_tracking` (`CostTrackingConfig` in Agent Stream's
-/// `src/pipes/config.rs`). Agent Stream leaves an unset one out of the surface
-/// it returns, so the name check takes these as known even when the stored
-/// object lacks them, and still refuses any other name.
+/// `src/pipes/config.rs`). Agent Stream drops a name it does not know without
+/// an error, and leaves an unset setting out of the surface it returns. So
+/// `add-feature` always checks the names given for cost-tracking against
+/// these and any the stored object has, even on a surface with no
+/// `cost_tracking` yet, and refuses any other name.
 const COST_TRACKING_FIELDS: [&str; 5] =
     ["enabled", "input_price_per_1k", "output_price_per_1k", "monthly_budget_usd", "alert_threshold_percent"];
 
@@ -457,7 +462,9 @@ fn kind_name(kind: Kind) -> &'static str {
 /// The text `surfaces features <id>` prints: each feature the surface `id`
 /// has set or one of its variants sets, with whether it is on, the variants
 /// that override it, and the command that removes it from the base surface,
-/// or with --output json the same with each base value.
+/// or with --output json the same with each base value. A deleted surface
+/// can't be changed, so its table shows no remove command and ends with a
+/// line saying it is deleted.
 pub async fn on_surface(
     client: &GatewayClient,
     id: &str,
@@ -494,11 +501,13 @@ pub async fn on_surface(
             "Surface '{id}' has none of the features set; `fabric agent-stream surfaces features` lists them."
         )),
         Output::Table => {
+            let deleted = status_of(&surface) == Some(STATUS_DELETED);
             let rows: Vec<Vec<String>> = shown
                 .iter()
                 .map(|(feature, value, variants)| {
                     let remove = match (value, feature.kind) {
                         (None, _) => "-".to_owned(),
+                        (Some(_), _) if deleted => "-".to_owned(),
                         (Some(_), Kind::Setting) => {
                             format!("fabric agent-stream surfaces remove-feature {id} {}", feature.key)
                         }
@@ -522,7 +531,11 @@ pub async fn on_surface(
                     ]
                 })
                 .collect();
-            Ok(format_rows(&["FEATURE", "FIELD", "STATE", "VARIANTS", "REMOVE WITH"], &rows).join("\n"))
+            let mut lines = format_rows(&["FEATURE", "FIELD", "STATE", "VARIANTS", "REMOVE WITH"], &rows);
+            if deleted {
+                lines.push(format!("\nSurface '{id}' is deleted, so its features can't be changed."));
+            }
+            Ok(lines.join("\n"))
         }
     }
 }
@@ -582,7 +595,9 @@ fn overriding_variants(
 
 /// How `features <id>` describes a feature: `on` or `off` for a setting
 /// with an `enabled` flag, else `set`, and the number of items of a list,
-/// with a note when its switch is off. `not set` when only variants set it.
+/// with a note when its switch is off. Cost tracking that is off but has a
+/// price set shows `off (prices used)`, since Agent Stream prices calls with
+/// them whatever `enabled` says. `not set` when only variants set it.
 fn state(
     surface: &Value,
     feature: &Feature,
@@ -597,6 +612,7 @@ fn state(
             .and_then(Value::as_bool)
         {
             Some(true) => "on".to_owned(),
+            Some(false) if feature.field == COST_TRACKING && has_price(value) => "off (prices used)".to_owned(),
             Some(false) => "off".to_owned(),
             None => "set".to_owned(),
         },
@@ -617,6 +633,17 @@ fn state(
             }
         }
     }
+}
+
+/// Whether `cost_tracking` has either of its prices set.
+fn has_price(cost_tracking: &Value) -> bool {
+    COST_TRACKING_PRICES
+        .iter()
+        .any(|price| {
+            cost_tracking
+                .get(*price)
+                .is_some_and(|value| !value.is_null())
+        })
 }
 
 /// A surface changed on this machine, with the notes to print about it.
@@ -652,9 +679,11 @@ pub async fn add(
 }
 
 /// `surface`, the surface `id`, with `given` as its `feature`: the whole
-/// field for a setting, or one more item for a list. A name inside a
-/// setting the surface already has must be one it has, unless
-/// `allow_new_field`. An item already in the list is refused. A list's
+/// field for a setting, or one more item for a list. Unless
+/// `allow_new_field`, a name inside a setting the surface already has must
+/// be one it has, and a name inside cost-tracking must be one of
+/// [`COST_TRACKING_FIELDS`] or one the stored object has, whether or not the
+/// surface has it. An item already in the list is refused. A list's
 /// switch is set to true only when the list was empty, so items left off on
 /// purpose stay off. The notes say what else the change does or does not do.
 fn with_feature_added(
@@ -674,15 +703,22 @@ fn with_feature_added(
             let Value::Object(mut settings) = given else {
                 bail!("{} takes a JSON object of settings, such as {{\"enabled\":true}}", feature.key);
             };
-            if let Some(Value::Object(existing)) = surface.get(feature.field) {
-                let mut known = existing.clone();
-                if feature.field == COST_TRACKING {
-                    for name in COST_TRACKING_FIELDS {
-                        known
-                            .entry(name)
-                            .or_insert(Value::Null);
-                    }
+            let stored = match surface.get(feature.field) {
+                Some(Value::Object(existing)) => Some(existing.clone()),
+                _ => None,
+            };
+            let known = if feature.field == COST_TRACKING {
+                let mut known = stored.unwrap_or_default();
+                for name in COST_TRACKING_FIELDS {
+                    known
+                        .entry(name)
+                        .or_insert(Value::Null);
                 }
+                Some(known)
+            } else {
+                stored
+            };
+            if let Some(known) = known {
                 check_nested_fields(feature.field, &settings, &known, allow_new_field, Given::Feature)?;
             }
             if feature.field == COST_TRACKING {
@@ -975,8 +1011,8 @@ mod tests {
             super::{
                 AgentStreamCommand,
                 test_support::{
-                    Route, UnusedKeyring, json_file, request_body, run_stream, saved_login, scripted_agent_stream,
-                    start_lines, stream_args,
+                    HANG_UP, Route, UnusedKeyring, json_file, request_body, run_stream, saved_login,
+                    scripted_agent_stream, start_lines, stream_args,
                 },
             },
             DRY_RUN_UPDATE_NOTE, SURFACE_FIELDS, SurfaceCommand,
@@ -1001,6 +1037,13 @@ mod tests {
     const GET_MOVED: Route = ("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", MOVED);
     const PUT_SAVED: Route = ("PUT /api/v1/pipes/s-1", "HTTP/1.1 200 OK", STORED);
     const GET_BUDGET: Route = ("GET /api/v1/pipes/s-1/budget", "HTTP/1.1 200 OK", BUDGET);
+
+    /// A surface Agent Stream has deleted and keeps for its usage history.
+    const DELETED: &str = r#"{"id":"s-1","name":"Sales","pipe_type":{"type":"webhook","endpoint":"https://hooks.example/in"},"status":"deleted","rate_limit":{"enabled":true,"requests_per_minute":60},"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-20T10:00:00Z"}"#;
+    /// What the CLI says when Agent Stream gave no answer to the save of `s-1`.
+    const MAY_HAVE_BEEN_SAVED: &str = "Agent Stream gave no answer, so surface 's-1' may have been saved anyway; \
+                                       check it with `fabric agent-stream surfaces get s-1` or `fabric agent-stream \
+                                       surfaces features s-1` before running this again";
 
     const GET_LINE: &str = "GET /api/v1/pipes/s-1 HTTP/1.1";
     const PUT_LINE: &str = "PUT /api/v1/pipes/s-1 HTTP/1.1";
@@ -1512,6 +1555,119 @@ mod tests {
             })
         );
         assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE]);
+    }
+
+    #[tokio::test]
+    async fn a_save_with_no_answer_or_a_proxy_502_or_504_says_it_may_have_been_saved() {
+        for put in [
+            ("PUT /api/v1/pipes/s-1", HANG_UP, ""),
+            ("PUT /api/v1/pipes/s-1", "HTTP/1.1 502 Bad Gateway", ""),
+            ("PUT /api/v1/pipes/s-1", "HTTP/1.1 504 Gateway Timeout", "upstream timed out"),
+        ] {
+            let (host, requests) = scripted_agent_stream(vec![GET_STORED, put]).await;
+
+            let error = run_surfaces(&host, &["surfaces", "add-feature", "s-1", "rate-limit", "--json", RATE_LIMIT])
+                .await
+                .expect_err("the save got no answer");
+
+            let text = format!("{error:#}");
+            assert!(text.starts_with(MAY_HAVE_BEEN_SAVED), "{put:?}: {text}");
+            assert!(!text.contains(ACCESS_TOKEN), "{text}");
+            assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE], "{put:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_save_agent_stream_refuses_prints_the_refusal_without_the_no_answer_advice() {
+        for put in [
+            ("PUT /api/v1/pipes/s-1", "HTTP/1.1 400 Bad Request", "Invalid LLM configuration: bad canary"),
+            ("PUT /api/v1/pipes/s-1", "HTTP/1.1 409 Conflict", "Save blocked: surface 'Sales' has drifted"),
+        ] {
+            let (host, requests) = scripted_agent_stream(vec![GET_STORED, put]).await;
+
+            let error = run_surfaces(&host, &["surfaces", "add-feature", "s-1", "rate-limit", "--json", RATE_LIMIT])
+                .await
+                .expect_err("Agent Stream refused the save");
+
+            let text = format!("{error:#}");
+            assert!(text.contains(put.2), "{put:?}: {text}");
+            assert!(!text.contains("may have been saved"), "{put:?}: {text}");
+            assert_eq!(start_lines(&requests), [GET_LINE, GET_LINE, PUT_LINE], "{put:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_names_are_checked_on_a_surface_without_cost_tracking() {
+        let (host, requests) = scripted_agent_stream(vec![GET_STORED, PUT_SAVED]).await;
+        let typo = r#"{"enabled":true,"monthly_budget":100,"alert_threshold_percent":80}"#;
+        let good = r#"{"enabled":true,"monthly_budget_usd":100,"alert_threshold_percent":80}"#;
+        assert!(
+            stored()
+                .get("cost_tracking")
+                .is_none()
+        );
+
+        let error = run_surfaces(&host, &["surfaces", "add-feature", "s-1", "cost-tracking", "--json", typo])
+            .await
+            .expect_err("monthly_budget is not a cost-tracking setting");
+        let sent_before_good = start_lines(&requests);
+        run_surfaces(&host, &["surfaces", "add-feature", "s-1", "cost-tracking", "--json", good])
+            .await
+            .expect("every name is a cost-tracking setting");
+
+        assert_eq!(
+            error.to_string(),
+            "`cost_tracking.monthly_budget` in the feature settings is not in the surface as read; pass \
+             --allow-new-field to add it as a new field; did you mean `cost_tracking.monthly_budget_usd`?"
+        );
+        assert_eq!(sent_before_good, [GET_LINE]);
+        assert_eq!(sent_json(&requests, 3)["cost_tracking"], serde_json::from_str::<Value>(good).unwrap());
+    }
+
+    #[test]
+    fn allow_new_field_lets_an_unknown_cost_tracking_name_through_on_a_surface_without_it() {
+        let feature = lookup("cost-tracking").unwrap();
+
+        let changed =
+            with_feature_added(feature, &stored(), json!({"enabled": true, "monthly_budget": 100}), true, "s-1")
+                .expect("--allow-new-field skips the name check");
+
+        assert_eq!(changed.surface["cost_tracking"]["monthly_budget"], 100);
+    }
+
+    #[test]
+    fn cost_tracking_that_is_off_with_a_price_says_the_prices_are_used() {
+        let feature = lookup("cost-tracking").unwrap();
+        let surface = stored();
+        let state_of = |value: Value| state(&surface, feature, Some(&value));
+
+        assert_eq!(state_of(json!({"enabled": false, "input_price_per_1k": 0.002})), "off (prices used)");
+        assert_eq!(state_of(json!({"enabled": false, "output_price_per_1k": 0.006})), "off (prices used)");
+        assert_eq!(state_of(json!({"enabled": false, "input_price_per_1k": null})), "off");
+        assert_eq!(state_of(json!({"enabled": true, "input_price_per_1k": 0.002})), "on");
+        assert_eq!(state(&surface, lookup("rate-limit").unwrap(), Some(&json!({"enabled": false}))), "off");
+    }
+
+    #[tokio::test]
+    async fn features_of_a_deleted_surface_shows_no_remove_command_and_says_it_is_deleted() {
+        let (host, _) = scripted_agent_stream(vec![("GET /api/v1/pipes/s-1", "HTTP/1.1 200 OK", DELETED)]).await;
+        let client = GatewayClient::for_agent_stream(&host, ACCESS_TOKEN).unwrap();
+
+        let table = on_surface(&client, "s-1", Output::Table)
+            .await
+            .expect("features s-1");
+
+        assert_eq!(
+            table
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "FEATURE     FIELD       STATE  VARIANTS  REMOVE WITH",
+                "rate-limit  rate_limit  on     -         -",
+                "",
+                "Surface 's-1' is deleted, so its features can't be changed.",
+            ]
+        );
     }
 
     #[test]

@@ -142,15 +142,21 @@ impl CredentialStore for UnusedKeyring {
 }
 
 /// One answer of a [`scripted_agent_stream`]: the request start it answers,
-/// such as `GET /api/v1/profile`, its status line, and its body.
+/// such as `GET /api/v1/profile`, its status line, or [`HANG_UP`], and its
+/// body.
 pub type Route = (&'static str, &'static str, &'static str);
+
+/// The status line of a [`Route`] that closes the connection after reading
+/// the request, without any answer.
+pub const HANG_UP: &str = "hang up";
 
 /// Answers each request with the route whose request start it begins with,
 /// and `404 Not Found` with an empty body to any other, until the test ends.
 /// When several routes share one request start, the first request gets the
 /// first of them, the next request the next, and the last one answers every
-/// request after that. Records each whole request, headers and body included.
-/// Returns its base URL and the recording.
+/// request after that. A route whose status line is [`HANG_UP`] closes the
+/// connection with no answer. Records each whole request, headers and body
+/// included. Returns its base URL and the recording.
 pub async fn scripted_agent_stream(routes: Vec<Route>) -> (String, Arc<Mutex<Vec<String>>>) {
     let mut answered: HashMap<&'static str, usize> = HashMap::new();
     serve(move |request| {
@@ -206,6 +212,9 @@ async fn serve(
                 .lock()
                 .unwrap()
                 .push(request);
+            if status_line == HANG_UP {
+                continue;
+            }
             let response =
                 format!("{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
             let _ = socket

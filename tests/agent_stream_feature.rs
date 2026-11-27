@@ -1146,3 +1146,69 @@ fn surfaces_remove_feature_on_a_list_without_item_or_all_is_refused_and_nothing_
     );
     assert!(requests.is_empty(), "{requests:?}");
 }
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn surfaces_add_feature_with_output_json_prints_one_json_value_and_its_notes_on_standard_error() {
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/pipes/s-1", "200 OK", SURFACE_WITH_FEATURES),
+        ("PUT /api/v1/pipes/s-1", "200 OK", SURFACE_WITH_FEATURES),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["surfaces", "add-feature", "s-1", "retry", "--json", r#"{"max_retries":2}"#, "--output", "json"],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&output)).expect("one JSON value on standard output"),
+        serde_json::from_str::<serde_json::Value>(SURFACE_WITH_FEATURES).unwrap()
+    );
+    assert!(
+        stderr(&output).contains(
+            "note: surface 's-1' is a `webhook` surface, and Agent Stream serves calls only on `llm` surfaces, so \
+             retry takes effect only through a variant whose `pipe_type` is `llm`\n"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        request_lines(&requests),
+        [
+            PROBE_REQUEST,
+            "GET /api/v1/pipes/s-1 HTTP/1.1",
+            "GET /api/v1/pipes/s-1 HTTP/1.1",
+            "PUT /api/v1/pipes/s-1 HTTP/1.1",
+            "GET /api/v1/pipes/s-1 HTTP/1.1"
+        ]
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn a_surface_save_agent_stream_refuses_shows_its_reason_and_fails() {
+    const REFUSAL: &str = "Invalid LLM configuration: canary weights must add up to 100";
+    let (host, requests) = agent_stream_stand_in(vec![
+        ("GET /api/v1/pipes/s-1", "200 OK", SURFACE_WITH_FEATURES),
+        ("PUT /api/v1/pipes/s-1", "400 Bad Request", REFUSAL),
+    ]);
+
+    let output = fabric_on_stream(
+        &host,
+        &["surfaces", "add-feature", "s-1", "rate-limit", "--json", r#"{"enabled":true,"requests_per_minute":60}"#],
+        "",
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert!(stderr(&output).contains(REFUSAL), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("may have been saved"), "{}", stderr(&output));
+    assert_eq!(
+        request_lines(&requests)
+            .last()
+            .map(String::as_str),
+        Some("PUT /api/v1/pipes/s-1 HTTP/1.1")
+    );
+}

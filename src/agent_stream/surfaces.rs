@@ -13,11 +13,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
 use rand::RngCore;
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    client::{GatewayClient, pretty_json_for_terminal, sanitize_for_terminal},
+    client::{GatewayClient, pretty_json_for_terminal, response_status, sanitize_for_terminal},
     commands::{Output, confirmation_line, entity_path, print_list, print_outcome, read_json, rfc3339_utc, unix_now},
     surface_patch,
     surface_validate::{self, Change},
@@ -46,8 +46,9 @@ const UPDATE_PIPE_TYPE_HINT: &str = "keep the `pipe_type` from `surfaces get`, o
 /// The end of the table-mode dry run of `update`, `add-feature`, and
 /// `remove-feature`, after a blank line.
 const DRY_RUN_UPDATE_NOTE: &str = "\nDry run: nothing was saved. Agent Stream's own checks, such as a route another \
-                                   surface uses, the drift block, or the checks on failover targets, canary splits, \
-                                   and usage limits, only run on a real save.";
+                                   surface uses or the drift block, only run on a real save, and its checks on \
+                                   failover targets, canary splits, and usage limits only on a real save of an `llm` \
+                                   surface.";
 
 /// The top-level fields of an Agent Stream surface: the fields of `PipeConfig`
 /// in Agent Stream's `src/pipes/config.rs`, which renames and flattens none of
@@ -248,10 +249,14 @@ pub enum SurfaceCommand {
     /// With an id, it lists each feature the surface has set, whether it is
     /// on, the variants that use their own value of it, and the
     /// `remove-feature` command for it; a feature only variants set shows as
-    /// `not set`. The names shown are the ones `add-feature` and
-    /// `remove-feature` take, in any case. --output json prints the same list,
-    /// or for a surface each feature with its field, state, base value, and
-    /// `overridden_by` variants.
+    /// `not set`. Cost tracking that is off but has a price set shows `off
+    /// (prices used)`, since Agent Stream prices calls with those prices
+    /// whatever `enabled` says. A deleted surface can't be changed, so it
+    /// shows no `remove-feature` command and a line saying it is deleted. The
+    /// names shown are the ones `add-feature` and `remove-feature` take, in
+    /// any case. --output json prints the same list, or for a surface each
+    /// feature with its field, state, base value, and `overridden_by`
+    /// variants.
     #[command(after_long_help = FEATURES_EXAMPLES)]
     Features {
         /// ID of the surface (see `fabric agent-stream surfaces list`).
@@ -289,14 +294,18 @@ pub enum SurfaceCommand {
     /// checks the field names, reads it again and stops if it was saved
     /// meanwhile, then sends the whole surface. Agent Stream has no version
     /// check, so a save that lands in the short gap between that last read
-    /// and the send is still overwritten. A name inside the JSON must be one
-    /// the surface's field already has, unless --allow-new-field is given;
-    /// nothing is checked inside a field the surface does not have yet, or
-    /// inside a list item. Table output lists the changes, and --output json
-    /// prints the surface read back after the save. --dry-run shows the
-    /// changes and saves nothing. Agent Stream has no dry run, so its own
-    /// checks, such as those on failover targets, canary splits, and usage
-    /// limits, only run on a real save.
+    /// and the send is still overwritten. When Agent Stream gives no answer
+    /// to the send, the error says the surface may have been saved anyway,
+    /// so check it before running the command again. A name inside the JSON
+    /// must be one the surface's field already has, unless --allow-new-field
+    /// is given; cost-tracking names are always checked against every setting
+    /// Agent Stream knows, while nothing is checked inside any other field
+    /// the surface does not have yet, or inside a list item. Table output
+    /// lists the changes, and --output json prints the surface read back
+    /// after the save. --dry-run shows the changes and saves nothing. Agent
+    /// Stream has no dry run, so its own checks, such as those on failover
+    /// targets, canary splits, and usage limits, only run on a real save of
+    /// an `llm` surface.
     #[command(after_long_help = ADD_FEATURE_EXAMPLES)]
     AddFeature(features::AddFeatureArgs),
     /// Remove a feature from a surface.
@@ -305,10 +314,10 @@ pub enum SurfaceCommand {
     /// the surface's own model prices too, with a note; to stop only the
     /// budget, set `cost_tracking.enabled` to false with `surfaces update`. A
     /// list feature needs --item to remove one item or --all to remove the
-    /// whole list, and neither is refused before anything is sent. --item
-    /// takes the item's `id`; routing rules and usage alerts have no id, so
-    /// give some of the item's fields as JSON instead, which must match
-    /// exactly one item. A list's switch, such as `routing_enabled`, is left
+    /// whole list; with neither, the command stops before anything is sent.
+    /// --item takes the item's `id`; routing rules and usage alerts have no
+    /// id, so give some of the item's fields as JSON instead, which must
+    /// match exactly one item. A list's switch, such as `routing_enabled`, is left
     /// as it is. A feature the surface does not have set is refused. Only the
     /// base surface is changed, as for `add-feature`, and the save, the
     /// output, and --dry-run work as for `add-feature` too.
@@ -320,9 +329,12 @@ pub enum SurfaceCommand {
     /// (`cost_tracking`). Agent Stream counts the spend only while
     /// `cost_tracking` has `enabled` set to true, a `monthly_budget_usd`
     /// above 0, and an `alert_threshold_percent`, and it counts only the
-    /// surface's own model calls, not those of the judge or jury. It takes a
-    /// changed budget into its count at the next model call, so until then
-    /// LIMIT shows the old one. Reading it needs the `metrics.view`
+    /// surface's own model calls, not those of the judge or jury. The
+    /// command says so instead of printing a table only when nothing was
+    /// counted this month. Spend counted earlier this month stays, with the
+    /// limit it was counted under, until the month ends, even after cost
+    /// tracking is turned off or removed, and a changed limit shows only
+    /// after the next counted call. Reading it needs the `metrics.view`
     /// permission. --output json prints Agent Stream's answer.
     #[command(after_long_help = BUDGET_EXAMPLES)]
     Budget {
@@ -806,7 +818,8 @@ struct Edit<'a> {
 /// print, if any. A dry run returns [`preview_update`] and sends nothing. A
 /// change that leaves the surface as it is sends nothing either. Otherwise
 /// the surface is read again, the save stops if its `updated_at` moved, and
-/// the whole surface is sent; table output then lists the changes, and
+/// the whole surface is sent; a send Agent Stream gives no answer to fails
+/// with [`unanswered_save`]. Table output then lists the changes, and
 /// --output json reads the saved surface back.
 async fn save(
     client: &GatewayClient,
@@ -835,7 +848,8 @@ async fn save(
     }
     client
         .request(Method::PUT, path, Some(after))
-        .await?;
+        .await
+        .map_err(|error| unanswered_save(error, id))?;
     match output {
         Output::Table => {
             let mut lines = vec!["Changes:".to_owned()];
@@ -853,6 +867,27 @@ async fn save(
             pretty_json_for_terminal(&saved).map(Some)
         }
     }
+}
+
+/// `error` from the save of surface `id`, with advice added when Agent Stream
+/// gave no answer: no HTTP answer at all, such as a timeout or a dropped
+/// connection, or a 502 or 504, which only a proxy in front of Agent Stream
+/// sends on its surface routes. The save may then have been applied anyway,
+/// and running the command again would fail on the change it already made.
+/// Any other answer, such as a refusal, is returned as it is.
+fn unanswered_save(
+    error: anyhow::Error,
+    id: &str,
+) -> anyhow::Error {
+    let answered = response_status(&error)
+        .is_some_and(|status| status != StatusCode::BAD_GATEWAY && status != StatusCode::GATEWAY_TIMEOUT);
+    if answered {
+        return error;
+    }
+    error.context(format!(
+        "Agent Stream gave no answer, so surface '{id}' may have been saved anyway; check it with `fabric \
+         agent-stream surfaces get {id}` or `fabric agent-stream surfaces features {id}` before running this again"
+    ))
 }
 
 /// Reads the surface at `path` as Agent Stream has it now, refusing one that
