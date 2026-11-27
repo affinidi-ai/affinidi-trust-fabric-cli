@@ -35,6 +35,7 @@ Every command also documents its options in its help text: `fabric agent-gateway
 | [Governance and drift](agent-stream/GOVERNANCE_AND_DRIFT.md) | `governance` and `drift`: governance records, chain checks, drift verdicts, baselines, and replay runs |
 | [Prompt templates](agent-stream/PROMPTS.md) | `prompts`: create, version, preview, and roll back prompt templates |
 | [Members and teams](agent-stream/TEAMS.md) | `members` and `teams`: register callers by identifier, group them into teams, and add or remove members |
+| [LLM providers](agent-stream/PROVIDERS.md) | `providers`: the Model catalog's built-in and custom providers, their models, and prices |
 
 ## Development
 

@@ -220,6 +220,34 @@ pub static AGENT_STREAM_PROMPTS: Layout = Layout {
     ],
 };
 
+/// The providers of an Agent Stream's Model catalog, as `fabric agent-stream
+/// providers list` shows them.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_PROVIDERS: Layout = Layout {
+    empty: "No providers yet.",
+    columns: &[
+        id(&["enum_value"]),
+        whole("NAME", &["name"]),
+        col("SOURCE", &["source"]),
+        col("ENABLED", &["enabled"]),
+        col("MODELS", &["model_count"]),
+    ],
+};
+
+/// The models of one provider, as `fabric agent-stream providers models`
+/// shows them. Prices are USD per 1,000 tokens.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_MODELS: Layout = Layout {
+    empty: "No models yet.",
+    columns: &[
+        whole("MODEL", &["value"]),
+        whole("NAME", &["name"]),
+        col("ENABLED", &["enabled"]),
+        col("INPUT", &["cost_per_1k_input"]),
+        col("OUTPUT", &["cost_per_1k_output"]),
+    ],
+};
+
 pub static POLICIES: Layout = Layout {
     empty: "No policies yet.",
     columns: &[

@@ -1690,3 +1690,112 @@ fn members_delete_shows_agent_stream_refusal_and_exits_non_zero() {
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
     assert_eq!(request_lines(&requests), [PROBE_REQUEST, "DELETE /api/v1/members/m-ada HTTP/1.1"]);
 }
+
+/// One answer that serves both catalog reads: built-in providers under
+/// `providers`, and the custom catalog's text under `raw`.
+#[cfg(feature = "agent-stream")]
+const CATALOG: &str = r#"{"providers":[{"enum_value":"openai","name":"OpenAI","enabled":true,
+  "models":[{"name":"GPT-4o mini","value":"gpt-4o-mini","cost_per_1k_input":0.00015,"cost_per_1k_output":0.0006},
+            {"name":"GPT-4o","value":"gpt-4o","enabled":false}]}],
+  "raw":"{\"providers\":[{\"enum_value\":\"acme\",\"name\":\"Acme\"}]}"}"#;
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_list_prints_built_in_and_custom_providers_with_their_source() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, CATALOG);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "providers", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let row = |id: &str| {
+        text.lines()
+            .find(|line| line.starts_with(id))
+            .unwrap_or_else(|| panic!("{text}"))
+            .to_owned()
+    };
+    assert!(row("openai").contains("built-in"), "{text}");
+    assert!(row("acme").contains("custom"), "{text}");
+    assert_eq!(
+        request_lines(&requests),
+        [PROBE_REQUEST, "GET /api/v1/llm-providers HTTP/1.1", "GET /api/v1/llm-providers/custom HTTP/1.1"]
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_models_prints_each_model_with_its_prices_and_whether_it_is_enabled() {
+    let (host, _) = host_answering(AGENT_STREAM_PERMISSIONS, CATALOG);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "providers", "models", "openai"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let mini = text
+        .lines()
+        .find(|line| line.starts_with("gpt-4o-mini"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(mini.contains("yes") && mini.contains("0.00015") && mini.contains("0.0006"), "{mini}");
+    let full = text
+        .lines()
+        .find(|line| line.starts_with("gpt-4o "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(full.contains("no"), "{full}");
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_delete_of_a_custom_provider_prints_deleted_and_its_id_as_json() {
+    let (host, requests) = host_answering(AGENT_STREAM_PERMISSIONS, CATALOG);
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "-o", "json", "providers", "delete", "acme"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let answer: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("JSON answer");
+    assert_eq!(answer, serde_json::json!({"deleted": "acme"}));
+    assert_eq!(
+        request_lines(&requests)
+            .last()
+            .map(String::as_str),
+        Some("PUT /api/v1/llm-providers/custom HTTP/1.1")
+    );
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn providers_list_refused_by_agent_stream_prints_its_reason_and_exits_non_zero() {
+    let probe = PROBE_REQUEST.trim_end_matches(" HTTP/1.1");
+    let (host, requests) = host_replying(
+        vec![(probe, "200 OK", AGENT_STREAM_PERMISSIONS)],
+        ("403 Forbidden", "missing permission llm_catalog.edit"),
+    );
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "providers", "list"],
+        &[],
+        &[("FABRIC_HOST", &host), ("FABRIC_TOKEN", ACCESS_TOKEN), UNREACHABLE_DBUS],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("missing permission llm_catalog.edit"), "{text}");
+    assert!(!text.contains(ACCESS_TOKEN), "{text}");
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert_eq!(request_lines(&requests), [PROBE_REQUEST, "GET /api/v1/llm-providers HTTP/1.1"]);
+}
