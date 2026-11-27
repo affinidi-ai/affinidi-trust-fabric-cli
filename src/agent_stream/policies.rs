@@ -60,17 +60,21 @@ pub enum PolicyCommand {
     },
     /// Delete a policy definition.
     ///
-    /// The definition is deleted as soon as the command runs. There is no
-    /// confirmation prompt, and Agent Stream does not check whether anything
-    /// still uses it. A Surface that enforces the policy then refuses its
-    /// requests, because Agent Stream denies a request when a policy the
-    /// Surface enforces is gone. When the policy is enforced appliance-wide,
-    /// Agent Stream then refuses every request of that policy type, on every
-    /// Surface. To see what uses it, run `fabric agent-stream policies impact
-    /// <policy-id>` first.
+    /// The command asks for confirmation first unless you pass --yes, and
+    /// Agent Stream does not check whether anything still uses the policy. A
+    /// Surface that enforces the policy then refuses its requests, because
+    /// Agent Stream denies a request when a policy the Surface enforces is
+    /// gone. When the policy is enforced appliance-wide, Agent Stream then
+    /// refuses every request of that policy type, on every Surface. To see
+    /// what uses it, run `fabric agent-stream policies impact <policy-id>`
+    /// first.
+    #[command(after_long_help = DELETE_EXAMPLES)]
     Delete {
         /// Policy definition ID.
         policy_id: String,
+        /// Skip the confirmation prompt. Required when running non-interactively.
+        #[arg(short, long)]
+        yes: bool,
     },
     /// List the saved versions of a policy definition.
     ///
@@ -115,6 +119,34 @@ const CREATE_EXAMPLES: &str = r#"Examples:
   See what uses it before changing or deleting it:
     fabric agent-stream policies impact block-pii"#;
 
+/// Examples shown at the bottom of `policies delete --help`.
+const DELETE_EXAMPLES: &str = r#"Examples:
+  See what uses the policy, then delete it after the prompt:
+    fabric agent-stream policies impact block-pii
+    fabric agent-stream policies delete block-pii
+
+  Delete it from a script, with no prompt:
+    fabric agent-stream policies delete block-pii --yes"#;
+
+impl PolicyCommand {
+    /// Whether this is a delete that asks for confirmation first, because
+    /// --yes was not given.
+    pub(crate) fn asks_before_deleting(&self) -> bool {
+        matches!(self, Self::Delete { yes: false, .. })
+    }
+}
+
+impl commands::SharedCommand {
+    /// The shared form of an Agent Stream policy command, which remembers
+    /// whether a delete asks for confirmation first.
+    pub(crate) fn policies(command: PolicyCommand) -> Self {
+        Self::Policies {
+            ask_first: command.asks_before_deleting(),
+            command: command.into(),
+        }
+    }
+}
+
 impl From<PolicyType> for commands::PolicyType {
     fn from(policy_type: PolicyType) -> Self {
         match policy_type {
@@ -144,7 +176,7 @@ impl From<PolicyCommand> for commands::PolicyCommand {
                 policy_file,
             },
             PolicyCommand::Update { policy_id, file } => Self::Update { policy_id, file },
-            PolicyCommand::Delete { policy_id } => Self::Delete { policy_id },
+            PolicyCommand::Delete { policy_id, .. } => Self::Delete { policy_id },
             PolicyCommand::Versions { policy_id } => Self::Versions { policy_id },
             PolicyCommand::Impact { policy_id } => Self::Impact { policy_id },
         }
@@ -195,6 +227,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_a_delete_without_yes_asks_first_and_agent_gateway_has_no_yes() {
+        let delete = |yes| PolicyCommand::Delete {
+            policy_id: "p-1".to_owned(),
+            yes,
+        };
+
+        assert!(delete(false).asks_before_deleting());
+        assert!(!delete(true).asks_before_deleting());
+        assert!(!PolicyCommand::Get { policy_id: "p-1".to_owned() }.asks_before_deleting());
+        assert!(parses(&["delete", "p-1", "--yes"]));
+        assert!(
+            Cli::try_parse_from(["fabric", "agent-gateway", "policies", "delete", "p-1", "--yes"]).is_err(),
+            "Agent Gateway's policies delete keeps its flags"
+        );
+    }
+
     #[tokio::test]
     async fn create_sends_the_agent_stream_policy_type_and_the_rego_source() {
         let rego = tempfile::NamedTempFile::new().expect("temp file");
@@ -205,16 +254,13 @@ mod tests {
 
         run_shared(
             &client(host),
-            SharedCommand::Policies(
-                PolicyCommand::Create {
-                    id: "p-1".to_owned(),
-                    name: "Block PII".to_owned(),
-                    description: String::new(),
-                    policy_type: PolicyType::Llm,
-                    policy_file: rego.path().to_path_buf(),
-                }
-                .into(),
-            ),
+            SharedCommand::policies(PolicyCommand::Create {
+                id: "p-1".to_owned(),
+                name: "Block PII".to_owned(),
+                description: String::new(),
+                policy_type: PolicyType::Llm,
+                policy_file: rego.path().to_path_buf(),
+            }),
             Output::Json,
         )
         .await
@@ -258,9 +304,9 @@ mod tests {
             },
             PolicyCommand::Versions { policy_id: id() },
             PolicyCommand::Impact { policy_id: id() },
-            PolicyCommand::Delete { policy_id: id() },
+            PolicyCommand::Delete { policy_id: id(), yes: true },
         ] {
-            run_shared(&client, SharedCommand::Policies(command.into()), Output::Json)
+            run_shared(&client, SharedCommand::policies(command), Output::Json)
                 .await
                 .expect("the command succeeds");
         }

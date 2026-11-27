@@ -498,7 +498,7 @@ fn policies_create_and_delete_print_the_agent_gateway_lines() {
         ],
         "",
     );
-    let delete = fabric_on_stream(&host, &["policies", "delete", "block-pii"], "");
+    let delete = fabric_on_stream(&host, &["policies", "delete", "block-pii", "--yes"], "");
 
     assert_eq!(stdout(&create), "Created policy 'block-pii'\n", "{}", stderr(&create));
     assert_eq!(stdout(&delete), "Deleted policy 'block-pii'\n", "{}", stderr(&delete));
@@ -588,6 +588,27 @@ fn api_keys_revoke_rotate_and_delete_with_a_typed_host_and_no_terminal_send_noth
         );
         assert!(request_lines(&requests).is_empty(), "{verb}: {:?}", request_lines(&requests));
     }
+}
+
+#[cfg(feature = "agent-stream")]
+#[test]
+fn policies_delete_without_yes_and_with_a_typed_host_and_no_terminal_sends_nothing() {
+    let (host, requests) = agent_stream_host();
+
+    let output = fabric_in_fresh_home(
+        &["agent-stream", "--host", &host, "policies", "delete", "block-pii"],
+        &[],
+        &[("FABRIC_TOKEN", SESSION_TOKEN)],
+        "",
+    );
+
+    let text = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("refusing to delete 'block-pii' without confirmation in a non-interactive session"),
+        "{text}"
+    );
+    assert!(request_lines(&requests).is_empty(), "{:?}", request_lines(&requests));
 }
 
 #[cfg(feature = "agent-stream")]

@@ -2202,11 +2202,20 @@ async fn dispatch_with(
 /// tables and confirmation lines as on Agent Gateway.
 #[cfg(feature = "agent-stream")]
 pub(crate) enum SharedCommand {
-    Secrets { command: SecretCommand, reveal: bool },
+    Secrets {
+        command: SecretCommand,
+        reveal: bool,
+    },
     Users(UserCommand),
     Identities(IdentityCommand),
     ApiKeys(ApiKeyCommand),
-    Policies(PolicyCommand),
+    /// `ask_first` is set for a delete that must be confirmed at a prompt
+    /// first. Agent Stream's `policies delete` asks unless --yes is given;
+    /// Agent Gateway's `policies delete` never asks and never comes here.
+    Policies {
+        command: PolicyCommand,
+        ask_first: bool,
+    },
     Settings(SettingsCommand),
     Audit(AuditCommand),
     Metrics(MetricsCommand),
@@ -2221,7 +2230,7 @@ impl From<SharedCommand> for Command {
             SharedCommand::Users(command) => Self::Users { command },
             SharedCommand::Identities(command) => Self::Identities { command },
             SharedCommand::ApiKeys(command) => Self::ApiKeys { command },
-            SharedCommand::Policies(command) => Self::Policies { command },
+            SharedCommand::Policies { command, .. } => Self::Policies { command },
             SharedCommand::Settings(command) => Self::Settings { command },
             SharedCommand::Audit(command) => Self::Audit { command },
             SharedCommand::Metrics(command) => Self::Metrics { command },
@@ -2231,14 +2240,49 @@ impl From<SharedCommand> for Command {
 }
 
 /// Runs one shared command on the appliance behind `client` and prints its
-/// answer as the Agent Gateway command of the same name does.
+/// answer as the Agent Gateway command of the same name does. A `policies
+/// delete` with `ask_first` set first asks at a prompt naming the policy and
+/// the host, and prints an `Aborted.` line and sends no delete when the answer
+/// is not yes.
 #[cfg(feature = "agent-stream")]
 pub(crate) async fn run_shared(
     client: &GatewayClient,
     command: SharedCommand,
     output: Output,
 ) -> Result<()> {
+    if let SharedCommand::Policies {
+        command: PolicyCommand::Delete { policy_id },
+        ask_first: true,
+    } = &command
+    {
+        let path = entity_path("/v1/policy-definitions", policy_id);
+        if !confirm_action("delete", policy_id, async {
+            format!("Delete policy {}?", describe_target(client, &path, policy_id).await)
+        })
+        .await?
+        {
+            println!("Aborted. Policy '{}' was not deleted.", sanitize_whole(policy_id));
+            return Ok(());
+        }
+    }
     run_and_print(client, command.into(), output).await
+}
+
+#[cfg(feature = "agent-stream")]
+impl SharedCommand {
+    /// Fails, as [`refuse_without_terminal`] does, for an Agent Stream
+    /// `policies delete` that would ask for a confirmation nobody can give.
+    /// Called before the host is asked which product it is, so a refused
+    /// delete sends nothing at all.
+    pub(crate) fn refuse_unconfirmed_policy_delete(&self) -> Result<()> {
+        match self {
+            Self::Policies {
+                command: PolicyCommand::Delete { policy_id },
+                ask_first: true,
+            } => refuse_without_terminal("delete", policy_id, false),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Runs a command that talks to the appliance behind `client` and prints the

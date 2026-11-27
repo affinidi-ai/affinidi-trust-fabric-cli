@@ -469,7 +469,7 @@ async fn run_command(
         AgentStreamCommand::Users { command } => SharedCommand::Users(command.into()),
         AgentStreamCommand::Identities { command } => SharedCommand::Identities(command.into()),
         AgentStreamCommand::ApiKeys { command } => SharedCommand::ApiKeys(command.into()),
-        AgentStreamCommand::Policies { command } => SharedCommand::Policies(command.into()),
+        AgentStreamCommand::Policies { command } => SharedCommand::policies(command),
         AgentStreamCommand::Settings { command } => SharedCommand::Settings(command.into()),
         AgentStreamCommand::Audit { command } => SharedCommand::Audit(command.into()),
         AgentStreamCommand::Metrics { command } => SharedCommand::Metrics(command.into()),
@@ -484,8 +484,9 @@ async fn run_command(
 /// product it is, so a refused command sends nothing at all: an API key
 /// revoke, rotate, or delete that would ask for a confirmation nobody can
 /// give, a `settings reset` without --force, a `users update` or `users
-/// delete` naming the reserved `integrations` route, and a `metrics truncate`
-/// or `logs truncate` without --yes. Only refusals that need neither the host
+/// delete` naming the reserved `integrations` route, a `metrics truncate` or
+/// `logs truncate` without --yes, and a `policies delete` that would ask for a
+/// confirmation nobody can give. Only refusals that need neither the host
 /// nor a file belong here; the ones that do are checked as the command runs.
 fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
     match command {
@@ -494,10 +495,8 @@ fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
         SharedCommand::Users(command) => command.refuse_reserved_route(Product::AgentStream),
         SharedCommand::Metrics(command) => command.refuse_unconfirmed_truncate(),
         SharedCommand::Logs(command) => command.refuse_unconfirmed_truncate(),
-        SharedCommand::Secrets { .. }
-        | SharedCommand::Identities(_)
-        | SharedCommand::Policies(_)
-        | SharedCommand::Audit(_) => Ok(()),
+        SharedCommand::Policies { .. } => command.refuse_unconfirmed_policy_delete(),
+        SharedCommand::Secrets { .. } | SharedCommand::Identities(_) | SharedCommand::Audit(_) => Ok(()),
     }
 }
 
