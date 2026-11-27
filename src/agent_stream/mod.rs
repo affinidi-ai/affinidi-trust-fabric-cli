@@ -47,7 +47,7 @@ use crate::{
     commands::{
         AccessTokenCommand, ApiArgs, CommandTarget, DEFAULT_CONNECTION, HostFlags, Output, SharedCommand, ShellGlobals,
         ShellText, add_terms_hint, command_target, given_host_and_token, new_hash_name_warnings, print_value,
-        run_access_tokens, run_api, run_shared, shell_prefix, without_reveal_hint,
+        run_access_tokens, run_api, run_shared, shell_prefix, with_stored_value_hint, without_reveal_hint,
     },
     config::Config,
     credentials::{CredentialStore, OsCredentialStore, add_no_keyring_hint},
@@ -309,16 +309,18 @@ enum AgentStreamCommand {
     /// placeholders. `integrations config` lists the types and categories on
     /// offer, and `integrations runtime-variables` the variables of each
     /// category. Agent Stream leaves only the stored credentials at the top
-    /// level of `configuration` out of its answers. The CLI removes any
-    /// secret-looking top-level value that still appears, and replaces one
-    /// nested deeper with a placeholder, with a `note: hid` line naming each.
-    /// Put the real value back in place of each placeholder before sending
-    /// the answer to `create` or `update`, which refuse it.
+    /// level of `configuration` out of its answers, and keeps them when an
+    /// update leaves them out. The CLI removes any such credential that still
+    /// appears, and replaces any other secret-looking value, at any depth,
+    /// with a placeholder, with a `note: hid` line naming each. Put the real
+    /// value back in place of each placeholder before sending the answer to
+    /// `create` or `update`, which refuse it.
     ///
     /// Testing an integration, triggering one, and triggering several send
     /// real messages, so they have no command here. Run them on purpose with
     /// `fabric agent-stream api post /v1/integrations/test --file <json>`,
-    /// `api post /v1/integrations/<ID>/trigger --file <json>`, or `api post
+    /// `fabric agent-stream api post /v1/integrations/<ID>/trigger --file
+    /// <json>`, or `fabric agent-stream api post
     /// /v1/integrations/trigger-multiple --file <json>`.
     Integrations {
         #[command(subcommand)]
@@ -370,7 +372,8 @@ enum AgentStreamCommand {
     /// connection's token. Paths are written without `/api`, which is added,
     /// so `/v1/pipes` goes to `/api/v1/pipes`. Give a body with --data or
     /// --file, not both; `patch` needs one and sends it as a JSON Merge Patch.
-    /// A body still carrying the masked placeholder is refused.
+    /// A body still carrying the masked placeholder, or the placeholder
+    /// `integrations` puts in place of a credential, is refused.
     ///
     /// Responses print as the Agent Stream sent them. In table mode a JSON
     /// array prints as a NAME ID DESCRIPTION table, anything else as JSON.
@@ -535,7 +538,9 @@ pub async fn dispatch(args: AgentStreamArgs) -> Result<()> {
 /// gets it here once, whichever path below runs it. An error from a keyring
 /// that cannot be reached gets one hint too, as on an Agent Gateway command:
 /// the move of a `token` line adds its own, which names the connection, and
-/// the command's error gets the general one.
+/// the command's error gets the general one. A refusal of a request body that
+/// still carries the integration placeholder gets [`with_stored_value_hint`]
+/// here too, whichever command read the body.
 async fn dispatch_with(
     args: AgentStreamArgs,
     mut saved: Config,
@@ -560,7 +565,7 @@ async fn dispatch_with(
     };
     run_command(args.command, globals, &mut saved, credentials, path)
         .await
-        .map_err(|error| add_no_keyring_hint(add_terms_hint(Product::AgentStream, error)))
+        .map_err(|error| add_no_keyring_hint(add_terms_hint(Product::AgentStream, with_stored_value_hint(error))))
 }
 
 /// Runs one command. The groups Agent Stream shares with Agent Gateway all

@@ -9365,15 +9365,16 @@ const INTEGRATIONS_RUNTIME_VARIABLES_PATH: &str = "/v1/integrations/runtime-vari
 /// Stand-in printed in place of a credential the caller did not ask to see.
 pub(crate) const MASKED_VALUE: &str = "<hidden; pass --reveal to show>";
 
-/// Stand-in printed in place of a credential nested below the top level of an
-/// Agent Stream integration's `configuration`. Agent Stream keeps only a
-/// top-level stored credential that an update leaves out, so this one must be
-/// put back by hand before the document is sent again.
-const NESTED_CREDENTIAL_PLACEHOLDER: &str = "<hidden; put the real value back before sending>";
+/// Stand-in printed in place of a credential in an Agent Stream integration's
+/// `configuration` that Agent Stream would not keep if an update left it out,
+/// such as one nested below the top level, so it must be put back by hand
+/// before the document is sent again.
+const INTEGRATION_CREDENTIAL_PLACEHOLDER: &str = "<hidden; put the real value back before sending>";
 
-/// How to read the value a [`NESTED_CREDENTIAL_PLACEHOLDER`] stands for:
-/// `integrations` has no --reveal, but Agent Stream answers a nested value as
-/// it is stored, and `api` prints the answer unchanged.
+/// How to read the value an [`INTEGRATION_CREDENTIAL_PLACEHOLDER`] stands
+/// for: `integrations` has no --reveal, but Agent Stream answers a value it
+/// does not keep on update as it is stored, apart from a `headers` that is
+/// not an object, and `api` prints the answer unchanged.
 const INTEGRATION_STORED_VALUE_HINT: &str =
     "`fabric agent-stream api get /v1/integrations/<ID>` prints the stored configuration as Agent Stream returns it";
 
@@ -9778,23 +9779,67 @@ fn check_secret_update(
 
 /// Refuses a request body carrying [`MASKED_VALUE`] with a
 /// [`MaskedPlaceholderError`], and one carrying
-/// [`NESTED_CREDENTIAL_PLACEHOLDER`] with a refusal that names the path of the
-/// first one and says how to read the stored value, since removing a nested
-/// field deletes it. A document captured from `get` and replayed through
-/// `create` or `update` would otherwise store the placeholder as the
-/// credential itself, and the masked response would look exactly as it did
-/// before.
+/// [`INTEGRATION_CREDENTIAL_PLACEHOLDER`] with an
+/// [`IntegrationPlaceholderError`] naming the path of the first one, since
+/// removing that field deletes it. A document captured from `get` and
+/// replayed through `create` or `update` would otherwise store the
+/// placeholder as the credential itself, and the masked response would look
+/// exactly as it did before.
 fn reject_masked_values(value: &Value) -> Result<()> {
     if placeholder_path(value, MASKED_VALUE).is_some() {
         return Err(MaskedPlaceholderError.into());
     }
-    if let Some(path) = placeholder_path(value, NESTED_CREDENTIAL_PLACEHOLDER) {
-        let path = sanitize_for_terminal(&path);
-        bail!(
-            "the request body still carries the placeholder {NESTED_CREDENTIAL_PLACEHOLDER} at '{path}'; put the real value back in its place, because removing a nested field deletes it from the integration. {INTEGRATION_STORED_VALUE_HINT}. Nothing was sent"
-        );
+    if let Some(path) = placeholder_path(value, INTEGRATION_CREDENTIAL_PLACEHOLDER) {
+        return Err(IntegrationPlaceholderError {
+            path: sanitize_for_terminal(&path),
+            names_stored_value: false,
+        }
+        .into());
     }
     Ok(())
+}
+
+/// A request body still carries [`INTEGRATION_CREDENTIAL_PLACEHOLDER`] at
+/// `path`. The refusal names no product, since every request body is checked
+/// on both; [`with_stored_value_hint`] adds how to read the stored value on
+/// Agent Stream, the only product that prints the placeholder.
+#[derive(Debug)]
+struct IntegrationPlaceholderError {
+    path: String,
+    names_stored_value: bool,
+}
+
+impl std::fmt::Display for IntegrationPlaceholderError {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the request body still carries the placeholder {INTEGRATION_CREDENTIAL_PLACEHOLDER} at '{}'; put the real value back in its place, because removing the field deletes it from the integration.",
+            self.path
+        )?;
+        if self.names_stored_value {
+            write!(formatter, " {INTEGRATION_STORED_VALUE_HINT}.")?;
+        }
+        write!(formatter, " Nothing was sent")
+    }
+}
+
+impl std::error::Error for IntegrationPlaceholderError {}
+
+/// Adds to an [`IntegrationPlaceholderError`] how Agent Stream's `api` reads
+/// the stored value. Any other error is returned as it is.
+#[cfg(feature = "agent-stream")]
+pub(crate) fn with_stored_value_hint(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<IntegrationPlaceholderError>() {
+        Some(refusal) if !refusal.names_stored_value => IntegrationPlaceholderError {
+            path: refusal.path.clone(),
+            names_stored_value: true,
+        }
+        .into(),
+        _ => error,
+    }
 }
 
 /// A request body still carries [`MASKED_VALUE`]. It reads as the refusal of
@@ -10152,9 +10197,9 @@ fn hidden_fields_note(fields: &[&str]) -> Option<String> {
 /// hides any secret-looking `configuration` value that appears anyway,
 /// through [`hide_integration_credentials`], with a note on standard error
 /// naming each one. When the answer's configuration is printed, which `get`
-/// and any `--output json` do, a nested one gets a second note, since it must
-/// be put back by hand before the answer is sent again. Agent Gateway's
-/// answers are printed as they come.
+/// and any `--output json` do, a value replaced with the placeholder gets a
+/// second note, since it must be put back by hand before the answer is sent
+/// again. Agent Gateway's answers are printed as they come.
 async fn run_integrations(
     client: &GatewayClient,
     command: CrudCommand,
@@ -10178,7 +10223,8 @@ async fn run_integrations(
 /// Configuration keys that hold a credential without naming one: a webhook
 /// URL is a bearer secret and a Redis URL can carry a password. These, the
 /// endings below, and the header parts follow the keys Agent Stream leaves
-/// out of its own integration answers.
+/// out of its own integration answers and keeps when an update leaves them
+/// out.
 const INTEGRATION_CREDENTIAL_KEYS: &[&str] = &["redis_url", "url", "webhook_url"];
 
 /// Key endings that name a credential, such as `smtp_password`,
@@ -10186,10 +10232,26 @@ const INTEGRATION_CREDENTIAL_KEYS: &[&str] = &["redis_url", "url", "webhook_url"
 const INTEGRATION_CREDENTIAL_KEY_ENDINGS: &[&str] =
     &["password", "secret", "secret_key", "api_key", "apikey", "token", "private_key", "access_key", "credentials"];
 
+/// Key endings that look like a credential although Agent Stream neither
+/// leaves them out of its answers nor keeps them, such as `private_key_pem`,
+/// `ssh_passphrase`, `client_credential`, `authorization`, or `smtp_passwd`.
+const SECRET_LOOKING_KEY_ENDINGS: &[&str] = &["key_pem", "passphrase", "credential", "authorization", "passwd", "pwd"];
+
+/// Words that look like a credential only as the whole key or its last
+/// `_`- or `-`-separated part, such as `pass` in `smtp_pass`, so that a key
+/// like `bypass` is not one.
+const SECRET_LOOKING_KEY_WORDS: &[&str] = &["pass"];
+
 /// Parts of a header name that mark a credential, such as `Authorization` or
 /// `X-Api-Key`.
 const INTEGRATION_CREDENTIAL_HEADER_PARTS: &[&str] =
     &["auth", "cookie", "cred", "key", "pass", "secret", "session", "token"];
+
+/// The `configuration` key holding the headers a webhook sends. Agent Stream
+/// leaves the credential entries of a top-level `headers` object out of its
+/// answers in any letter case of the key, but keeps them on update only
+/// under this exact key.
+const HEADERS: &str = "headers";
 
 /// The `configuration` key Agent Stream records the pinned destination of an
 /// integration's secret references under. It sets and strips only this exact
@@ -10210,13 +10272,12 @@ const SECRET_REFERENCE_ENDING: &str = "_secret_id";
 /// integrations held it.
 #[derive(Debug, Default, PartialEq)]
 struct HiddenIntegrationCredentials {
-    /// Top-level credentials, and entries of the top-level `headers`, which
-    /// were removed: Agent Stream keeps a stored one that an update leaves
-    /// out.
+    /// Credentials Agent Stream keeps when an update leaves them out, which
+    /// were removed.
     removed: Vec<String>,
-    /// Credentials below the top level, which were replaced with
-    /// [`NESTED_CREDENTIAL_PLACEHOLDER`]: Agent Stream deletes a nested value
-    /// that an update leaves out.
+    /// Every other credential, which was replaced with
+    /// [`INTEGRATION_CREDENTIAL_PLACEHOLDER`]: Agent Stream deletes it when an
+    /// update leaves it out.
     masked: Vec<String>,
     /// Where each masked credential sits, as the put-back note names it: its
     /// quoted path, followed in a list by `of` and its integration's ID.
@@ -10233,27 +10294,39 @@ fn push_once(
     }
 }
 
+/// What [`hide_integration_credentials`] does with a credential.
+#[derive(Clone, Copy)]
+enum Hiding {
+    /// Removes it, because Agent Stream keeps the stored one when an update
+    /// leaves it out.
+    Remove,
+    /// Replaces it with [`INTEGRATION_CREDENTIAL_PLACEHOLDER`], because Agent
+    /// Stream would delete it if an update left it out, and the placeholder
+    /// is refused before anything is sent.
+    Mask,
+}
+
 impl HiddenIntegrationCredentials {
-    /// Hides the credential `value` at `field`. Returns `false` for a
-    /// top-level one, which the caller removes, and replaces a nested one
-    /// with [`NESTED_CREDENTIAL_PLACEHOLDER`] and returns `true`.
+    /// Hides the credential `value` at `field` the way `hiding` says, and
+    /// returns whether its entry stays in place.
     fn hide(
         &mut self,
         value: &mut Value,
         field: &str,
-        top_level: bool,
+        hiding: Hiding,
     ) -> bool {
         let field = sanitize_for_terminal(field);
-        let named = if top_level {
-            &mut self.removed
-        } else {
-            &mut self.masked
-        };
-        push_once(named, field);
-        if !top_level {
-            *value = json!(NESTED_CREDENTIAL_PLACEHOLDER);
+        match hiding {
+            Hiding::Remove => {
+                push_once(&mut self.removed, field);
+                false
+            }
+            Hiding::Mask => {
+                push_once(&mut self.masked, field);
+                *value = json!(INTEGRATION_CREDENTIAL_PLACEHOLDER);
+                true
+            }
         }
-        !top_level
     }
 
     /// Adds what was `found` in one integration's `configuration`, naming
@@ -10286,39 +10359,47 @@ impl HiddenIntegrationCredentials {
             .collect()
     }
 
-    /// The note asking for each masked nested value back before the answer
-    /// is sent to `create` or `update`, and saying how to read it, or nothing
-    /// when none was masked.
+    /// The note asking for each masked value back before the answer is sent
+    /// to `create` or `update`, and saying how to read it, or nothing when
+    /// none was masked.
     fn put_back_note(&self) -> Option<String> {
         if self.put_back.is_empty() {
             return None;
         }
         Some(format!(
             "note: put the real value back in {} before sending this to create or update, which refuse the \
-             placeholder; removing a nested field deletes it from the integration. {INTEGRATION_STORED_VALUE_HINT}.",
+             placeholder; removing such a field deletes it from the integration. {INTEGRATION_STORED_VALUE_HINT}.",
             self.put_back.join(", ")
         ))
     }
 }
 
 /// Hides, in the `configuration` of one integration or of each in a list,
-/// every value that looks like a credential. A top-level one, or a
-/// credential-named entry of the top-level `headers`, is removed, because
-/// Agent Stream keeps the stored one when an update leaves it out. Any other
-/// credential, inside objects, arrays, or header values at any depth, is
-/// replaced with [`NESTED_CREDENTIAL_PLACEHOLDER`], because Agent Stream
-/// would delete it if an update left it out, and the placeholder is refused
-/// before anything is sent; a credential-named entry of a nested `headers`
-/// counts too. Key and header names match in any letter case, as Agent
-/// Stream matches them, except the three it reads only as written: a string
-/// under a key ending in `_secret_id` and the top-level `headers_secret_id`
-/// map name secrets rather than holding them, and the top-level
-/// `pinned_destination` holds only the host and port Agent Stream pinned, so
-/// all three are kept. Any other spelling of them, and a nested
-/// `pinned_destination`, are searched like any other value. An empty value,
-/// and one made only of `${VARIABLE}` placeholders, holds no secret and is
-/// kept. In a list, the put-back note names each masked one with the ID of
-/// its integration.
+/// every value that looks like a credential, and leaves the rest as it is.
+///
+/// Only what Agent Stream itself leaves out of its answers and keeps when an
+/// update leaves it out is removed: a top-level key that names a credential
+/// in Agent Stream's terms ([`INTEGRATION_CREDENTIAL_KEYS`] and
+/// [`INTEGRATION_CREDENTIAL_KEY_ENDINGS`]), whatever its value, and a
+/// credential-named entry of the top-level `headers` object, spelled exactly
+/// so. Every other credential is replaced with
+/// [`INTEGRATION_CREDENTIAL_PLACEHOLDER`], at any depth and inside arrays:
+/// a key Agent Stream names a credential below the top level, a key that
+/// only looks like one ([`SECRET_LOOKING_KEY_ENDINGS`] and
+/// [`SECRET_LOOKING_KEY_WORDS`]) at any depth, a credential-named entry of
+/// any other `headers` object, a `headers` that is not an object, and any
+/// string that is a URL carrying user info, such as
+/// `amqp://user:pass@broker`, whatever its key.
+///
+/// Key and header names match in any letter case, as Agent Stream matches
+/// them, except the three it reads only as written: a string under a key
+/// ending in `_secret_id` and the top-level `headers_secret_id` map name
+/// secrets rather than holding them, and the top-level `pinned_destination`
+/// holds only the host and port Agent Stream pinned, so all three are kept.
+/// Any other spelling of them, and a nested `pinned_destination`, are
+/// searched like any other value. An empty value, and one made only of
+/// `${VARIABLE}` placeholders, holds no secret and is kept. In a list, the
+/// put-back note names each masked one with the ID of its integration.
 fn hide_integration_credentials(value: &mut Value) -> HiddenIntegrationCredentials {
     let mut hidden = HiddenIntegrationCredentials::default();
     let listed = value.is_array();
@@ -10357,29 +10438,26 @@ fn hide_credentials_in(
             return true;
         }
         let field = format!("{path}.{key}");
-        if key.eq_ignore_ascii_case("headers") {
+        if key.eq_ignore_ascii_case(HEADERS) {
             let Some(headers) = child.as_object_mut() else {
-                return !holds_integration_secret(child) || hidden.hide(child, &field, top_level);
+                return !holds_integration_secret(child) || hidden.hide(child, &field, Hiding::Mask);
             };
-            let mut nested_headers = Vec::new();
-            headers.retain(|name, header| {
-                if is_integration_credential_header(name) && holds_integration_secret(header) {
-                    return hidden.hide(header, &format!("{field}.{name}"), top_level);
-                }
-                if header.is_object() || header.is_array() {
-                    nested_headers.push(name.clone());
-                }
-                true
-            });
-            for name in nested_headers {
-                if let Some(header) = headers.get_mut(&name) {
-                    hide_credentials_below(header, &format!("{field}.{name}"), hidden);
-                }
-            }
+            let entry_hiding = if top_level && key == HEADERS {
+                Hiding::Remove
+            } else {
+                Hiding::Mask
+            };
+            hide_headers(headers, &field, entry_hiding, hidden);
             return true;
         }
-        if is_integration_credential_key(&key.to_ascii_lowercase()) && holds_integration_secret(child) {
-            return hidden.hide(child, &field, top_level);
+        if holds_integration_secret(child) {
+            let key = key.to_ascii_lowercase();
+            if top_level && is_integration_credential_key(&key) {
+                return hidden.hide(child, &field, Hiding::Remove);
+            }
+            if is_integration_credential_key(&key) || looks_like_a_credential_key(&key) || is_secret_url(child) {
+                return hidden.hide(child, &field, Hiding::Mask);
+            }
         }
         nested.push(key.clone());
         true
@@ -10387,6 +10465,36 @@ fn hide_credentials_in(
     for key in nested {
         if let Some(child) = entries.get_mut(&key) {
             hide_credentials_below(child, &format!("{path}.{key}"), hidden);
+        }
+    }
+}
+
+/// Hides the entries of the `headers` object at `field`: a credential-named
+/// one the way `credential_hiding` says, a URL carrying user info with the
+/// placeholder, and the credentials inside an object or array value.
+fn hide_headers(
+    headers: &mut serde_json::Map<String, Value>,
+    field: &str,
+    credential_hiding: Hiding,
+    hidden: &mut HiddenIntegrationCredentials,
+) {
+    let mut nested = Vec::new();
+    headers.retain(|name, header| {
+        let entry = format!("{field}.{name}");
+        if is_integration_credential_header(name) && holds_integration_secret(header) {
+            return hidden.hide(header, &entry, credential_hiding);
+        }
+        if is_secret_url(header) {
+            return hidden.hide(header, &entry, Hiding::Mask);
+        }
+        if header.is_object() || header.is_array() {
+            nested.push(name.clone());
+        }
+        true
+    });
+    for name in nested {
+        if let Some(header) = headers.get_mut(&name) {
+            hide_credentials_below(header, &format!("{field}.{name}"), hidden);
         }
     }
 }
@@ -10411,8 +10519,9 @@ fn is_secret_reference(
     key.ends_with(SECRET_REFERENCE_ENDING) && value.is_string()
 }
 
-/// Hides the credentials in the objects `value` holds below the top level of
-/// `configuration`, inside arrays too, at any depth.
+/// Hides the credentials in `value`, below the top level of
+/// `configuration`: in the objects it holds, and in each string of an array
+/// that is a URL carrying user info, at any depth.
 fn hide_credentials_below(
     value: &mut Value,
     path: &str,
@@ -10422,19 +10531,38 @@ fn hide_credentials_below(
         Value::Object(object) => hide_credentials_in(object, path, false, hidden),
         Value::Array(items) => {
             for item in items {
-                hide_credentials_below(item, path, hidden);
+                if is_secret_url(item) {
+                    hidden.hide(item, path, Hiding::Mask);
+                } else {
+                    hide_credentials_below(item, path, hidden);
+                }
             }
         }
         _ => {}
     }
 }
 
-/// `key` is lower-cased already.
+/// Whether `key`, lower-cased already, names a credential the way Agent
+/// Stream does.
 fn is_integration_credential_key(key: &str) -> bool {
     INTEGRATION_CREDENTIAL_KEYS.contains(&key)
         || INTEGRATION_CREDENTIAL_KEY_ENDINGS
             .iter()
             .any(|ending| key.ends_with(ending))
+}
+
+/// Whether `key`, lower-cased already, looks like a credential although Agent
+/// Stream does not treat it as one.
+fn looks_like_a_credential_key(key: &str) -> bool {
+    SECRET_LOOKING_KEY_ENDINGS
+        .iter()
+        .any(|ending| key.ends_with(ending))
+        || SECRET_LOOKING_KEY_WORDS
+            .iter()
+            .any(|word| {
+                key.strip_suffix(word)
+                    .is_some_and(|rest| rest.is_empty() || rest.ends_with(['_', '-']))
+            })
 }
 
 fn is_integration_credential_header(name: &str) -> bool {
@@ -10453,6 +10581,35 @@ fn holds_integration_secret(value: &Value) -> bool {
         Value::String(text) => !text.is_empty() && !is_template_only(text),
         _ => true,
     }
+}
+
+/// Whether `value` is a string URL whose authority carries user info, such
+/// as `amqp://user:pass@broker:5672` or `https://token@host`, unless each
+/// `:`-separated part of that user info is empty or made only of
+/// `${VARIABLE}` placeholders.
+fn is_secret_url(value: &Value) -> bool {
+    let Some((scheme, rest)) = value
+        .as_str()
+        .and_then(|text| text.trim().split_once("://"))
+    else {
+        return false;
+    };
+    let is_scheme = scheme.starts_with(|character: char| character.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.'));
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    is_scheme
+        && authority
+            .rsplit_once('@')
+            .is_some_and(|(user_info, _)| {
+                user_info
+                    .split(':')
+                    .any(|part| !part.is_empty() && !is_template_only(part))
+            })
 }
 
 /// Whether `text` holds at least one `${NAME}` placeholder, with `NAME` made
@@ -10490,7 +10647,7 @@ mod integrations_tests {
     use super::*;
 
     /// The placeholder as it reads in a JSON document.
-    const NESTED: &str = NESTED_CREDENTIAL_PLACEHOLDER;
+    const PUT_BACK: &str = INTEGRATION_CREDENTIAL_PLACEHOLDER;
 
     #[test]
     fn top_level_credentials_are_removed_and_nested_ones_masked_each_named_once() {
@@ -10527,20 +10684,20 @@ mod integrations_tests {
                 {"id": "in-1", "configuration": {
                     "smtp_host": "smtp.example.com",
                     "headers": {"Content-Type": "application/json"},
-                    "auth": {"provider": {"API_KEY": NESTED, "region": "eu"}},
-                    "brokers": [{"host": "kafka-1", "sasl_password": NESTED}],
-                    "routes": [[{"headers": {"X-Token": NESTED, "Accept": "*/*"}}]]
+                    "auth": {"provider": {"API_KEY": PUT_BACK, "region": "eu"}},
+                    "brokers": [{"host": "kafka-1", "sasl_password": PUT_BACK}],
+                    "routes": [[{"headers": {"X-Token": PUT_BACK, "Accept": "*/*"}}]]
                 }},
-                {"id": "in-2", "configuration": {"auth": {"provider": {"API_KEY": NESTED}}}},
+                {"id": "in-2", "configuration": {"auth": {"provider": {"API_KEY": PUT_BACK}}}},
                 {"id": "in-3", "configuration": {
-                    "headers": {"X-Custom": {"token": NESTED, "region": "eu"}, "X-List": [{"api_key": NESTED}]},
+                    "headers": {"X-Custom": {"token": PUT_BACK, "region": "eu"}, "X-List": [{"api_key": PUT_BACK}]},
                     "pinned_destination": {"url": "kafka-1:9092"},
                     "smtp_password_secret_id": "smtp-secret",
                     "options": {
-                        "pinned_destination": {"password": NESTED},
-                        "foo_secret_id": {"token": NESTED},
+                        "pinned_destination": {"password": PUT_BACK},
+                        "foo_secret_id": {"token": PUT_BACK},
                         "bar_secret_id": "bar-secret",
-                        "headers": {"X-Api-Key": NESTED, "Accept": "*/*", "X-Meta": {"secret": NESTED}}
+                        "headers": {"X-Api-Key": PUT_BACK, "Accept": "*/*", "X-Meta": {"secret": PUT_BACK}}
                     }
                 }}
             ])
@@ -10583,7 +10740,7 @@ mod integrations_tests {
     }
 
     #[test]
-    fn only_the_exact_reference_and_pin_keys_are_kept_while_headers_match_in_any_case() {
+    fn only_the_exact_reference_pin_and_headers_keys_are_treated_as_agent_stream_reads_them() {
         let mut value = json!({"id": "in-1", "configuration": {
             "PINNED_DESTINATION": {"password": "p-1", "url": "kafka-1:9092"},
             "Pinned_Destination": {"token": "t-1"},
@@ -10596,22 +10753,116 @@ mod integrations_tests {
         assert_eq!(
             value,
             json!({"id": "in-1", "configuration": {
-                "PINNED_DESTINATION": {"password": NESTED, "url": NESTED},
-                "Pinned_Destination": {"token": NESTED},
-                "Headers_Secret_Id": {"X-Auth-Token": NESTED},
-                "HEADERS": {"Accept": "*/*"}
+                "PINNED_DESTINATION": {"password": PUT_BACK, "url": PUT_BACK},
+                "Pinned_Destination": {"token": PUT_BACK},
+                "Headers_Secret_Id": {"X-Auth-Token": PUT_BACK},
+                "HEADERS": {"Authorization": PUT_BACK, "Accept": "*/*"}
             }})
         );
-        assert_eq!(hidden.removed, ["configuration.HEADERS.Authorization"]);
+        assert!(hidden.removed.is_empty(), "{hidden:?}");
         assert_eq!(
             hidden.put_back,
             [
+                "'configuration.HEADERS.Authorization'",
                 "'configuration.Headers_Secret_Id.X-Auth-Token'",
                 "'configuration.PINNED_DESTINATION.password'",
                 "'configuration.PINNED_DESTINATION.url'",
                 "'configuration.Pinned_Destination.token'",
             ]
         );
+    }
+
+    #[test]
+    fn a_secret_looking_value_agent_stream_would_not_keep_gets_the_placeholder_at_any_depth() {
+        let mut value = json!({"id": "in-1", "configuration": {
+            "private_key_pem": "-----BEGIN PRIVATE KEY-----",
+            "passphrase": "open-sesame",
+            "smtp_pass": "hunter2",
+            "dsn": "postgres://app:hunter2@db.example.com:5432/app",
+            "brokers": ["amqp://mq:s3cret@mq-1:5672", "amqp://mq-2:5672"],
+            "redis_url": 6379,
+            "smtp_password": "hunter3",
+            "tls": {
+                "private_key_pem": "-----BEGIN PRIVATE KEY-----",
+                "passphrase": "open-sesame",
+                "authorization": "Basic YWxhZGRpbjpvcGVu",
+                "client_credential": "c-1",
+                "db_passwd": "p-1",
+                "PWD": "p-2",
+                "callback": "https://token@hooks.example.com/in"
+            },
+            "headers": {"X-Upstream": "https://u:p@upstream.example.com", "Accept": "*/*"}
+        }});
+
+        let hidden = hide_integration_credentials(&mut value);
+
+        assert_eq!(
+            value,
+            json!({"id": "in-1", "configuration": {
+                "private_key_pem": PUT_BACK,
+                "passphrase": PUT_BACK,
+                "smtp_pass": PUT_BACK,
+                "dsn": PUT_BACK,
+                "brokers": [PUT_BACK, "amqp://mq-2:5672"],
+                "tls": {
+                    "private_key_pem": PUT_BACK,
+                    "passphrase": PUT_BACK,
+                    "authorization": PUT_BACK,
+                    "client_credential": PUT_BACK,
+                    "db_passwd": PUT_BACK,
+                    "PWD": PUT_BACK,
+                    "callback": PUT_BACK
+                },
+                "headers": {"X-Upstream": PUT_BACK, "Accept": "*/*"}
+            }})
+        );
+        assert_eq!(hidden.removed, ["configuration.redis_url", "configuration.smtp_password"]);
+        assert_eq!(hidden.masked.len(), 13, "{hidden:?}");
+        assert!(
+            hidden
+                .masked
+                .contains(&"configuration.brokers".to_owned()),
+            "{hidden:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_that_only_resembles_a_secret_url_or_key_is_kept() {
+        let configuration = json!({
+            "bypass": true,
+            "compass_heading": "north",
+            "broker_url": "amqp://${MQ_USER}:${MQ_PASSWORD}@mq-1:5672",
+            "endpoint": "https://hooks.example.com/in?to=ops@example.com",
+            "mailto": "mailto:ops@example.com",
+            "contact": "ops@example.com",
+            "proxy": "http://:@proxy.example.com:3128",
+            "tls": {"passphrase": "${TLS_PASSPHRASE}", "private_key_pem": "", "certificate_pem": "-----BEGIN CERTIFICATE-----", "ca_pem": "-----BEGIN CERTIFICATE-----"}
+        });
+        let mut value = json!({"id": "in-1", "configuration": configuration});
+
+        let hidden = hide_integration_credentials(&mut value);
+
+        assert_eq!(hidden, HiddenIntegrationCredentials::default());
+        assert_eq!(value["configuration"], configuration);
+    }
+
+    #[test]
+    fn a_top_level_headers_that_is_not_an_object_gets_the_placeholder() {
+        for headers in [json!("Authorization: Bearer abc"), json!(["Authorization: Bearer abc"]), json!(42)] {
+            let mut value = json!({"configuration": {"headers": headers}});
+
+            let hidden = hide_integration_credentials(&mut value);
+
+            assert_eq!(value, json!({"configuration": {"headers": PUT_BACK}}), "{headers}");
+            assert_eq!(hidden.masked, ["configuration.headers"], "{headers}");
+            assert!(hidden.removed.is_empty(), "{headers}");
+        }
+        for headers in [json!(""), json!(null), json!("${HEADERS}")] {
+            let mut value = json!({"configuration": {"headers": headers}});
+
+            assert_eq!(hide_integration_credentials(&mut value), HiddenIntegrationCredentials::default());
+            assert_eq!(value, json!({"configuration": {"headers": headers}}));
+        }
     }
 
     #[test]
@@ -10639,7 +10890,7 @@ mod integrations_tests {
                 .as_deref(),
             Some(
                 "note: put the real value back in 'configuration.auth.API_KEY', 'configuration.brokers.sasl_password' \
-                 before sending this to create or update, which refuse the placeholder; removing a nested field \
+                 before sending this to create or update, which refuse the placeholder; removing such a field \
                  deletes it from the integration. `fabric agent-stream api get /v1/integrations/<ID>` prints the \
                  stored configuration as Agent Stream returns it."
             )
@@ -10677,25 +10928,41 @@ mod integrations_tests {
     }
 
     #[test]
-    fn a_nested_placeholder_is_refused_with_a_put_it_back_message_that_names_no_flag() {
-        let document = json!({"configuration": {"region": "eu", "auth": [{"provider": {"API_KEY": NESTED}}]}});
+    fn the_placeholder_is_refused_naming_no_flag_and_no_product() {
+        let document = json!({"configuration": {"region": "eu", "auth": [{"provider": {"API_KEY": PUT_BACK}}]}});
 
-        let refusal = reject_masked_values(&document).expect_err("the nested placeholder is refused");
+        let refusal = checked_body(document).expect_err("the placeholder is refused");
+
+        assert_eq!(
+            refusal.to_string(),
+            "the request body still carries the placeholder <hidden; put the real value back before sending> at \
+             'configuration.auth.provider.API_KEY'; put the real value back in its place, because removing the \
+             field deletes it from the integration. Nothing was sent"
+        );
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[test]
+    fn on_agent_stream_the_placeholder_refusal_says_how_to_read_the_stored_value() {
+        let refusal = reject_masked_values(&json!({"configuration": {"auth": {"API_KEY": PUT_BACK}}}))
+            .expect_err("the placeholder is refused");
+
+        let hinted = with_stored_value_hint(without_reveal_hint(refusal));
 
         let expected = "the request body still carries the placeholder <hidden; put the real value back before \
-                        sending> at 'configuration.auth.provider.API_KEY'; put the real value back in its place, \
-                        because removing a nested field deletes it from the integration. `fabric agent-stream api \
-                        get /v1/integrations/<ID>` prints the stored configuration as Agent Stream returns it. \
-                        Nothing was sent";
-        assert_eq!(refusal.to_string(), expected);
-        assert!(checked_body(document).is_err());
-        #[cfg(feature = "agent-stream")]
-        assert_eq!(without_reveal_hint(refusal).to_string(), expected);
+                        sending> at 'configuration.auth.API_KEY'; put the real value back in its place, because \
+                        removing the field deletes it from the integration. `fabric agent-stream api get \
+                        /v1/integrations/<ID>` prints the stored configuration as Agent Stream returns it. Nothing \
+                        was sent";
+        assert_eq!(hinted.to_string(), expected);
+        assert_eq!(with_stored_value_hint(hinted).to_string(), expected);
+        let other = with_stored_value_hint(anyhow::anyhow!("unrelated"));
+        assert_eq!(other.to_string(), "unrelated");
     }
 
     #[test]
     fn a_document_carrying_the_reveal_placeholder_keeps_its_refusal() {
-        let refusal = reject_masked_values(&json!({"value": MASKED_VALUE, "auth": {"API_KEY": NESTED}}))
+        let refusal = reject_masked_values(&json!({"value": MASKED_VALUE, "auth": {"API_KEY": PUT_BACK}}))
             .expect_err("a masked document");
 
         assert_eq!(refusal.to_string(), super::secrets_certs_tests::masked_refusal());
@@ -10803,7 +11070,38 @@ mod integrations_tests {
             .await
             .expect("get");
 
-        assert_eq!(value, json!({"id": "in-1", "configuration": {"auth": {"API_KEY": NESTED, "region": "eu"}}}));
+        assert_eq!(value, json!({"id": "in-1", "configuration": {"auth": {"API_KEY": PUT_BACK, "region": "eu"}}}));
+    }
+
+    /// The long help of `command`, as `--help` prints it at 100 columns, up
+    /// to the options shared by every command, followed by the help of each
+    /// option of its own and by its after-help, so the text the command owns
+    /// is compared whole and the shared options are left to their own tests.
+    fn own_long_help(command: &clap::Command) -> String {
+        let rendered = command
+            .clone()
+            .term_width(100)
+            .render_long_help()
+            .to_string();
+        let (head, _) = rendered
+            .split_once("\nOptions:\n")
+            .expect("every command has options");
+        let mut help = head.to_owned();
+        for argument in command
+            .get_arguments()
+            .filter(|argument| !argument.is_global_set() && !argument.is_positional() && argument.get_id() != "help")
+        {
+            let text = argument
+                .get_long_help()
+                .or_else(|| argument.get_help())
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            help.push_str(&format!("\n--{}: {text}", argument.get_id()));
+        }
+        if let Some(after) = command.get_after_long_help() {
+            help.push_str(&format!("\n{after}"));
+        }
+        help
     }
 
     #[test]
@@ -10814,81 +11112,73 @@ mod integrations_tests {
             .find_subcommand("agent-gateway")
             .and_then(|gateway| gateway.find_subcommand("integrations"))
             .expect("agent-gateway integrations");
-        let text = |command: &clap::Command| {
-            (
-                command
-                    .get_about()
-                    .map(ToString::to_string),
-                command
-                    .get_long_about()
-                    .map(ToString::to_string),
-            )
-        };
-        let about = |text: &str| Some(text.to_owned());
-
-        assert_eq!(
-            text(group),
-            (
-                about("Manage integrations, such as the email, Slack or webhook senders the gateway notifies through"),
-                about(
-                    "Manage integrations, such as the email, Slack or webhook senders the gateway notifies \
-                     through.\n\nEach integration has a type, a category that sets which runtime variables its \
-                     message can use, its connection settings, and the message content with ${VARIABLE} \
-                     placeholders. The types and categories on offer come from the gateway's configuration."
-                ),
-            )
-        );
         let subcommand = |name: &str| {
-            text(
+            own_long_help(
                 group
                     .find_subcommand(name)
                     .unwrap_or_else(|| panic!("integrations {name}")),
             )
         };
-        assert_eq!(subcommand("list"), (about("List integrations"), None));
+
+        assert_eq!(
+            own_long_help(group),
+            "Manage integrations, such as the email, Slack or webhook senders the gateway notifies through.\n\n\
+             Each integration has a type, a category that sets which runtime variables its message can use, its\n\
+             connection settings, and the message content with ${VARIABLE} placeholders. The types and categories\n\
+             on offer come from the gateway's configuration.\n\n\
+             Usage: fabric agent-gateway integrations [OPTIONS] <COMMAND>\n\n\
+             Commands:\n  \
+             list    List integrations\n  \
+             get     Get an integration by ID\n  \
+             create  Create an integration from a JSON document\n  \
+             update  Update an integration from a JSON document\n  \
+             delete  Delete an integration by ID\n  \
+             help    Print this message or the help of the given subcommand(s)\n"
+        );
+        assert_eq!(
+            subcommand("list"),
+            "List integrations\n\nUsage: fabric agent-gateway integrations list [OPTIONS]\n"
+        );
         assert_eq!(
             subcommand("get"),
-            (
-                about("Get an integration by ID"),
-                about(
-                    "Get an integration by ID.\n\nThe ID is the ID column of `fabric agent-gateway integrations \
-                     list`. It is sent as given: a name is not looked up."
-                ),
-            )
+            "Get an integration by ID.\n\n\
+             The ID is the ID column of `fabric agent-gateway integrations list`. It is sent as given: a name is\n\
+             not looked up.\n\n\
+             Usage: fabric agent-gateway integrations get [OPTIONS] <ID>\n\n\
+             Arguments:\n  \
+             <ID>\n          \n"
         );
         assert_eq!(
             subcommand("create"),
-            (
-                about("Create an integration from a JSON document"),
-                about(
-                    "Create an integration from a JSON document.\n\n`fabric agent-gateway integrations get <ID> \
-                     --output json` prints an existing integration, which shows the fields the gateway stores. \
-                     Use `--file -` to read the document from standard input."
-                ),
-            )
+            "Create an integration from a JSON document.\n\n\
+             `fabric agent-gateway integrations get <ID> --output json` prints an existing integration, which\n\
+             shows the fields the gateway stores. Use `--file -` to read the document from standard input.\n\n\
+             Usage: fabric agent-gateway integrations create [OPTIONS] --file <FILE>\n\n\
+             --file: JSON request body. Use '-' to read from standard input"
         );
         assert_eq!(
             subcommand("update"),
-            (
-                about("Update an integration from a JSON document"),
-                about(
-                    "Update an integration from a JSON document.\n\nThe document is sent as an HTTP PUT and \
-                     replaces the whole integration: a field it leaves out is cleared. Start from the current \
-                     integration:\n\n  fabric agent-gateway integrations get <ID> \\\n    --output json > \
-                     record.json\n  fabric agent-gateway integrations update <ID> \\\n    --file \
-                     record.json\n\nUse `--file -` to read the document from standard input."
-                ),
-            )
+            "Update an integration from a JSON document.\n\n\
+             The document is sent as an HTTP PUT and replaces the whole integration: a field it leaves out is\n\
+             cleared. Start from the current integration:\n\n  \
+             fabric agent-gateway integrations get <ID> \\\n    \
+             --output json > record.json\n  \
+             fabric agent-gateway integrations update <ID> \\\n    \
+             --file record.json\n\n\
+             Use `--file -` to read the document from standard input.\n\n\
+             Usage: fabric agent-gateway integrations update [OPTIONS] --file <FILE> <ID>\n\n\
+             Arguments:\n  \
+             <ID>\n          \n\n\
+             --file: JSON document to send. Use '-' to read from standard input"
         );
         assert_eq!(
             subcommand("delete"),
-            (
-                about("Delete an integration by ID"),
-                about(
-                    "Delete an integration by ID.\n\nThe request is sent as soon as the command runs: there is \
-                     no confirmation prompt and no --yes flag. The ID is sent as given: a name is not looked up."
-                ),
-            )
+            "Delete an integration by ID.\n\n\
+             The request is sent as soon as the command runs: there is no confirmation prompt and no --yes flag.\n\
+             The ID is sent as given: a name is not looked up.\n\n\
+             Usage: fabric agent-gateway integrations delete [OPTIONS] <ID>\n\n\
+             Arguments:\n  \
+             <ID>\n          \n"
         );
         assert!(
             Cli::try_parse_from(["fabric", "agent-gateway", "integrations", "delete", "in-1", "--yes"]).is_err(),

@@ -1341,7 +1341,7 @@ fn a_nested_integration_credential_is_masked_and_the_saved_answer_is_refused_by_
         stderr(&get).ends_with(
             "\nnote: hid 'configuration.signing_secret', 'configuration.options.sasl_password'.\n\
              note: put the real value back in 'configuration.options.sasl_password' before sending this to create \
-             or update, which refuse the placeholder; removing a nested field deletes it from the integration. \
+             or update, which refuse the placeholder; removing such a field deletes it from the integration. \
              `fabric agent-stream api get /v1/integrations/<ID>` prints the stored configuration as Agent Stream \
              returns it.\n"
         ),
@@ -1361,7 +1361,7 @@ fn a_nested_integration_credential_is_masked_and_the_saved_answer_is_refused_by_
             stderr(&output).ends_with(
                 "\nerror: the request body still carries the placeholder <hidden; put the real value back before \
                  sending> at 'configuration.options.sasl_password'; put the real value back in its place, because \
-                 removing a nested field deletes it from the integration. `fabric agent-stream api get \
+                 removing the field deletes it from the integration. `fabric agent-stream api get \
                  /v1/integrations/<ID>` prints the stored configuration as Agent Stream returns it. Nothing was \
                  sent\n"
             ),
@@ -1480,8 +1480,16 @@ fn integrations_have_no_command_that_sends_a_message() {
         assert!(stderr(&output).contains("unrecognized subcommand"), "{words:?}: {}", stderr(&output));
     }
     let help = stdout(&fabric(&["agent-stream", "integrations", "--help"], &[]));
-    for route in ["/v1/integrations/test", "/v1/integrations/<ID>/trigger", "/v1/integrations/trigger-multiple"] {
-        assert!(help.contains(route), "{route}: {help}");
+    let unwrapped = help
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for call in [
+        "`fabric agent-stream api post /v1/integrations/test --file <json>`",
+        "`fabric agent-stream api post /v1/integrations/<ID>/trigger --file <json>`",
+        "`fabric agent-stream api post /v1/integrations/trigger-multiple --file <json>`",
+    ] {
+        assert!(unwrapped.contains(call), "{call}: {help}");
     }
 }
 

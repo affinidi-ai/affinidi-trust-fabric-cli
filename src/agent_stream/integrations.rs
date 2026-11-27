@@ -71,10 +71,11 @@ pub enum IntegrationCommand {
     /// them all: a `category` left out is cleared. A stored credential at
     /// the top level of `configuration`, or a credential entry of its
     /// top-level `headers`, that the document leaves out is kept, and `null`
-    /// clears it, but any other nested value that the document leaves out is
-    /// deleted. `fabric agent-stream api get /v1/integrations/<ID>` prints the
-    /// stored configuration as Agent Stream returns it, nested values
-    /// included. Agent Stream refuses to keep a credential when the update
+    /// clears it, but any other value that the document leaves out is
+    /// deleted, such as a nested one or a top-level `private_key_pem`.
+    /// `fabric agent-stream api get /v1/integrations/<ID>` prints the stored
+    /// configuration as Agent Stream returns it, those values included.
+    /// Agent Stream refuses to keep a credential when the update
     /// changes where the integration sends, so send its reference again then.
     /// A new or moved secret reference needs the secrets.view permission, and
     /// where `secrets.reveal_values` is off, Agent Stream refuses any
@@ -150,10 +151,11 @@ const CREATE_EXAMPLES: &str = r#"Examples:
 const UPDATE_EXAMPLES: &str = r#"Examples:
   Change an integration: save it, edit it, send it back. The saved copy leaves
   the stored credentials at the top level of `configuration` out, and sending
-  it back keeps them. A credential nested deeper is saved as a placeholder:
-  put the real value back in its place first, or update refuses the file.
+  it back keeps them. Any other secret-looking value, such as a nested one or
+  a top-level `private_key_pem`, is saved as a placeholder: put the real value
+  back in its place first, or update refuses the file.
   `fabric agent-stream api get /v1/integrations/<id>` prints the stored
-  configuration as Agent Stream returns it, nested values included.
+  configuration as Agent Stream returns it, those values included.
   Agent Stream replaces with no version check, so a change saved by someone
   else between the get and the update is lost:
     fabric agent-stream integrations get <id> --output json > integration.json

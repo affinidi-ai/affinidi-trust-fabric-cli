@@ -280,7 +280,10 @@ products print the same tables and confirmation lines. `integrations config` and
 `integrations runtime-variables`, which only Agent Stream has, are read and printed in
 `run_shared_command`, which `run_shared` calls, and `run_integrations` hides any
 secret-looking `configuration` value in an Agent Stream integration answer: it removes a
-top-level one and masks a nested one, which `checked_body` then refuses to send. `tenant-ownership` takes Agent Stream's
+credential Agent Stream keeps when an update leaves it out (a top-level credential key, or an
+entry of the top-level `headers` object) and masks any other, at any depth, which
+`checked_body` then refuses to send; `dispatch_with` adds to that refusal how Agent Stream's
+`api` reads the stored value, so Agent Gateway's names no other product. `tenant-ownership` takes Agent Stream's
 own resource kinds, so `run_shared` sends it straight to `run_ownership_change`, which
 the Agent Gateway command also ends in. An Agent Stream delete or revoke without `--yes`
 (`policies delete`, `certificates delete`, `credential-providers delete`,
