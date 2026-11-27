@@ -181,7 +181,7 @@ pub static AGENT_STREAM_SURFACES: Layout = Layout {
 /// list` shows them: never their messages.
 #[cfg(feature = "agent-stream")]
 pub static AGENT_STREAM_PROMPTS: Layout = Layout {
-    empty: "No prompt templates yet.",
+    empty: "No enabled prompt templates. Disabled ones are not listed; read one with `prompts get <id>`.",
     columns: &[
         id(&["id"]),
         whole("NAME", &["name"]),
@@ -938,6 +938,15 @@ mod tests {
         assert_eq!(render_scoped(&SECRETS, &[], Scope::Filtered), ["No matching secrets."]);
         assert_eq!(render_scoped(&PAYMENTS, &[], Scope::Partial), ["No payments returned."]);
         assert_eq!(render_scoped(&AUDIT, &[], Scope::Filtered), ["No matching audit events."]);
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[test]
+    fn an_empty_prompts_list_says_disabled_templates_are_not_listed() {
+        assert_eq!(
+            render_scoped(&AGENT_STREAM_PROMPTS, &[], Scope::All),
+            ["No enabled prompt templates. Disabled ones are not listed; read one with `prompts get <id>`."]
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use reqwest::Method;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    client::{GatewayClient, pretty_json_for_terminal, sanitize_for_terminal, sanitize_multiline},
+    client::{GatewayClient, pretty_json_for_terminal, response_status, sanitize_for_terminal, sanitize_multiline},
     commands::{Output, confirmation_line, entity_path, print_list, print_outcome, read_json},
     surface_validate,
     tables::{self, Scope},
@@ -84,9 +84,11 @@ pub enum PromptCommand {
     ///
     /// Before anything is sent, the CLI checks the template as Agent Stream
     /// would: an id of letters, digits, `-`, and `_`, up to 128 characters; a
-    /// name; at least one version, and no two with one number; at least one
-    /// message in each version, each with a role; a default version that exists; and only
-    /// field names Agent Stream knows.
+    /// name; no two versions with one number; at least one message in each
+    /// version, each with a role; a default version that exists; and only
+    /// field names Agent Stream knows. The CLI also needs at least one
+    /// version: Agent Stream would save a template with none, but could not
+    /// render it.
     ///
     /// --dry-run prints the template and sends nothing, so it needs no saved
     /// login; with --output json it prints the same preview as `update
@@ -105,9 +107,10 @@ pub enum PromptCommand {
     /// template as it is sends nothing.
     ///
     /// --file replaces the whole template, versions included, so a version
-    /// left out of it is removed; a file with no versions is refused. It must hold the `updated_at` the template
-    /// has now, so start it from `prompts get`; a copy read before another
-    /// save is refused. Its `created_at`, `updated_at`, and `tenant_id` are
+    /// left out of it is removed. A file with no versions is refused by the
+    /// CLI, since Agent Stream would save it but could not render it. It must
+    /// hold the `updated_at` the template has now, so start it from `prompts
+    /// get`; a copy read before another save is refused. Its `created_at`, `updated_at`, and `tenant_id` are
     /// replaced with the stored ones.
     ///
     /// Table output lists each changed field; --output json prints the
@@ -432,13 +435,19 @@ pub async fn run(
             let id = text_field(&template, "id").to_owned();
             let answer = client
                 .request(Method::POST, PROMPTS_PATH, Some(template))
-                .await?;
+                .await
+                .map_err(|error| unanswered_save(error, &id))?;
             print_outcome(&answer, output, &confirmation_line("Created", "prompt template", &id))
         }
         PromptCommand::Update(args) => {
             let before = read_template(&client, &args.id).await?;
             let after = updated(&before, &args)?;
-            save(&client, &args.id, &before, after, args.dry_run, output).await
+            let retry = if args.file.is_some() {
+                Retry::FreshFile
+            } else {
+                Retry::RunAgain
+            };
+            save(&client, &args.id, &before, after, args.dry_run, retry, output).await
         }
         PromptCommand::Delete { id } => {
             let answer = client
@@ -450,17 +459,17 @@ pub async fn run(
             let version = new_version(&args)?;
             let before = read_template(&client, &args.id).await?;
             let after = with_version(&before, version, args.make_default)?;
-            save(&client, &args.id, &before, after, args.dry_run, output).await
+            save(&client, &args.id, &before, after, args.dry_run, Retry::RunAgain, output).await
         }
         PromptCommand::SetDefault(args) => {
             let before = read_template(&client, &args.id).await?;
             let after = with_default(&before, args.version)?;
-            save(&client, &args.id, &before, after, args.dry_run, output).await
+            save(&client, &args.id, &before, after, args.dry_run, Retry::RunAgain, output).await
         }
         PromptCommand::RemoveVersion(args) => {
             let before = read_template(&client, &args.id).await?;
             let after = without_version(&before, args.version)?;
-            save(&client, &args.id, &before, after, args.dry_run, output).await
+            save(&client, &args.id, &before, after, args.dry_run, Retry::RunAgain, output).await
         }
         PromptCommand::Render(args) => render(&client, args, output).await,
     }
@@ -806,9 +815,11 @@ fn text_field<'a>(
         .unwrap_or_default()
 }
 
-/// Refuses a template Agent Stream would refuse, or would save without a
-/// field it does not know: Agent Stream drops an unknown field without an
-/// error, so a mistyped name would be lost. A field name the `stored`
+/// Refuses a template Agent Stream would refuse, would save without a field
+/// it does not know, or would save but could not render: Agent Stream drops
+/// an unknown field without an error, so a mistyped name would be lost, and
+/// accepts a template with no versions. A `stored` template means an
+/// existing one is being changed. A field name the `stored`
 /// template already has counts as known too, at the same level, for a field
 /// a newer Agent Stream added.
 fn check_template(
@@ -848,9 +859,10 @@ fn check_template(
     {
         None => {}
         Some(Value::String(status)) if status == "enabled" || status == "disabled" => {}
-        Some(Value::String(status)) if status == "deleted" => {
-            bail!("a template can't be saved as deleted; use `fabric agent-stream prompts delete`")
-        }
+        Some(Value::String(status)) if status == "deleted" => match stored {
+            Some(_) => bail!("a template can't be saved as deleted; use `fabric agent-stream prompts delete`"),
+            None => bail!("a template can't be created as deleted; its `status` must be \"enabled\" or \"disabled\""),
+        },
         Some(other) => bail!(
             "the template's `status` must be \"enabled\" or \"disabled\", not {}",
             sanitize_for_terminal(&other.to_string())
@@ -863,10 +875,16 @@ fn check_template(
         bail!("the template's `versions` must be a list");
     }
     if versions_of(template).is_empty() {
-        bail!(
-            "the template needs at least one version; to remove every version, delete the template with `fabric \
-             agent-stream prompts delete`"
-        );
+        // Agent Stream saves a template with no versions but can't render
+        // it, so the CLI adds this rule of its own.
+        let rule = "the template needs at least one version: Agent Stream would save it with none, but could not \
+                    render it";
+        match stored {
+            Some(_) => {
+                bail!("{rule}; to remove every version, delete the template with `fabric agent-stream prompts delete`")
+            }
+            None => bail!("{rule}"),
+        }
     }
     let mut seen = BTreeSet::new();
     for version in versions_of(template) {
@@ -967,15 +985,28 @@ fn check_fields(
     Ok(())
 }
 
+/// How to try a change again after someone else saved the template first.
+#[derive(Clone, Copy)]
+enum Retry {
+    /// The change came from flags, so running the command again applies it
+    /// to the template as it is now.
+    RunAgain,
+    /// The change is a whole --file document, which would undo the other
+    /// save, so it has to be made again on a fresh copy.
+    FreshFile,
+}
+
 /// Saves `after` in place of the template `before`, read as `id`: checks it,
 /// shows the changes, and stops with nothing sent on a dry run, on no change,
-/// or when the template was saved by someone else since `before` was read.
+/// or when the template was saved by someone else since `before` was read;
+/// `retry` says what to do then.
 async fn save(
     client: &GatewayClient,
     id: &str,
     before: &Value,
     after: Value,
     dry_run: bool,
+    retry: Retry,
     output: Output,
 ) -> Result<()> {
     check_template(&after, Some(before))?;
@@ -997,21 +1028,43 @@ async fn save(
     }
     let current = read_template(client, id).await?;
     if present(current.get("updated_at")) != present(before.get("updated_at")) {
-        bail!(
-            "prompt template '{id}' was saved by someone else after it was read, so nothing was saved; run the \
-             command again to change the new version"
-        );
+        let next = match retry {
+            Retry::RunAgain => "run the command again to apply the change to the template as it is now".to_owned(),
+            Retry::FreshFile => format!(
+                "get a fresh copy with `fabric agent-stream prompts get {id}`, apply the change to it, and update \
+                 again"
+            ),
+        };
+        bail!("prompt template '{id}' was saved by someone else after it was read, so nothing was saved; {next}");
     }
     // Agent Stream answers a save with the template as it stored it,
     // `updated_at` included, so the answer can go straight back to --file.
+    let path = template_path(id)?;
     let saved = client
-        .request(Method::PUT, &template_path(id)?, Some(after))
-        .await?;
+        .request(Method::PUT, &path, Some(after))
+        .await
+        .map_err(|error| unanswered_save(error, id))?;
     match output {
         Output::Table => println!("{}", changes_table(&changes, &confirmation_line("Updated", "prompt template", id))),
         Output::Json => println!("{}", pretty_json_for_terminal(&saved)?),
     }
     Ok(())
+}
+
+/// `error` from a save request, with a warning added when no HTTP answer came
+/// back: a connection that failed after the request was sent may have failed
+/// after Agent Stream saved it. A refusal from Agent Stream is left as it is.
+fn unanswered_save(
+    error: anyhow::Error,
+    id: &str,
+) -> anyhow::Error {
+    if response_status(&error).is_some() {
+        return error;
+    }
+    error.context(format!(
+        "no answer came back, so prompt template '{id}' may have been saved before the connection failed; check with \
+         `fabric agent-stream prompts get {id}` before running the command again"
+    ))
 }
 
 /// One change to a template: a field outside `versions`, or one version
@@ -1459,7 +1512,7 @@ mod tests {
                 r#"{"id":"greeter","name":"G","versions":[{"version":1,"messages":[{"role":"user","content":"x","name":"n"}]}]}"#,
                 "'name'",
             ),
-            (r#"{"id":"greeter","name":"G","status":"deleted"}"#, "prompts delete"),
+            (r#"{"id":"greeter","name":"G","status":"deleted"}"#, "can't be created as deleted"),
             (r#"{"id":"greeter","name":"G"}"#, "needs at least one version"),
             (r#"{"id":"greeter","name":"G","versions":[]}"#, "needs at least one version"),
         ];
@@ -1469,8 +1522,19 @@ mod tests {
                 run_prompts(&["prompts", "create", "--file", file.path().to_str().unwrap()], vec![]).await;
             let text = error_text(result);
             assert!(text.contains(expected), "{document}: {text}");
+            assert!(!text.contains("prompts delete"), "a new template has nothing to delete: {text}");
             assert!(start_lines(&requests).is_empty(), "{document}");
         }
+    }
+
+    #[tokio::test]
+    async fn create_with_no_versions_says_the_rule_is_the_clis_own() {
+        let file = json_file(r#"{"id":"greeter","name":"G","versions":[]}"#);
+        let (result, _) = run_prompts(&["prompts", "create", "--file", file.path().to_str().unwrap()], vec![]).await;
+        assert_eq!(
+            error_text(result),
+            "the template needs at least one version: Agent Stream would save it with none, but could not render it"
+        );
     }
 
     #[tokio::test]
@@ -1485,7 +1549,118 @@ mod tests {
         .await;
         let text = error_text(result);
         assert!(text.contains("A prompt with id 'greeter' already exists"), "{text}");
+        assert!(!text.contains("may have been saved"), "a refusal is an answer: {text}");
         assert!(!text.contains(ACCESS_TOKEN), "{text}");
+    }
+
+    /// A local Agent Stream that answers each GET with [`STORED`] and reads
+    /// any other request whole, then closes the connection without
+    /// answering. Returns its base URL and each request's start line.
+    async fn hangs_up_on_saves() -> (String, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = starts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 4096];
+                let request = loop {
+                    let read = socket
+                        .read(&mut buf)
+                        .await
+                        .unwrap_or(0);
+                    bytes.extend_from_slice(&buf[..read]);
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let whole = text
+                        .split_once("\r\n\r\n")
+                        .is_some_and(|(head, body)| {
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().ok())?
+                                })
+                                .unwrap_or(0);
+                            body.len() >= length
+                        });
+                    if read == 0 || whole {
+                        break text;
+                    }
+                };
+                recorded.lock().unwrap().push(
+                    request
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                if request.starts_with("GET ") {
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{STORED}",
+                        STORED.len()
+                    );
+                    let _ = socket
+                        .write_all(answer.as_bytes())
+                        .await;
+                    let _ = socket.shutdown().await;
+                }
+            }
+        });
+        (host, starts)
+    }
+
+    #[tokio::test]
+    async fn a_save_that_gets_no_answer_says_to_check_before_running_again() {
+        let file = json_file(
+            r#"{"id":"greeter","name":"Greeter","versions":[{"version":1,"messages":[{"role":"user","content":"x"}]}]}"#,
+        );
+        let path = file
+            .path()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        for (words, sent) in [
+            (vec!["prompts", "create", "--file", path.as_str()], "POST /api/v1/prompts HTTP/1.1"),
+            (vec!["prompts", "update", "greeter", "--name", "New"], "PUT /api/v1/prompts/greeter HTTP/1.1"),
+        ] {
+            let (host, starts) = hangs_up_on_saves().await;
+            let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
+            let text = error_text(run_stream(&words, saved, &credentials).await);
+            assert!(
+                text.starts_with(
+                    "no answer came back, so prompt template 'greeter' may have been saved before the connection \
+                     failed; check with `fabric agent-stream prompts get greeter` before running the command again"
+                ),
+                "{words:?}: {text}"
+            );
+            assert!(!text.contains(ACCESS_TOKEN), "{text}");
+            assert_eq!(
+                starts
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map(String::as_str),
+                Some(sent),
+                "{words:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_save_agent_stream_refuses_is_shown_without_the_unanswered_warning() {
+        let (result, _) = run_prompts(
+            &["prompts", "update", "greeter", "--name", "New"],
+            vec![GET_STORED, ("PUT /api/v1/prompts/greeter", "HTTP/1.1 400 Bad Request", "name is too long")],
+        )
+        .await;
+        let text = error_text(result);
+        assert!(text.contains("name is too long"), "{text}");
+        assert!(!text.contains("may have been saved"), "{text}");
     }
 
     #[tokio::test]
@@ -1525,7 +1700,11 @@ mod tests {
             vec![GET_STORED, PUT_OK],
         )
         .await;
-        assert!(error_text(result).contains("needs at least one version"));
+        assert_eq!(
+            error_text(result),
+            "the template needs at least one version: Agent Stream would save it with none, but could not render it; \
+             to remove every version, delete the template with `fabric agent-stream prompts delete`"
+        );
         assert_eq!(start_lines(&requests), ["GET /api/v1/prompts/greeter HTTP/1.1"]);
     }
 
@@ -1554,11 +1733,53 @@ mod tests {
             vec![GET_STORED, ("GET /api/v1/prompts/greeter", "HTTP/1.1 200 OK", STORED_LATER), PUT_OK],
         )
         .await;
-        assert!(error_text(result).contains("saved by someone else"));
+        assert_eq!(
+            error_text(result),
+            "prompt template 'greeter' was saved by someone else after it was read, so nothing was saved; run the \
+             command again to apply the change to the template as it is now"
+        );
         assert!(
             !start_lines(&requests)
                 .iter()
                 .any(|line| line.starts_with("PUT"))
+        );
+    }
+
+    #[tokio::test]
+    async fn update_file_stops_when_the_template_was_saved_after_it_was_read_and_says_to_start_fresh() {
+        let mut document: Value = serde_json::from_str(STORED).unwrap();
+        document["name"] = json!("Renamed");
+        let file = json_file(&document.to_string());
+        let (result, requests) = run_prompts(
+            &["prompts", "update", "greeter", "--file", file.path().to_str().unwrap()],
+            vec![GET_STORED, ("GET /api/v1/prompts/greeter", "HTTP/1.1 200 OK", STORED_LATER), PUT_OK],
+        )
+        .await;
+        assert_eq!(
+            error_text(result),
+            "prompt template 'greeter' was saved by someone else after it was read, so nothing was saved; get a fresh \
+             copy with `fabric agent-stream prompts get greeter`, apply the change to it, and update again"
+        );
+        assert!(
+            !start_lines(&requests)
+                .iter()
+                .any(|line| line.starts_with("PUT"))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_file_with_status_deleted_says_to_use_prompts_delete() {
+        let mut document: Value = serde_json::from_str(STORED).unwrap();
+        document["status"] = json!("deleted");
+        let file = json_file(&document.to_string());
+        let (result, _) = run_prompts(
+            &["prompts", "update", "greeter", "--file", file.path().to_str().unwrap()],
+            vec![GET_STORED, PUT_OK],
+        )
+        .await;
+        assert_eq!(
+            error_text(result),
+            "a template can't be saved as deleted; use `fabric agent-stream prompts delete`"
         );
     }
 

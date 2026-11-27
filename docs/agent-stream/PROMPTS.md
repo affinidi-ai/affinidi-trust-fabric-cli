@@ -81,7 +81,8 @@ Good to know:
 
 - A message file is read as UTF-8, and one line break at its end is dropped, since editors add one.
 - With flags, version 1 becomes the default version.
-- Before anything is sent, the CLI checks the template the way Agent Stream would: the id, a name that is not blank, at least one version and no two with one number, at least one message per version, each with a role, and a default version that exists. It also refuses a field name Agent Stream does not know, because Agent Stream would drop it without an error.
+- Before anything is sent, the CLI checks the template the way Agent Stream would: the id, a name that is not blank, no two versions with one number, at least one message per version, each with a role, and a default version that exists. It also refuses a field name Agent Stream does not know, because Agent Stream would drop it without an error.
+- The CLI also needs at least one version. This rule is the CLI's own: Agent Stream would save a template with no versions, but could not render it.
 
 ## Change a template
 
@@ -102,7 +103,11 @@ Agent Stream replaces the whole template on every save and has no version check.
 3. It reads the template again, and stops with nothing saved if someone else saved it in the meantime. A save that lands in the short gap before the send is still overwritten.
 4. It sends the whole template. A change that leaves the template as it was sends nothing.
 
-`--file` replaces the whole template, versions included, so a version left out of the file is removed, and a file with no versions is refused. The file must carry the template's current `updated_at`, so start from a fresh `prompts get`. A copy read before another save is refused. Its `created_at`, `updated_at`, and `tenant_id` are replaced with the stored ones.
+When step 3 stops, run a flag change or a version command again to apply it to the template as it is now. For `update --file`, get a fresh copy with `prompts get`, make the change to it again, and update again.
+
+If the connection fails after a save or a `create` was sent, with no answer from Agent Stream, the change may have been saved. Check with `prompts get <id>` before running the command again.
+
+`--file` replaces the whole template, versions included, so a version left out of the file is removed. The CLI refuses a file with no versions, since Agent Stream would save it but could not render it; to remove every version, delete the template. The file must carry the template's current `updated_at`, so start from a fresh `prompts get`. A copy read before another save is refused. Its `created_at`, `updated_at`, and `tenant_id` are replaced with the stored ones.
 
 After a save, table output lists each change. A version shows as added, removed, or changed by its number, never by its messages. `--output json` prints the template Agent Stream answered the save with, which can go straight back to `--file`.
 
@@ -120,6 +125,7 @@ fabric agent-stream prompts add-version support-greeter --file v3.json --make-de
 ```
 
 - The new version's number is `--version`, else the file's `version`, else one more than the highest version. A number the template already has is refused, so an existing version is never overwritten.
+- In a script, give `--version N`. If the connection fails after the request was sent, the version may have been added, and running the command again with the same `--version` is refused instead of adding a second copy.
 - `--file` holds one version: `{"messages": [...], "label": "...", "version": 3}`, with `label` and `version` optional.
 - Without `--make-default`, callers who name no version keep the version they get now. When the template has no `default_version`, which means callers get the highest version, the CLI sets `default_version` to that version and prints a note saying so (on a dry run too, as part of the change it shows), so the new version doesn't reach them.
 
