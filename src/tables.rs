@@ -162,6 +162,34 @@ pub static SURFACES: Layout = Layout {
     ],
 };
 
+/// The members of an Agent Stream, as `fabric agent-stream members list`
+/// and the members table of `teams get` show them.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_MEMBERS: Layout = Layout {
+    empty: "No members yet.",
+    columns: &[
+        id(&["id"]),
+        whole("NAME", &["name"]),
+        col("STATUS", &["status"]),
+        wide("IDENTIFIERS", &["identifier_list"]),
+        col("UPDATED", &["updated_at"]),
+    ],
+};
+
+/// The teams of an Agent Stream, as `fabric agent-stream teams list` shows
+/// them.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_TEAMS: Layout = Layout {
+    empty: "No teams yet.",
+    columns: &[
+        id(&["id"]),
+        whole("NAME", &["name"]),
+        col("STATUS", &["status"]),
+        col("MEMBERS", &["member_count"]),
+        col("UPDATED", &["updated_at"]),
+    ],
+};
+
 /// The surfaces of an Agent Stream, as `fabric agent-stream surfaces list`
 /// shows them.
 #[cfg(feature = "agent-stream")]
@@ -174,6 +202,49 @@ pub static AGENT_STREAM_SURFACES: Layout = Layout {
         col("STATUS", &["status"]),
         col("ROUTE", &["route"]),
         col("UPDATED", &["updated_at"]),
+    ],
+};
+
+/// The prompt templates of an Agent Stream, as `fabric agent-stream prompts
+/// list` shows them: never their messages.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_PROMPTS: Layout = Layout {
+    empty: "No enabled prompt templates. Disabled ones are not listed; read one with `prompts get <id>`.",
+    columns: &[
+        id(&["id"]),
+        whole("NAME", &["name"]),
+        col("STATUS", &["status"]),
+        col("VERSIONS", &["version_numbers"]),
+        col("DEFAULT", &["default_version"]),
+        col("UPDATED", &["updated_at"]),
+    ],
+};
+
+/// The providers of an Agent Stream's Model catalog, as `fabric agent-stream
+/// providers list` shows them.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_PROVIDERS: Layout = Layout {
+    empty: "No providers yet.",
+    columns: &[
+        id(&["enum_value"]),
+        whole("NAME", &["name"]),
+        col("SOURCE", &["source"]),
+        col("ENABLED", &["enabled"]),
+        col("MODELS", &["model_count"]),
+    ],
+};
+
+/// The models of one provider, as `fabric agent-stream providers models`
+/// shows them. Prices are USD per 1,000 tokens.
+#[cfg(feature = "agent-stream")]
+pub static AGENT_STREAM_MODELS: Layout = Layout {
+    empty: "No models yet.",
+    columns: &[
+        whole("MODEL", &["value"]),
+        whole("NAME", &["name"]),
+        col("ENABLED", &["enabled"]),
+        col("INPUT", &["cost_per_1k_input"]),
+        col("OUTPUT", &["cost_per_1k_output"]),
     ],
 };
 
@@ -923,6 +994,15 @@ mod tests {
         assert_eq!(render_scoped(&SECRETS, &[], Scope::Filtered), ["No matching secrets."]);
         assert_eq!(render_scoped(&PAYMENTS, &[], Scope::Partial), ["No payments returned."]);
         assert_eq!(render_scoped(&AUDIT, &[], Scope::Filtered), ["No matching audit events."]);
+    }
+
+    #[cfg(feature = "agent-stream")]
+    #[test]
+    fn an_empty_prompts_list_says_disabled_templates_are_not_listed() {
+        assert_eq!(
+            render_scoped(&AGENT_STREAM_PROMPTS, &[], Scope::All),
+            ["No enabled prompt templates. Disabled ones are not listed; read one with `prompts get <id>`."]
+        );
     }
 
     #[test]

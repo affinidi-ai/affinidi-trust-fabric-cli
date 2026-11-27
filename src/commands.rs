@@ -2221,6 +2221,15 @@ pub(crate) enum SharedCommand {
         command: PolicyCommand,
         ask_first: bool,
     },
+    /// `ask_first` is set for a delete that must be confirmed at a prompt
+    /// first. Agent Stream's `connections delete` asks unless --yes is given;
+    /// Agent Gateway's `connections delete` never asks and never comes here.
+    Connections {
+        command: CrudCommand,
+        ask_first: bool,
+    },
+    ConnectionPoints(CrudCommand),
+    Mediators(CrudCommand),
     Settings(SettingsCommand),
     UserSettings(UserSettingsCommand),
     Terms(TermsCommand),
@@ -2461,6 +2470,15 @@ impl SharedCommand {
                 "Policy",
                 entity_path("/v1/policy-definitions", policy_id),
             )),
+            Self::Connections {
+                command: CrudCommand::Delete { id },
+                ask_first: true,
+            } => Some(Confirmation::delete(
+                id,
+                "Delete Trust Fabric connection",
+                "Trust Fabric connection",
+                entity_path("/v1/gateways", id),
+            )),
             Self::Certificates {
                 command: CrudCommand::Delete { id },
                 ask_first: true,
@@ -2582,6 +2600,9 @@ async fn run_shared_command(
         SharedCommand::Identities(command) => Command::Identities { command },
         SharedCommand::ApiKeys(command) => Command::ApiKeys { command },
         SharedCommand::Policies { command, .. } => Command::Policies { command },
+        SharedCommand::Connections { command, .. } => Command::Connections { command },
+        SharedCommand::ConnectionPoints(command) => Command::ConnectionPoints { command },
+        SharedCommand::Mediators(command) => Command::Mediators { command },
         SharedCommand::Settings(command) => Command::Settings { command },
         SharedCommand::UserSettings(command) => Command::UserSettings { command },
         SharedCommand::Terms(command) => Command::Terms { command },
@@ -15529,6 +15550,8 @@ mod identity_access_tests {
         for (arguments, line) in [
             (vec!["issuers", "update", "i-1", "-f", "x.json"], "Updated issuer 'i-1'"),
             (vec!["connections", "update", "c-1", "-f", "x.json"], "Updated connection 'c-1'"),
+            (vec!["connection-points", "update", "cp-1", "-f", "x.json"], "Updated connection point 'cp-1'"),
+            (vec!["mediators", "update", "m-1", "-f", "x.json"], "Updated mediator 'm-1'"),
             (vec!["mcp-proxies", "update", "m-1", "-f", "x.json"], "Updated MCP proxy 'm-1'"),
             (
                 vec!["jwt-verification-strategies", "update", "j-1", "-f", "x.json"],

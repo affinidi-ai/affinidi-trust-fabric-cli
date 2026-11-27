@@ -10,6 +10,8 @@ mod api_keys;
 mod audit;
 mod certificates;
 mod config;
+mod connection_points;
+mod connections;
 mod credential_providers;
 mod delegation_vault;
 mod drift;
@@ -19,14 +21,20 @@ mod integrations;
 mod jwt_verification_strategies;
 mod login;
 mod logs;
+mod mediators;
+mod members;
 mod metrics;
 mod notifications;
 mod policies;
 mod prompt_content;
+mod prompts;
+mod providers;
+mod records;
 mod request;
 mod secrets;
 mod settings;
 mod surfaces;
+mod teams;
 mod tenant_ownership;
 mod terms;
 #[cfg(test)]
@@ -171,6 +179,29 @@ enum AgentStreamCommand {
         #[command(subcommand)]
         command: config::ConfigCommand,
     },
+    /// Manage Members: the known callers, a person, service, or API key, that
+    /// usage, limits, and spend are counted against.
+    ///
+    /// Reading members needs the `members.view` permission, creating and
+    /// changing them `members.edit`, and deleting them `members.delete`; by
+    /// default only administrators have them. `create` and `update` also read
+    /// the member list or the member first, so they need `members.view` too.
+    Members {
+        #[command(subcommand)]
+        command: members::MemberCommand,
+    },
+    /// Manage Teams: groups of Members with a shared budget.
+    ///
+    /// Reading teams needs the `teams.view` permission, creating and changing
+    /// them, members included, `teams.edit`, and deleting them
+    /// `teams.delete`; by default only administrators have them. `update`,
+    /// `add-member`, and `remove-member` also read the team first, so they
+    /// need `teams.view` too. Naming a member by identifier, and the members
+    /// table of `teams get`, need `members.view`.
+    Teams {
+        #[command(subcommand)]
+        command: teams::TeamCommand,
+    },
     /// Manage surfaces.
     ///
     /// Agent Stream's API calls a surface a pipe and serves surfaces at
@@ -178,6 +209,27 @@ enum AgentStreamCommand {
     Surfaces {
         #[command(subcommand)]
         command: surfaces::SurfaceCommand,
+    },
+    /// Manage prompt templates: saved, versioned prompts that a request
+    /// names instead of sending the prompt text.
+    ///
+    /// Reading and rendering need the `prompts.view` permission. Creating and
+    /// changing need `prompts.edit`, and deleting needs `prompts.delete`; by
+    /// default only administrators have those two.
+    Prompts {
+        #[command(subcommand)]
+        command: prompts::PromptCommand,
+    },
+    /// Manage the Model catalog: the LLM providers an Agent Stream knows, with
+    /// their endpoints, models, and prices.
+    ///
+    /// Every providers command, reading included, needs the
+    /// `llm_catalog.edit` permission, which by default only administrators
+    /// have. The catalog holds no API keys: a provider's key is stored as a
+    /// secret, and the surface that uses the provider names that secret.
+    Providers {
+        #[command(subcommand)]
+        command: providers::ProviderCommand,
     },
     /// Manage access tokens.
     Tokens {
@@ -224,6 +276,32 @@ enum AgentStreamCommand {
     Policies {
         #[command(subcommand)]
         command: policies::PolicyCommand,
+    },
+    /// Manage Trust Fabric connections, the records of this Agent Stream and
+    /// the peers it connects to.
+    ///
+    /// These are the records under `/v1/gateways`, not the saved connections
+    /// of `fabric agent-stream config`.
+    Connections {
+        #[command(subcommand)]
+        command: connections::ConnectionCommand,
+    },
+    /// Manage connection points, the DIDComm invitations other appliances use
+    /// to connect to this Agent Stream.
+    ///
+    /// Each one holds a secret that a peer must know to accept it. Keep your
+    /// own copy of the secret, the one in the document you create the
+    /// connection point with: only the create answer carries it, and that one
+    /// may show it encrypted when Agent Stream encrypts stored fields.
+    #[command(name = "connection-points")]
+    ConnectionPoints {
+        #[command(subcommand)]
+        command: connection_points::ConnectionPointCommand,
+    },
+    /// Manage DIDComm mediator records.
+    Mediators {
+        #[command(subcommand)]
+        command: mediators::MediatorCommand,
     },
     /// Manage appliance-wide settings.
     Settings {
@@ -595,6 +673,18 @@ async fn run_command(
                 .await
                 .map_err(without_reveal_hint);
         }
+        AgentStreamCommand::Prompts { command } => {
+            return prompts::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+        }
+        AgentStreamCommand::Members { command } => {
+            return members::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+        }
+        AgentStreamCommand::Teams { command } => {
+            return teams::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+        }
+        AgentStreamCommand::Providers { command } => {
+            return providers::run(command, globals.output, async || connect(saved, credentials, &globals).await).await;
+        }
         AgentStreamCommand::Tokens { command } => {
             let command = AccessTokenCommand::from(command);
             command.refuse_without_terminal()?;
@@ -625,6 +715,9 @@ async fn run_command(
         AgentStreamCommand::Identities { command } => SharedCommand::Identities(command.into()),
         AgentStreamCommand::ApiKeys { command } => SharedCommand::ApiKeys(command.into()),
         AgentStreamCommand::Policies { command } => SharedCommand::policies(command),
+        AgentStreamCommand::Connections { command } => SharedCommand::connections(command),
+        AgentStreamCommand::ConnectionPoints { command } => SharedCommand::ConnectionPoints(command.into()),
+        AgentStreamCommand::Mediators { command } => SharedCommand::Mediators(command.into()),
         AgentStreamCommand::Settings { command } => SharedCommand::Settings(command.into()),
         AgentStreamCommand::UserSettings { command } => SharedCommand::UserSettings(command.into()),
         AgentStreamCommand::Terms { command } => SharedCommand::Terms(command.into()),
@@ -651,13 +744,14 @@ async fn run_command(
 /// revoke, rotate, or delete that would ask for a confirmation nobody can
 /// give, a `settings reset` without --force, a `users update` or `users
 /// delete` naming the reserved `integrations` route, a `metrics truncate` or
-/// `logs truncate` without --yes, and a `policies delete`, `certificates
-/// delete`, `credential-providers delete`, `jwt-verification-strategies
-/// delete`, `delegation-vault revoke`, `delegation-vault revoke-user`, or
-/// `integrations delete` that would ask for a confirmation nobody can give,
-/// and an `integrations get`, `update`, or `delete` whose ID is empty or names
-/// another integrations route. Only refusals that need neither the host nor a
-/// file belong here; the ones that do are checked as the command runs.
+/// `logs truncate` without --yes, and a `policies delete`, `connections
+/// delete`, `certificates delete`, `credential-providers delete`,
+/// `jwt-verification-strategies delete`, `delegation-vault revoke`,
+/// `delegation-vault revoke-user`, or `integrations delete` that would ask for
+/// a confirmation nobody can give, and an `integrations get`, `update`, or
+/// `delete` whose ID is empty or names another integrations route. Only
+/// refusals that need neither the host nor a file belong here; the ones that
+/// do are checked as the command runs.
 fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
     match command {
         SharedCommand::ApiKeys(command) => command.refuse_without_terminal(),
@@ -670,12 +764,15 @@ fn refuse_before_connecting(command: &SharedCommand) -> Result<()> {
             command.refuse_unconfirmed_removal()
         }
         SharedCommand::Policies { .. }
+        | SharedCommand::Connections { .. }
         | SharedCommand::Certificates { .. }
         | SharedCommand::CredentialProviders { .. }
         | SharedCommand::JwtVerificationStrategies { .. }
         | SharedCommand::DelegationVault { .. } => command.refuse_unconfirmed_removal(),
         SharedCommand::Secrets { .. }
         | SharedCommand::Identities(_)
+        | SharedCommand::ConnectionPoints(_)
+        | SharedCommand::Mediators(_)
         | SharedCommand::UserSettings(_)
         | SharedCommand::Terms(_)
         | SharedCommand::Notifications(_)
@@ -1601,12 +1698,15 @@ mod tests {
 
     /// The groups `fabric agent-stream` runs through the Agent Gateway
     /// commands.
-    const SHARED_GROUPS: [&str; 18] = [
+    const SHARED_GROUPS: [&str; 21] = [
         "secrets",
         "users",
         "identities",
         "api-keys",
         "policies",
+        "connections",
+        "connection-points",
+        "mediators",
         "settings",
         "user-settings",
         "terms",
@@ -1735,6 +1835,54 @@ mod tests {
         }
     }
 
+    /// The prose of a help text, without the names Agent Stream reads, sends,
+    /// or checks: a name in backticks, such as `gateways` in the `policies
+    /// impact` answer, a JSON key in an example document, such as
+    /// "gateway_id", and a permission, such as gateways.view.
+    fn help_prose(text: &str) -> String {
+        let unticked: String = text
+            .split('`')
+            .step_by(2)
+            .collect();
+        let parts: Vec<&str> = unticked.split('"').collect();
+        let without_keys: String = parts
+            .iter()
+            .enumerate()
+            .filter(|(index, part)| {
+                let quoted = index % 2 == 1;
+                let is_key = parts
+                    .get(index + 1)
+                    .is_some_and(|after| after.starts_with(':'));
+                !(quoted && is_key && is_field_name(part))
+            })
+            .map(|(_, part)| *part)
+            .collect();
+        without_keys
+            .split_whitespace()
+            .filter(|word| !is_permission(word.trim_end_matches([',', '.', ';', ')'])))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn is_field_name(word: &str) -> bool {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '_')
+    }
+
+    fn is_permission(word: &str) -> bool {
+        word.split_once('.')
+            .is_some_and(|(resource, action)| is_field_name(resource) && matches!(action, "view" | "edit" | "delete"))
+    }
+
+    #[test]
+    fn help_prose_drops_json_keys_and_permissions_but_keeps_quoted_words() {
+        assert_eq!(help_prose(r#"{"gateway_id": "g-1"}"#), "{: g-1}");
+        assert_eq!(help_prose("Needs the gateways.view permission."), "Needs the permission.");
+        assert_eq!(help_prose(r#"the "gateway" record"#), "the gateway record");
+    }
+
     #[test]
     fn the_shared_groups_help_never_names_agent_gateway() {
         use clap::CommandFactory;
@@ -1751,14 +1899,10 @@ mod tests {
                     .unwrap_or_else(|| panic!("{group}")),
             );
             for text in texts {
-                // A field name in backticks, such as `gateways` in the
-                // `policies impact` answer, is what Agent Stream sends, but a
-                // command in backticks still never names the other product.
-                let prose: String = text
-                    .split('`')
-                    .step_by(2)
-                    .collect();
-                let lower = prose.to_ascii_lowercase();
+                // `help_prose` drops the names Agent Stream reads, sends, or
+                // checks, but a command in backticks still never names the
+                // other product.
+                let lower = help_prose(&text).to_ascii_lowercase();
                 assert!(!lower.contains("gateway"), "{group}: {text}");
                 assert!(!lower.contains("agent surface"), "{group}: {text}");
                 assert!(
@@ -1779,10 +1923,15 @@ mod tests {
             ("GET /api/v1/identities", "HTTP/1.1 200 OK", r#"{"identities":[],"count":0}"#),
             ("GET /api/v1/api-keys", "HTTP/1.1 200 OK", "[]"),
             ("GET /api/v1/policy-definitions", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/gateways", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/connection-points", "HTTP/1.1 200 OK", "[]"),
+            ("GET /api/v1/mediators", "HTTP/1.1 200 OK", "[]"),
         ])
         .await;
 
-        for group in ["secrets", "users", "identities", "api-keys", "policies"] {
+        for group in
+            ["secrets", "users", "identities", "api-keys", "policies", "connections", "connection-points", "mediators"]
+        {
             let (saved, credentials) = saved_login(&host, ACCESS_TOKEN);
             run_stream(&[group, "list"], saved, &credentials)
                 .await
@@ -1797,6 +1946,9 @@ mod tests {
                 "GET /api/v1/identities HTTP/1.1",
                 "GET /api/v1/api-keys HTTP/1.1",
                 "GET /api/v1/policy-definitions HTTP/1.1",
+                "GET /api/v1/gateways HTTP/1.1",
+                "GET /api/v1/connection-points HTTP/1.1",
+                "GET /api/v1/mediators HTTP/1.1",
             ]
         );
         assert!(

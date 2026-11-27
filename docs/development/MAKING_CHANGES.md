@@ -45,16 +45,16 @@ every place on this list that applies to a command that changes a surface: all b
   check on each line, and keeps a line that trips it out of its history.
 - The interactive shell parses each line with the same `Cli`, so a new command needs no
   shell wiring.
-- `secrets`, `users`, `identities`, `api-keys`, `policies`, `settings`,
-  `user-settings`, `terms`, `notifications`, `tenant-ownership`, `certificates`,
+- `secrets`, `users`, `identities`, `api-keys`, `policies`, `connections`,
+  `connection-points`, `mediators`, `settings`, `user-settings`, `terms`, `notifications`, `tenant-ownership`, `certificates`,
   `credential-providers`, `jwt-verification-strategies`, `delegation-vault`,
   `integrations`, `audit`, `metrics`, and `logs` also run on Agent Stream, through their
   own enums in [`src/agent_stream/`](../../src/agent_stream/), which a `From` maps onto
-  the shared enums: the Agent Gateway ones (`CrudCommand` for `certificates` and
-  `credential-providers`), `SharedIntegrationCommand`, which wraps `CrudCommand` and adds
-  the two read-only routes only Agent Stream has, or, through a `TryFrom`,
-  `OwnershipChange`, which both products' `tenant-ownership` map onto because their
-  resource kinds differ.
+  the shared enums: the Agent Gateway ones (`CrudCommand` for `connections`,
+  `connection-points`, `mediators`, `certificates`, and `credential-providers`),
+  `SharedIntegrationCommand`, which wraps `CrudCommand` and adds the two read-only routes
+  only Agent Stream has, or, through a `TryFrom`, `OwnershipChange`, which both
+  products' `tenant-ownership` map onto because their resource kinds differ.
   The compiler does not point at them, but
   `each_shared_group_has_every_agent_gateway_subcommand_or_leaves_it_out_on_purpose` in
   `agent_stream/mod.rs` fails for a new Agent Gateway subcommand in one of these groups.
@@ -228,7 +228,8 @@ on. `tool_gate_preview_help_ends_with_examples` finds the subcommand with
 
 ## Add a surface feature
 
-Features are what `surfaces add-feature`, `remove-feature`, and `features` work with. They
+Agent Gateway features are what `fabric agent-gateway surfaces add-feature`,
+`remove-feature`, and `features` work with; Agent Stream has its own table, [below](#an-agent-stream-surface-feature). They
 are data, in the `FEATURES` registry in [`src/features.rs`](../../src/features.rs), which
 mirrors the dashboard surface builder's map from element to payload path.
 
@@ -265,6 +266,31 @@ makes the merge patch, and `on_surface` and `describe` pick the feature up for
   refuses a `null` inside an object value and checks the surface's required fields with
   `surface_validate::check_surface`; it does not check the feature's own value. The
   gateway does, and `--dry-run` asks it to without saving.
+
+### An Agent Stream surface feature
+
+`fabric agent-stream surfaces add-feature` and `remove-feature` use their own table,
+`FEATURES` in [`src/agent_stream/surfaces/features.rs`](../../src/agent_stream/surfaces/features.rs),
+not the Agent Gateway registry above. On Agent Stream a feature is one field of the surface.
+
+| Order | Place | Change |
+| --- | --- | --- |
+| 1 | `SURFACE_FIELDS` in `agent_stream/surfaces.rs` | The field must be there already, since it lists every field of Agent Stream's `PipeConfig`. |
+| 2 | `FEATURES` | Add a `Feature` with its `key`, `alias`, `field`, `kind`, `switch`, `reach`, and `about`, and raise the array length. |
+| 3 | `VARIANT_FIELDS` | Add the field when Agent Stream's `PipeVariantOverrides` can override it. |
+| 4 | [`docs/agent-stream/SURFACE_FEATURES.md`](../agent-stream/SURFACE_FEATURES.md) | Add the feature to its table. |
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | `Setting` for an object `add-feature` replaces whole, or `List { item_id }` for a list it appends one item to; `item_id` says whether the items have an `id` that `--item` can name. |
+| `switch` | The surface flag Agent Stream reads before it uses a list's items, such as `routing_enabled`, or `None`. |
+| `reach` | `AnySurface` when Agent Stream acts on it for every surface type, else `ModelCalls`, or `PaidModelCalls` when it makes its own calls before the model call. It decides the note `add-feature` prints on a `webhook` or `ide_catalog` surface. |
+
+**Watch for:** `every_feature_is_a_surface_field_and_every_name_is_used_once` fails when a
+`field` or `switch` is not in `SURFACE_FIELDS`, a name is used twice, or a `VARIANT_FIELDS`
+entry has no feature. A feature whose settings hold more than the feature itself, as
+`cost_tracking` holds the surface's prices, needs its own handling in `with_feature_added`
+and `with_feature_removed`.
 
 ## Related
 
